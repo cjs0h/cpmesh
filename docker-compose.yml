@@ -1,0 +1,77 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: cpmesh
+      POSTGRES_USER: cpmesh
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-cpmesh-dev-password}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Database port is NOT exposed to host — only accessible within the internal network.
+    # Uncomment the ports section below only for local development/debugging:
+    # ports:
+    #   - "127.0.0.1:5433:5432"
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cpmesh"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  server:
+    build: .
+    ports:
+      - "39271:8080"
+    environment:
+      DATABASE_URL: postgres://cpmesh:${DB_PASSWORD:-cpmesh-dev-password}@db:5432/cpmesh?sslmode=disable
+      # RS256 JWT keys (file paths inside container)
+      JWT_ACTIVE_KID: ${JWT_ACTIVE_KID:-dev-key-1}
+      JWT_PRIVATE_KEY_PATH: /etc/cpmesh/jwt_private.pem
+      JWT_PUBLIC_KEYS_PATH: /etc/cpmesh/jwt_public_keys.json
+      ADDR: "0.0.0.0:8080"
+      DOWNLOADS_DIR: /srv/downloads
+      INITIAL_ADMIN: ${INITIAL_ADMIN:-admin}
+      INITIAL_ADMIN_PASSWORD: ${INITIAL_ADMIN_PASSWORD}
+      INITIAL_ADMIN_EMAIL: ${INITIAL_ADMIN_EMAIL:-}
+      CPNET_INSECURE_DEV: ${CPNET_INSECURE_DEV:-0}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      PII_MASTER_KEY: ${PII_MASTER_KEY}
+      PII_HMAC_KEY: ${PII_HMAC_KEY}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_TLS: ${SMTP_TLS:-true}
+      BASE_URL: ${BASE_URL:-}
+      REGISTRATION_OPEN: ${REGISTRATION_OPEN:-true}
+      OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      OIDC_CALLBACK_URL: ${OIDC_CALLBACK_URL:-}
+      GROUP_KEY_ROTATION_INTERVAL_HOURS: ${GROUP_KEY_ROTATION_INTERVAL_HOURS:-24}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - internal
+      - web
+    read_only: true
+    volumes:
+      - downloads:/srv/downloads
+      - ./${JWT_PRIVATE_KEY_PATH:-.dev/jwt/jwt_private.pem}:/etc/cpmesh/jwt_private.pem:ro
+      - ./${JWT_PUBLIC_KEYS_PATH:-.dev/jwt/jwt_public_keys.json}:/etc/cpmesh/jwt_public_keys.json:ro
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  internal:
+    internal: true
+  web:
+
+volumes:
+  pgdata:
+  downloads:

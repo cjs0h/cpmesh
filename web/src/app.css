@@ -1,0 +1,173 @@
+@import '@fontsource/manrope/400.css';
+@import '@fontsource/manrope/500.css';
+@import '@fontsource/manrope/600.css';
+@import '@fontsource/manrope/700.css';
+@import '@fontsource/manrope/800.css';
+@import '@fontsource/space-grotesk/500.css';
+@import '@fontsource/space-grotesk/700.css';
+@import 'tailwindcss';
+
+@theme {
+  /* Home / landing page palette */
+  --color-home-bg: #07111f;
+  --color-home-deep: #030814;
+  --color-home-surface: rgba(11,20,35,0.8);
+  --color-home-border: rgba(158,178,201,0.16);
+  --color-home-text: #f5f7fb;
+  --color-home-muted: #9eb2c9;
+  --color-home-dim: #677992;
+  --color-home-accent: #ff7a59;
+  --color-home-cyan: #49c6e5;
+  --color-home-green: #2ad6a0;
+  --color-home-gold: #f4c95d;
+
+  /* App backgrounds */
+  --color-bg: #0b0d14;
+  --color-bg-card: #12151f;
+  --color-bg-sidebar: #0e1019;
+  --color-bg-input: #181b28;
+  --color-bg-hover: #1a1e2e;
+  --color-bg-elevated: #161a26;
+
+  /* App borders */
+  --color-border: #1e2235;
+  --color-border-hover: #2d3250;
+
+  /* App text */
+  --color-text-DEFAULT: #e8eaf0;
+  --color-text-muted: #6b7194;
+  --color-text-dim: #454b6b;
+
+  /* Primary */
+  --color-primary: #818cf8;
+  --color-primary-hover: #6d78f2;
+  --color-primary-dim: #3730a3;
+  --color-primary-glow: rgba(129, 140, 248, 0.15);
+  --color-primary-glow-strong: rgba(129, 140, 248, 0.25);
+
+  /* Semantic */
+  --color-danger: #f87171;
+  --color-danger-hover: #ef4444;
+  --color-danger-glow: rgba(248, 113, 113, 0.12);
+  --color-success: #34d399;
+  --color-success-dim: #065f46;
+  --color-success-glow: rgba(52, 211, 153, 0.12);
+  --color-warning: #fbbf24;
+  --color-warning-glow: rgba(251, 191, 36, 0.12);
+
+  /* Fonts */
+  --font-sans: 'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-display: 'Space Grotesk', 'Manrope', sans-serif;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3), 0 1px 3px rgba(0, 0, 0, 0.15);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4), 0 2px 4px rgba(0, 0, 0, 0.2);
+  --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.5), 0 4px 12px rgba(0, 0, 0, 0.3);
+  --shadow-primary: 0 4px 24px rgba(129, 140, 248, 0.2), 0 2px 8px rgba(129, 140, 248, 0.1);
+
+  /* Radii */
+  --radius-sm: 6px;
+  --radius-DEFAULT: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-2xl: 20px;
+
+  /* Breakpoints */
+  --breakpoint-3xl: 1920px;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+::selection {
+  background: var(--color-primary-dim);
+  color: var(--color-text-DEFAULT);
+}
+
+body {
+  font-family: var(--font-sans);
+  background: var(--color-bg);
+  color: var(--color-text-DEFAULT);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-border-hover);
+}
+
+a {
+  color: var(--color-primary);
+  text-decoration: none;
+  transition: color 0.15s ease;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+button {
+  cursor: pointer;
+  font-family: inherit;
+}
+
+input, select, textarea {
+  font-family: inherit;
+}
+
+/* Focus styles */
+:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+/* Shared keyframes */
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes drift {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0);
+  }
+  50% {
+    transform: translate3d(0, -1rem, 0);
+  }
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(0.82);
+    opacity: 0.55;
+  }
+}
+
+@keyframes float1 {
+  0%, 100% { transform: translateY(0) rotate(0deg); }
+  50% { transform: translateY(-14px) rotate(1deg); }
+}
+
+@keyframes float2 {
+  0%, 100% { transform: translateY(0) rotate(0deg); }
+  50% { transform: translateY(-10px) rotate(-1.5deg); }
+}

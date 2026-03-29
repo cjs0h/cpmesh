@@ -1,0 +1,21 @@
+# Rust build artifacts (very large)
+target/
+desktop-tauri/src-tauri/target/
+
+# Node modules (rebuilt in Docker)
+web/node_modules/
+desktop-tauri/node_modules/
+web/dist/
+
+# Local development secrets
+.dev/
+
+# Git
+.git/
+
+# IDE
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db

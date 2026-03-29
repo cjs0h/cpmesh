@@ -1,0 +1,32 @@
+# Security Policy
+
+## Supported Versions
+
+| Version | Supported |
+|---------|-----------|
+| latest  | Yes       |
+
+## Reporting a Vulnerability
+
+If you discover a security vulnerability in cpmesh, please report it responsibly.
+
+**Do not open a public GitHub issue for security vulnerabilities.**
+
+Instead, please report vulnerabilities by emailing the maintainers or using GitHub's private vulnerability reporting.
+
+### What to include
+
+- Description of the vulnerability
+- Steps to reproduce
+- Potential impact
+- Suggested fix (if any)
+
+### Response timeline
+
+- We will acknowledge your report within 48 hours
+- We will provide an initial assessment within 7 days
+- We will work with you to understand and resolve the issue
+
+## Security Considerations
+
+cpmesh handles encrypted clipboard data. The server is designed as a relay that only sees ciphertext. If you find any scenario where plaintext clipboard data could be exposed to the server or other unauthorized parties, this is a critical security issue and should be reported immediately.

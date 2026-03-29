@@ -1,0 +1,239 @@
+import { invoke } from '@tauri-apps/api/core';
+
+export interface StatusInfo {
+	state: string;
+	server_url: string;
+	device_name: string;
+	device_count: number;
+	online_count: number;
+}
+
+export interface DeviceInfo {
+	id: string;
+	name: string;
+	last_seen?: string;
+	online: boolean;
+	status: 'pending' | 'approved' | 'rejected' | 'revoked';
+}
+
+export interface HistoryEntry {
+	id: string;
+	device_name: string;
+	content_type: string;
+	preview: string;
+	size: number;
+	created_at: string;
+}
+
+export interface HistoryPage {
+	entries: HistoryEntry[];
+	has_more: boolean;
+}
+
+export interface AppConfig {
+	server_url: string;
+	device_name: string;
+	auto_connect: boolean;
+	autostart: boolean;
+	notifications_enabled: boolean;
+	global_hotkey: string;
+	device_status: string;
+}
+
+// Tauri command wrappers
+
+export async function getStatus(): Promise<StatusInfo> {
+	return invoke('get_status');
+}
+
+export async function getAppState(): Promise<string> {
+	return invoke('get_app_state');
+}
+
+export async function setupAndLogin(
+	serverUrl: string,
+	username: string,
+	password: string,
+	isRegister: boolean,
+	email?: string,
+	fullName?: string,
+	passwordConfirm?: string,
+	country?: string,
+	mobile?: string,
+): Promise<void> {
+	return invoke('setup_and_login', {
+		serverUrl,
+		username,
+		password,
+		isRegister,
+		email: email || null,
+		fullName: fullName || null,
+		passwordConfirm: passwordConfirm || null,
+		country: country || null,
+		mobile: mobile || null,
+	});
+}
+
+export async function connectToServer(): Promise<void> {
+	return invoke('connect');
+}
+
+export async function disconnectFromServer(): Promise<void> {
+	return invoke('disconnect');
+}
+
+export async function getDevices(): Promise<DeviceInfo[]> {
+	return invoke('get_devices');
+}
+
+export async function removeDevice(deviceId: string): Promise<void> {
+	return invoke('remove_device', { deviceId });
+}
+
+// === Device Approval ===
+
+export interface PendingDevice {
+	id: string;
+	name: string;
+	created_at: string;
+}
+
+export interface ApprovalSession {
+	session_id: string;
+	approval_code: string;
+	expires_at: string;
+}
+
+export interface MyApprovalStatus {
+	status: 'pending' | 'approved' | 'rejected' | 'revoked';
+	approval_code?: string;
+	session_id?: string;
+}
+
+export async function getPendingDevices(): Promise<PendingDevice[]> {
+	return invoke('get_pending_devices');
+}
+
+export async function beginDeviceApproval(pendingDeviceId: string): Promise<ApprovalSession> {
+	return invoke('begin_device_approval', { pendingDeviceId });
+}
+
+export async function confirmDeviceApproval(pendingDeviceId: string, sessionId: string): Promise<void> {
+	return invoke('confirm_device_approval', { pendingDeviceId, sessionId });
+}
+
+export async function rejectPendingDevice(pendingDeviceId: string): Promise<void> {
+	return invoke('reject_pending_device', { pendingDeviceId });
+}
+
+export async function getMyApprovalStatus(): Promise<MyApprovalStatus> {
+	return invoke('get_my_approval_status');
+}
+
+export async function getHistory(page: number, pageSize: number = 20): Promise<HistoryPage> {
+	return invoke('get_history', { page, pageSize });
+}
+
+export async function searchHistory(query: string): Promise<HistoryEntry[]> {
+	return invoke('search_history', { query });
+}
+
+export async function copyEntry(entryId: string): Promise<void> {
+	return invoke('copy_entry', { entryId });
+}
+
+export async function deleteEntry(entryId: string): Promise<void> {
+	return invoke('delete_entry', { entryId });
+}
+
+export async function clearHistory(): Promise<void> {
+	return invoke('clear_history');
+}
+
+export async function syncHistory(): Promise<number> {
+	return invoke('sync_history');
+}
+
+export async function getConfig(): Promise<AppConfig> {
+	return invoke('get_config');
+}
+
+export async function updateConfig(updates: Partial<AppConfig>): Promise<void> {
+	return invoke('update_config', {
+		serverUrl: updates.server_url,
+		autoConnect: updates.auto_connect,
+		autostart: updates.autostart,
+		notificationsEnabled: updates.notifications_enabled,
+		globalHotkey: updates.global_hotkey
+	});
+}
+
+export async function changePassword(currentPassword: string, newPassword: string): Promise<void> {
+	return invoke('change_password', { currentPassword, newPassword });
+}
+
+export async function logout(): Promise<void> {
+	return invoke('logout');
+}
+
+export interface UpdateInfo {
+	update_available: boolean;
+	version: string;
+	download_url: string;
+	release_notes: string;
+}
+
+export async function checkUpdate(): Promise<UpdateInfo | null> {
+	return invoke('check_update');
+}
+
+export async function downloadAndInstallUpdate(downloadUrl: string): Promise<void> {
+	return invoke('download_and_install_update', { downloadUrl });
+}
+
+// === OAuth / Social Login ===
+
+export interface SocialStatus {
+	enabled: boolean;
+	provider: string;
+}
+
+export interface UserInfo {
+	id: string;
+	username: string;
+	email: string;
+	full_name: string;
+	email_verified: boolean;
+	auth_provider: string;
+	is_admin: boolean;
+	avatar_url: string | null;
+}
+
+export async function checkSocialStatus(serverUrl: string): Promise<SocialStatus> {
+	return invoke('check_social_status', { serverUrl });
+}
+
+export async function setupWithOAuthTokens(
+	serverUrl: string,
+	accessToken: string,
+	refreshToken: string,
+): Promise<void> {
+	return invoke('setup_with_oauth_tokens', { serverUrl, accessToken, refreshToken });
+}
+
+export async function getUserInfo(): Promise<UserInfo> {
+	return invoke('get_user_info');
+}
+
+export interface OAuthTokens {
+	access_token: string;
+	refresh_token: string;
+}
+
+export async function exchangeOAuthCode(
+	serverUrl: string,
+	code: string,
+	codeVerifier: string,
+): Promise<OAuthTokens> {
+	return invoke('exchange_oauth_code', { serverUrl, code, codeVerifier });
+}

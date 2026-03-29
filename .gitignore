@@ -1,0 +1,35 @@
+# Rust build output
+target/
+
+# Web frontend build output
+**/dist/
+**/node_modules/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Local development secrets
+.dev/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+
+# Tauri mobile generated projects
+desktop-tauri/src-tauri/gen/android/
+desktop-tauri/src-tauri/gen/apple/
+
+# SQLite local history
+*.db
+*.db-journal
+*.db-wal

@@ -1,0 +1,77 @@
+[package]
+name = "cpmesh-desktop"
+version = "0.1.0"
+description = "cpmesh - Encrypted Clipboard Sync"
+authors = ["cpmesh"]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "cpmesh_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Tauri
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-sql = { version = "2", features = ["sqlite"] }
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-deep-link = "2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Crypto
+p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+pem = "3"
+base64 = "0.22"
+zeroize = { version = "1", features = ["derive"] }
+
+# Async / Networking
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+futures-util = "0.3"
+url = "2"
+urlencoding = "2"
+
+# Image encoding (used on all platforms)
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Utilities
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+dirs = "6"
+gethostname = "1"
+
+# Windows-only dependencies
+[target.'cfg(target_os = "windows")'.dependencies]
+winreg = "0.55"
+
+# Desktop-only dependencies
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-single-instance = "2"
+arboard = "3"
+open = "5"
+keyring = { version = "3", features = ["windows-native", "apple-native", "sync-secret-service"] }
+
+[dev-dependencies]
+tempfile = "3"
+

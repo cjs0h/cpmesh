@@ -1,0 +1,287 @@
+use std::sync::Arc;
+use std::net::SocketAddr;
+use axum::{extract::{ConnectInfo, Extension, Path, State}, http::StatusCode, response::Response};
+use serde_json::json;
+
+use cpmesh_proto::models as proto;
+use crate::AppState;
+use crate::models::{AUDIT_DEVICE_APPROVE, AUDIT_DEVICE_REJECT};
+use super::middleware::{AuthClaims, extract_client_ip, json_error, json_response};
+
+/// GET /api/device-approvals/pending — list pending devices (requires approved device).
+pub async fn handle_list_pending(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<AuthClaims>,
+) -> Response {
+    let devices = match state.db.get_pending_devices_by_user(claims.user_id).await {
+        Ok(d) => d,
+        Err(_) => return json_error("failed to list pending devices", StatusCode::INTERNAL_SERVER_ERROR),
+    };
+
+    let infos: Vec<proto::PendingDeviceInfo> = devices.iter().map(|d| {
+        proto::PendingDeviceInfo {
+            id: d.id.to_string(),
+            name: d.name.clone(),
+            public_key: d.public_key.clone(),
+            public_key_sig: d.public_key_sig.clone(),
+            created_at: d.created_at,
+        }
+    }).collect();
+
+    json_response(StatusCode::OK, infos)
+}
+
+/// GET /api/device-approvals/me — pending device checks its own approval status.
+/// This endpoint is accessible to pending devices (not gated by approved-device middleware).
+pub async fn handle_my_approval_status(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<AuthClaims>,
+) -> Response {
+    let device_id = match claims.device_id {
+        Some(d) => d,
+        None => return json_error("device context required", StatusCode::BAD_REQUEST),
+    };
+
+    let device = match state.db.get_device_by_id(device_id).await {
+        Ok(d) => d,
+        Err(_) => return json_error("device not found", StatusCode::NOT_FOUND),
+    };
+
+    // Check for an active approval session
+    let session = state.db.get_approval_session(device_id).await.unwrap_or(None);
+
+    let (approver_device_id, approver_public_key, approver_public_key_sig, session_id) =
+        if let Some(ref sess) = session {
+            let approver = state.db.get_device_by_id(sess.approver_device_id).await.ok();
+            (
+                Some(sess.approver_device_id.to_string()),
+                approver.as_ref().map(|a| a.public_key.clone()),
+                approver.and_then(|a| a.public_key_sig.clone()),
+                Some(sess.id.to_string()),
+            )
+        } else {
+            (None, None, None, None)
+        };
+
+    json_response(StatusCode::OK, proto::ApprovalStatusResponse {
+        status: proto::DeviceStatus::from_str(&device.status),
+        approver_device_id,
+        approver_public_key,
+        approver_public_key_sig,
+        session_id,
+    })
+}
+
+/// POST /api/device-approvals/{pending_device_id}/begin — start approval session.
+pub async fn handle_begin_approval(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<AuthClaims>,
+    Path(pending_device_id): Path<uuid::Uuid>,
+) -> Response {
+    let approver_device_id = match claims.device_id {
+        Some(d) => d,
+        None => return json_error("device context required", StatusCode::BAD_REQUEST),
+    };
+
+    // Verify pending device belongs to same user and is pending
+    let pending_device = match state.db.get_device_by_id(pending_device_id).await {
+        Ok(d) => d,
+        Err(_) => return json_error("device not found", StatusCode::NOT_FOUND),
+    };
+
+    if pending_device.user_id != claims.user_id {
+        return json_error("device does not belong to this account", StatusCode::FORBIDDEN);
+    }
+
+    if pending_device.status != "pending" {
+        return json_error(&format!("device is not pending (status: {})", pending_device.status), StatusCode::CONFLICT);
+    }
+
+    // Create approval session (10 minute TTL)
+    let session = match state.db.create_approval_session(pending_device_id, approver_device_id, 600).await {
+        Ok(s) => s,
+        Err(e) => return json_error(&format!("failed to create session: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    };
+
+    json_response(StatusCode::OK, proto::ApprovalSessionResponse {
+        session_id: session.id.to_string(),
+        pending_device_id: pending_device_id.to_string(),
+        pending_public_key: pending_device.public_key,
+        pending_public_key_sig: pending_device.public_key_sig,
+        expires_at: session.expires_at,
+    })
+}
+
+/// POST /api/device-approvals/{pending_device_id}/approve — approve device + rotate key.
+pub async fn handle_approve_device(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<AuthClaims>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    Path(pending_device_id): Path<uuid::Uuid>,
+    axum::Json(req): axum::Json<proto::ApproveDeviceRequest>,
+) -> Response {
+    let approver_device_id = match claims.device_id {
+        Some(d) => d,
+        None => return json_error("device context required", StatusCode::BAD_REQUEST),
+    };
+
+    // Validate session
+    let session_id = match uuid::Uuid::parse_str(&req.session_id) {
+        Ok(id) => id,
+        Err(_) => return json_error("invalid session_id", StatusCode::BAD_REQUEST),
+    };
+
+    let session = match state.db.get_approval_session(pending_device_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return json_error("no active approval session for this device", StatusCode::NOT_FOUND),
+        Err(_) => return json_error("failed to check session", StatusCode::INTERNAL_SERVER_ERROR),
+    };
+
+    if session.id != session_id {
+        return json_error("session_id mismatch", StatusCode::BAD_REQUEST);
+    }
+
+    if session.approver_device_id != approver_device_id {
+        return json_error("you are not the approver for this session", StatusCode::FORBIDDEN);
+    }
+
+    // Verify pending device belongs to same user
+    let pending_device = match state.db.get_device_by_id(pending_device_id).await {
+        Ok(d) => d,
+        Err(_) => return json_error("pending device not found", StatusCode::NOT_FOUND),
+    };
+
+    if pending_device.user_id != claims.user_id || pending_device.status != "pending" {
+        return json_error("invalid pending device", StatusCode::BAD_REQUEST);
+    }
+
+    // Validate wrapped_keys covers all approved devices + the new device
+    let approved_devices = match state.db.get_approved_devices_by_user(claims.user_id).await {
+        Ok(d) => d,
+        Err(_) => return json_error("failed to get approved devices", StatusCode::INTERNAL_SERVER_ERROR),
+    };
+
+    let mut expected_device_ids: std::collections::HashSet<String> = approved_devices.iter()
+        .map(|d| d.id.to_string())
+        .collect();
+    expected_device_ids.insert(pending_device_id.to_string());
+
+    let provided_device_ids: std::collections::HashSet<String> = req.wrapped_keys.iter()
+        .map(|k| k.device_id.clone())
+        .collect();
+
+    if expected_device_ids != provided_device_ids {
+        return json_error(
+            "wrapped_keys must contain exactly one key for every approved device plus the newly approved device",
+            StatusCode::BAD_REQUEST,
+        );
+    }
+
+    // Parse wrapped keys
+    let mut keys = Vec::new();
+    for entry in &req.wrapped_keys {
+        let did = match uuid::Uuid::parse_str(&entry.device_id) {
+            Ok(d) => d,
+            Err(_) => return json_error("invalid device_id in wrapped_keys", StatusCode::BAD_REQUEST),
+        };
+        keys.push((did, entry.encrypted_key.clone()));
+    }
+
+    // Atomically: rotate group key (CAS) + approve device
+    let success = match state.db.rotate_group_key(
+        claims.user_id,
+        approver_device_id,
+        req.expected_current_version,
+        req.new_version,
+        &keys,
+        state.config.group_key_rotation_interval_hours,
+    ).await {
+        Ok(s) => s,
+        Err(e) => return json_error(&format!("failed to rotate key: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    };
+
+    if !success {
+        return json_error("version conflict — another rotation occurred, retry", StatusCode::CONFLICT);
+    }
+
+    // Mark device as approved
+    if let Err(e) = state.db.update_device_status(pending_device_id, claims.user_id, "approved", Some(approver_device_id)).await {
+        return json_error(&format!("failed to approve device: {e}"), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // Complete the session
+    let _ = state.db.complete_approval_session(session.id).await;
+
+    // Notify all devices about key update
+    let msg = cpmesh_proto::models::WsMessage {
+        msg_type: cpmesh_proto::models::MSG_GROUP_KEY_UPDATED.to_string(),
+        payload: json!({"from_device_id": approver_device_id.to_string(), "version": req.new_version}),
+    };
+    state.hub.broadcast_to_user(&claims.user_id.to_string(), "", &msg).await;
+
+    // Audit log
+    let ip = extract_client_ip(&headers, &addr, state.config.trust_proxy_headers);
+    let ua = headers.get(axum::http::header::USER_AGENT).and_then(|v| v.to_str().ok()).map(String::from);
+    let pool = state.db.pool.clone();
+    let uid = claims.user_id;
+    let ip_str = ip.to_string();
+    let dev_name = pending_device.name.clone();
+    tokio::spawn(async move {
+        let _ = sqlx::query(
+            "INSERT INTO audit_logs (user_id, action, ip_address, user_agent, details) VALUES ($1, $2, $3, $4, $5)"
+        )
+        .bind(Some(uid))
+        .bind(AUDIT_DEVICE_APPROVE)
+        .bind(&ip_str)
+        .bind(ua.as_deref())
+        .bind(&json!({"pending_device_id": pending_device_id.to_string(), "device_name": dev_name, "new_key_version": req.new_version}))
+        .execute(&pool)
+        .await;
+    });
+
+    json_response(StatusCode::OK, json!({"message": "device approved", "version": req.new_version}))
+}
+
+/// POST /api/device-approvals/{pending_device_id}/reject — reject a pending device.
+pub async fn handle_reject_device(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<AuthClaims>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    Path(pending_device_id): Path<uuid::Uuid>,
+) -> Response {
+    let pending_device = match state.db.get_device_by_id(pending_device_id).await {
+        Ok(d) => d,
+        Err(_) => return json_error("device not found", StatusCode::NOT_FOUND),
+    };
+
+    if pending_device.user_id != claims.user_id || pending_device.status != "pending" {
+        return json_error("invalid pending device", StatusCode::BAD_REQUEST);
+    }
+
+    if let Err(e) = state.db.update_device_status(pending_device_id, claims.user_id, "rejected", None).await {
+        return json_error(&format!("failed to reject device: {e}"), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // Audit log
+    let ip = extract_client_ip(&headers, &addr, state.config.trust_proxy_headers);
+    let ua = headers.get(axum::http::header::USER_AGENT).and_then(|v| v.to_str().ok()).map(String::from);
+    let pool = state.db.pool.clone();
+    let uid = claims.user_id;
+    let ip_str = ip.to_string();
+    tokio::spawn(async move {
+        let _ = sqlx::query(
+            "INSERT INTO audit_logs (user_id, action, ip_address, user_agent, details) VALUES ($1, $2, $3, $4, $5)"
+        )
+        .bind(Some(uid))
+        .bind(AUDIT_DEVICE_REJECT)
+        .bind(&ip_str)
+        .bind(ua.as_deref())
+        .bind(&json!({"pending_device_id": pending_device_id.to_string()}))
+        .execute(&pool)
+        .await;
+    });
+
+    json_response(StatusCode::OK, json!({"message": "device rejected"}))
+}
