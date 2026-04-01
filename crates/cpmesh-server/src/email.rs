@@ -24,7 +24,10 @@ impl EmailService {
             password: std::env::var("SMTP_PASSWORD").unwrap_or_default(),
             from: std::env::var("SMTP_FROM").unwrap_or_default(),
             use_tls,
-            base_url: std::env::var("BASE_URL").unwrap_or_default().trim_end_matches('/').to_string(),
+            base_url: std::env::var("BASE_URL")
+                .unwrap_or_default()
+                .trim_end_matches('/')
+                .to_string(),
         }
     }
 
@@ -46,7 +49,12 @@ impl EmailService {
         self.send_html(to_email, subject, body)
     }
 
-    pub fn send_verification_email(&self, to_email: &str, full_name: &str, token: &str) -> Result<(), String> {
+    pub fn send_verification_email(
+        &self,
+        to_email: &str,
+        full_name: &str,
+        token: &str,
+    ) -> Result<(), String> {
         if !self.is_configured() {
             warn!("SMTP not configured, skipping verification email");
             return Ok(());
@@ -81,7 +89,11 @@ impl EmailService {
         self.send_html(to_email, subject, &body)
     }
 
-    pub fn send_duplicate_registration_notice(&self, to_email: &str, name: &str) -> Result<(), String> {
+    pub fn send_duplicate_registration_notice(
+        &self,
+        to_email: &str,
+        name: &str,
+    ) -> Result<(), String> {
         if !self.is_configured() {
             return Ok(());
         }
@@ -114,7 +126,11 @@ impl EmailService {
         use lettre::{Message, SmtpTransport, Transport};
 
         let email = Message::builder()
-            .from(self.from.parse().map_err(|e| format!("invalid from: {e}"))?)
+            .from(
+                self.from
+                    .parse()
+                    .map_err(|e| format!("invalid from: {e}"))?,
+            )
             .to(to.parse().map_err(|e| format!("invalid to: {e}"))?)
             .subject(subject)
             .header(ContentType::TEXT_HTML)

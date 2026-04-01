@@ -43,7 +43,10 @@ impl Config {
         let registration_open = !matches!(reg.to_lowercase().as_str(), "false" | "0");
 
         Config {
-            database_url: env("DATABASE_URL", "postgres://cpmesh:cpmesh@localhost:5432/cpmesh?sslmode=disable"),
+            database_url: env(
+                "DATABASE_URL",
+                "postgres://cpmesh:cpmesh@localhost:5432/cpmesh?sslmode=disable",
+            ),
             jwt_active_kid: env("JWT_ACTIVE_KID", ""),
             jwt_private_key_path: env("JWT_PRIVATE_KEY_PATH", ""),
             jwt_public_keys_path: env("JWT_PUBLIC_KEYS_PATH", ""),
@@ -63,7 +66,9 @@ impl Config {
             oidc_client_secret: env("OIDC_CLIENT_SECRET", ""),
             oidc_callback_url: env("OIDC_CALLBACK_URL", ""),
             trust_proxy_headers: env("TRUST_PROXY_HEADERS", "0") == "1",
-            group_key_rotation_interval_hours: env("GROUP_KEY_ROTATION_INTERVAL_HOURS", "24").parse().unwrap_or(24),
+            group_key_rotation_interval_hours: env("GROUP_KEY_ROTATION_INTERVAL_HOURS", "24")
+                .parse()
+                .unwrap_or(24),
         }
     }
 }

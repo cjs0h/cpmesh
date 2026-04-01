@@ -1,11 +1,11 @@
-use jsonwebtoken::{decode, encode, Header, Validation, DecodingKey, EncodingKey, Algorithm};
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use std::sync::RwLock;
 use std::collections::HashMap;
+use std::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
-use rand::rngs::OsRng;
 use tracing::warn;
 
 use crate::routes::middleware::AuthClaims;
@@ -57,7 +57,12 @@ impl AuthService {
     /// - `active_kid`: key ID to embed in JWT headers
     /// - `private_key_pem`: RSA private key in PEM format for signing
     /// - `public_keys_json`: JSON array of `[{"kid":"...", "pem":"..."}]` for verification
-    pub fn new(active_kid: &str, private_key_pem: &str, public_keys_json: &str, pool: Option<PgPool>) -> Result<Self, String> {
+    pub fn new(
+        active_kid: &str,
+        private_key_pem: &str,
+        public_keys_json: &str,
+        pool: Option<PgPool>,
+    ) -> Result<Self, String> {
         let encoding_key = EncodingKey::from_rsa_pem(private_key_pem.as_bytes())
             .map_err(|e| format!("invalid JWT private key PEM: {e}"))?;
 
@@ -70,7 +75,7 @@ impl AuthService {
             active_kid: active_kid.to_string(),
             encoding_key,
             public_keys,
-            access_expiry: Duration::from_secs(3600),           // 1 hour
+            access_expiry: Duration::from_secs(3600), // 1 hour
             refresh_expiry: Duration::from_secs(7 * 24 * 3600), // 7 days
             revoked: RwLock::new(HashMap::new()),
             pool,
@@ -96,7 +101,11 @@ impl AuthService {
             .is_ok()
     }
 
-    pub fn generate_access_token(&self, user_id: uuid::Uuid, device_id: Option<uuid::Uuid>) -> Result<String, String> {
+    pub fn generate_access_token(
+        &self,
+        user_id: uuid::Uuid,
+        device_id: Option<uuid::Uuid>,
+    ) -> Result<String, String> {
         let now = now_secs();
         let claims = Claims {
             user_id: user_id.to_string(),
@@ -108,8 +117,7 @@ impl AuthService {
         };
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(self.active_kid.clone());
-        encode(&header, &claims, &self.encoding_key)
-            .map_err(|e| format!("encode token: {e}"))
+        encode(&header, &claims, &self.encoding_key).map_err(|e| format!("encode token: {e}"))
     }
 
     pub fn generate_refresh_token(&self, user_id: uuid::Uuid) -> Result<String, String> {
@@ -124,18 +132,20 @@ impl AuthService {
         };
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(self.active_kid.clone());
-        encode(&header, &claims, &self.encoding_key)
-            .map_err(|e| format!("encode token: {e}"))
+        encode(&header, &claims, &self.encoding_key).map_err(|e| format!("encode token: {e}"))
     }
 
     /// Select the decoding key matching the token's `kid` header claim.
     fn decoding_key_for_token(&self, token: &str) -> Result<&DecodingKey, String> {
-        let header = jsonwebtoken::decode_header(token)
-            .map_err(|e| format!("invalid token header: {e}"))?;
+        let header =
+            jsonwebtoken::decode_header(token).map_err(|e| format!("invalid token header: {e}"))?;
 
         // Reject non-RS256 tokens
         if header.alg != Algorithm::RS256 {
-            return Err(format!("unsupported token algorithm: {:?}, only RS256 is accepted", header.alg));
+            return Err(format!(
+                "unsupported token algorithm: {:?}, only RS256 is accepted",
+                header.alg
+            ));
         }
 
         let kid = header.kid.unwrap_or_default();
@@ -177,10 +187,16 @@ impl AuthService {
 
         let user_id = uuid::Uuid::parse_str(&data.claims.user_id)
             .map_err(|e| format!("invalid user_id in token: {e}"))?;
-        let device_id = data.claims.device_id
+        let device_id = data
+            .claims
+            .device_id
             .and_then(|d| uuid::Uuid::parse_str(&d).ok());
 
-        Ok(AuthClaims { user_id, device_id, iat: data.claims.iat })
+        Ok(AuthClaims {
+            user_id,
+            device_id,
+            iat: data.claims.iat,
+        })
     }
 
     /// Validate a refresh token. Returns the claims, JTI, and expiry on success.
@@ -218,11 +234,17 @@ impl AuthService {
             Ok(uid) => uid,
             Err(e) => return RefreshResult::Invalid(format!("invalid user_id: {e}")),
         };
-        let device_id = data.claims.device_id
+        let device_id = data
+            .claims
+            .device_id
             .and_then(|d| uuid::Uuid::parse_str(&d).ok());
 
         RefreshResult::Ok(
-            AuthClaims { user_id, device_id, iat: data.claims.iat },
+            AuthClaims {
+                user_id,
+                device_id,
+                iat: data.claims.iat,
+            },
             data.claims.jti,
             data.claims.exp,
         )
@@ -263,13 +285,12 @@ impl AuthService {
     /// Check if a JTI is revoked in the database and promote to in-memory cache.
     pub async fn check_revoked_db_async(&self, jti: &str) -> bool {
         if let Some(ref pool) = self.pool {
-            let row: Option<(i64,)> = sqlx::query_as(
-                "SELECT expires_at FROM revoked_tokens WHERE jti = $1"
-            )
-            .bind(jti)
-            .fetch_optional(pool)
-            .await
-            .unwrap_or(None);
+            let row: Option<(i64,)> =
+                sqlx::query_as("SELECT expires_at FROM revoked_tokens WHERE jti = $1")
+                    .bind(jti)
+                    .fetch_optional(pool)
+                    .await
+                    .unwrap_or(None);
 
             if let Some((expires_at,)) = row {
                 // Promote to L1 cache
@@ -312,14 +333,20 @@ fn parse_public_keys(json_str: &str) -> Result<Vec<PublicKeyEntry>, String> {
         pem: String,
     }
 
-    let entries: Vec<KeyEntry> = serde_json::from_str(json_str)
-        .map_err(|e| format!("invalid JWT_PUBLIC_KEYS_JSON: {e}"))?;
+    let entries: Vec<KeyEntry> =
+        serde_json::from_str(json_str).map_err(|e| format!("invalid JWT_PUBLIC_KEYS_JSON: {e}"))?;
 
-    entries.into_iter().map(|entry| {
-        let decoding_key = DecodingKey::from_rsa_pem(entry.pem.as_bytes())
-            .map_err(|e| format!("invalid public key PEM for kid '{}': {e}", entry.kid))?;
-        Ok(PublicKeyEntry { kid: entry.kid, decoding_key })
-    }).collect()
+    entries
+        .into_iter()
+        .map(|entry| {
+            let decoding_key = DecodingKey::from_rsa_pem(entry.pem.as_bytes())
+                .map_err(|e| format!("invalid public key PEM for kid '{}': {e}", entry.kid))?;
+            Ok(PublicKeyEntry {
+                kid: entry.kid,
+                decoding_key,
+            })
+        })
+        .collect()
 }
 
 fn now_secs() -> u64 {

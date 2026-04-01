@@ -1,11 +1,15 @@
-use std::sync::Arc;
-use axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}};
+use axum::{
+    extract::{Extension, Path, Query, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 use base64::Engine;
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::Arc;
 
-use crate::AppState;
 use super::middleware::{AuthClaims, json_error, json_response};
+use crate::AppState;
 
 #[derive(Deserialize)]
 pub struct PaginationQuery {
@@ -26,10 +30,13 @@ pub async fn handle_get_clipboard_history(
         if let Some(max_history) = sub.max_clipboard_history {
             if max_history > 0 {
                 if offset >= max_history as i64 {
-                    return json_response(StatusCode::OK, json!({
-                        "entries": [],
-                        "has_more": false,
-                    }));
+                    return json_response(
+                        StatusCode::OK,
+                        json!({
+                            "entries": [],
+                            "has_more": false,
+                        }),
+                    );
                 }
                 if offset + limit > max_history as i64 {
                     limit = max_history as i64 - offset;
@@ -38,7 +45,11 @@ pub async fn handle_get_clipboard_history(
         }
     }
 
-    let entries = match state.db.get_clipboard_history(claims.user_id, limit + 1, offset).await {
+    let entries = match state
+        .db
+        .get_clipboard_history(claims.user_id, limit + 1, offset)
+        .await
+    {
         Ok(e) => e,
         Err(_) => return json_error("failed to get history", StatusCode::INTERNAL_SERVER_ERROR),
     };
@@ -58,10 +69,13 @@ pub async fn handle_get_clipboard_history(
         })
     }).collect();
 
-    json_response(StatusCode::OK, json!({
-        "entries": entries,
-        "has_more": has_more,
-    }))
+    json_response(
+        StatusCode::OK,
+        json!({
+            "entries": entries,
+            "has_more": has_more,
+        }),
+    )
 }
 
 pub async fn handle_delete_clipboard_entry(
@@ -69,7 +83,11 @@ pub async fn handle_delete_clipboard_entry(
     Extension(claims): Extension<AuthClaims>,
     Path(entry_id): Path<uuid::Uuid>,
 ) -> Response {
-    if let Err(_) = state.db.delete_clipboard_entry(entry_id, claims.user_id).await {
+    if let Err(_) = state
+        .db
+        .delete_clipboard_entry(entry_id, claims.user_id)
+        .await
+    {
         return json_error("entry not found", StatusCode::NOT_FOUND);
     }
     StatusCode::NO_CONTENT.into_response()

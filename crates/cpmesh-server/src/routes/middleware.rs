@@ -1,6 +1,3 @@
-use std::sync::Arc;
-use std::net::{IpAddr, SocketAddr};
-use std::num::NonZeroU32;
 use axum::{
     extract::{ConnectInfo, Request, State},
     http::{StatusCode, header},
@@ -9,15 +6,18 @@ use axum::{
 };
 use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DefaultKeyedStateStore};
 use serde_json::json;
+use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroU32;
+use std::sync::Arc;
 
 use crate::AppState;
 
 pub type IpRateLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
 
 pub fn build_rate_limiter(per_minute: u32) -> Arc<IpRateLimiter> {
-    Arc::new(RateLimiter::keyed(
-        Quota::per_minute(NonZeroU32::new(per_minute).expect("rate limit must be non-zero")),
-    ))
+    Arc::new(RateLimiter::keyed(Quota::per_minute(
+        NonZeroU32::new(per_minute).expect("rate limit must be non-zero"),
+    )))
 }
 
 #[derive(Clone)]
@@ -49,12 +49,18 @@ pub async fn auth_middleware(
             // Check if token was issued before bulk revocation
             if let Some(revoked_before) = user.tokens_revoked_before {
                 if revoked_before > 0 && (claims.iat as i64) < revoked_before {
-                    return json_error("session has been revoked, please log in again", StatusCode::UNAUTHORIZED);
+                    return json_error(
+                        "session has been revoked, please log in again",
+                        StatusCode::UNAUTHORIZED,
+                    );
                 }
             }
         }
         Err(_) => {
-            return json_error("user no longer exists, please re-register or log in again", StatusCode::UNAUTHORIZED);
+            return json_error(
+                "user no longer exists, please re-register or log in again",
+                StatusCode::UNAUTHORIZED,
+            );
         }
     }
 
@@ -79,7 +85,9 @@ pub async fn approved_device_middleware(
             Ok(status) if status == "approved" => {}
             Ok(status) => {
                 return json_error(
-                    &format!("device is not approved (status: {status}). Approval from another device is required."),
+                    &format!(
+                        "device is not approved (status: {status}). Approval from another device is required."
+                    ),
                     StatusCode::FORBIDDEN,
                 );
             }
@@ -111,12 +119,42 @@ pub async fn admin_middleware(
 pub async fn security_headers(req: Request, next: Next) -> Response {
     let mut response = next.run(req).await;
     let headers = response.headers_mut();
-    headers.insert("X-Content-Type-Options", "nosniff".parse().expect("Failed to parse X-Content-Type-Options header"));
-    headers.insert("X-Frame-Options", "DENY".parse().expect("Failed to parse X-Frame-Options header"));
-    headers.insert("Referrer-Policy", "no-referrer".parse().expect("Failed to parse Referrer-Policy header"));
-    headers.insert("X-XSS-Protection", "1; mode=block".parse().expect("Failed to parse X-XSS-Protection header"));
-    headers.insert("Permissions-Policy", "clipboard-read=(self), clipboard-write=(self)".parse().expect("Failed to parse Permissions-Policy header"));
-    headers.insert("Strict-Transport-Security", "max-age=63072000; includeSubDomains".parse().expect("Failed to parse Strict-Transport-Security header"));
+    headers.insert(
+        "X-Content-Type-Options",
+        "nosniff"
+            .parse()
+            .expect("Failed to parse X-Content-Type-Options header"),
+    );
+    headers.insert(
+        "X-Frame-Options",
+        "DENY"
+            .parse()
+            .expect("Failed to parse X-Frame-Options header"),
+    );
+    headers.insert(
+        "Referrer-Policy",
+        "no-referrer"
+            .parse()
+            .expect("Failed to parse Referrer-Policy header"),
+    );
+    headers.insert(
+        "X-XSS-Protection",
+        "1; mode=block"
+            .parse()
+            .expect("Failed to parse X-XSS-Protection header"),
+    );
+    headers.insert(
+        "Permissions-Policy",
+        "clipboard-read=(self), clipboard-write=(self)"
+            .parse()
+            .expect("Failed to parse Permissions-Policy header"),
+    );
+    headers.insert(
+        "Strict-Transport-Security",
+        "max-age=63072000; includeSubDomains"
+            .parse()
+            .expect("Failed to parse Strict-Transport-Security header"),
+    );
     headers.insert("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' wss: ws:; font-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'".parse().expect("Failed to parse Content-Security-Policy header"));
     response
 }
@@ -142,7 +180,11 @@ fn extract_token(req: &Request) -> Option<String> {
 }
 
 /// Extract real client IP, respecting X-Forwarded-For when trust_proxy is true.
-pub fn extract_client_ip(headers: &axum::http::HeaderMap, addr: &SocketAddr, trust_proxy: bool) -> IpAddr {
+pub fn extract_client_ip(
+    headers: &axum::http::HeaderMap,
+    addr: &SocketAddr,
+    trust_proxy: bool,
+) -> IpAddr {
     if trust_proxy {
         if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
             if let Some(first) = xff.split(',').next() {
@@ -171,7 +213,10 @@ pub async fn rate_limit_auth(
     };
     match limiter.check_key(&ip) {
         Ok(_) => next.run(req).await,
-        Err(_) => json_error("too many requests, please try again later", StatusCode::TOO_MANY_REQUESTS),
+        Err(_) => json_error(
+            "too many requests, please try again later",
+            StatusCode::TOO_MANY_REQUESTS,
+        ),
     }
 }
 

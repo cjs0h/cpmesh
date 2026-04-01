@@ -35,15 +35,17 @@ impl std::fmt::Display for DeviceStatus {
     }
 }
 
-impl DeviceStatus {
-    pub fn from_str(s: &str) -> Self {
-        match s {
+impl std::str::FromStr for DeviceStatus {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
             "pending" => DeviceStatus::Pending,
             "approved" => DeviceStatus::Approved,
             "rejected" => DeviceStatus::Rejected,
             "revoked" => DeviceStatus::Revoked,
             _ => DeviceStatus::Pending,
-        }
+        })
     }
 }
 
@@ -167,7 +169,11 @@ pub struct RegisterDeviceRequest {
     pub name: String,
     #[serde(with = "base64_serde")]
     pub public_key: Vec<u8>,
-    #[serde(skip_serializing_if = "Option::is_none", default, with = "option_base64_serde")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        with = "option_base64_serde"
+    )]
     pub public_key_sig: Option<Vec<u8>>,
     /// Stable device fingerprint: SHA-256 hex of platform hardware ID salted with user_id.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -178,9 +184,17 @@ pub struct RegisterDeviceRequest {
 pub struct DeviceInfo {
     pub id: String,
     pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "option_base64_serde")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_base64_serde"
+    )]
     pub public_key: Option<Vec<u8>>,
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "option_base64_serde")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_base64_serde"
+    )]
     pub public_key_sig: Option<Vec<u8>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_seen: Option<String>,
@@ -351,9 +365,17 @@ pub struct ApprovalStatusResponse {
     pub status: DeviceStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approver_device_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "option_base64_serde")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_base64_serde"
+    )]
     pub approver_public_key: Option<Vec<u8>>,
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "option_base64_serde")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_base64_serde"
+    )]
     pub approver_public_key_sig: Option<Vec<u8>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
@@ -361,7 +383,7 @@ pub struct ApprovalStatusResponse {
 
 /// Serde helper for base64-encoding Vec<u8> in JSON.
 pub mod base64_serde {
-    use base64::{engine::general_purpose::STANDARD, Engine};
+    use base64::{Engine, engine::general_purpose::STANDARD};
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(data: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
@@ -376,7 +398,7 @@ pub mod base64_serde {
 
 /// Serde helper for base64-encoding Option<Vec<u8>> in JSON.
 pub mod option_base64_serde {
-    use base64::{engine::general_purpose::STANDARD, Engine};
+    use base64::{Engine, engine::general_purpose::STANDARD};
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(data: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
@@ -389,7 +411,10 @@ pub mod option_base64_serde {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
         let opt: Option<String> = Option::deserialize(d)?;
         match opt {
-            Some(s) => STANDARD.decode(&s).map(Some).map_err(serde::de::Error::custom),
+            Some(s) => STANDARD
+                .decode(&s)
+                .map(Some)
+                .map_err(serde::de::Error::custom),
             None => Ok(None),
         }
     }

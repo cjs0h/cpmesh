@@ -1,5 +1,5 @@
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 
 use crate::models::*;
 use crate::pii::PiiService;
@@ -56,26 +56,26 @@ impl Db {
 
     pub async fn get_user_by_username(&self, username: &str) -> Result<User, sqlx::Error> {
         let idx = username.trim().to_lowercase();
-        sqlx::query_as::<_, User>(
-            "SELECT * FROM users WHERE username_idx = $1"
-        )
-        .bind(&idx)
-        .fetch_one(&self.pool)
-        .await
+        sqlx::query_as::<_, User>("SELECT * FROM users WHERE username_idx = $1")
+            .bind(&idx)
+            .fetch_one(&self.pool)
+            .await
     }
 
-    pub async fn get_user_by_email(&self, email: &str, pii: Option<&PiiService>) -> Result<User, sqlx::Error> {
+    pub async fn get_user_by_email(
+        &self,
+        email: &str,
+        pii: Option<&PiiService>,
+    ) -> Result<User, sqlx::Error> {
         let idx = if let Some(p) = pii {
             p.blind_index(email)
         } else {
             email.trim().to_lowercase()
         };
-        sqlx::query_as::<_, User>(
-            "SELECT * FROM users WHERE email_idx = $1"
-        )
-        .bind(&idx)
-        .fetch_one(&self.pool)
-        .await
+        sqlx::query_as::<_, User>("SELECT * FROM users WHERE email_idx = $1")
+            .bind(&idx)
+            .fetch_one(&self.pool)
+            .await
     }
 
     pub async fn get_user_by_id(&self, user_id: uuid::Uuid) -> Result<User, sqlx::Error> {
@@ -86,14 +86,19 @@ impl Db {
     }
 
     /// Find an OIDC user by provider+subject (using the blind-index column).
-    pub async fn get_user_by_provider_id(&self, provider: &str, provider_id: &str, pii: Option<&PiiService>) -> Result<User, sqlx::Error> {
+    pub async fn get_user_by_provider_id(
+        &self,
+        provider: &str,
+        provider_id: &str,
+        pii: Option<&PiiService>,
+    ) -> Result<User, sqlx::Error> {
         let idx = if let Some(p) = pii {
             p.blind_index(provider_id)
         } else {
             provider_id.to_string()
         };
         sqlx::query_as::<_, User>(
-            "SELECT * FROM users WHERE auth_provider = $1 AND auth_provider_id_idx = $2"
+            "SELECT * FROM users WHERE auth_provider = $1 AND auth_provider_id_idx = $2",
         )
         .bind(provider)
         .bind(&idx)
@@ -103,14 +108,27 @@ impl Db {
 
     /// Create a user from an OIDC provider. Email is auto-verified, no password.
     pub async fn create_oidc_user(
-        &self, username: &str, email: &str, full_name: &str,
-        provider: &str, provider_id: &str, avatar_url: Option<&str>,
+        &self,
+        username: &str,
+        email: &str,
+        full_name: &str,
+        provider: &str,
+        provider_id: &str,
+        avatar_url: Option<&str>,
         pii: Option<&PiiService>,
     ) -> Result<User, sqlx::Error> {
         let (enc_email, email_idx, enc_full_name, username_idx, _, _) =
             encrypt_user_fields(username, email, full_name, None, None, pii);
-        let enc_provider_id = if let Some(p) = pii { p.encrypt(provider_id).unwrap_or_default() } else { provider_id.to_string() };
-        let provider_id_idx = if let Some(p) = pii { p.blind_index(provider_id) } else { provider_id.to_string() };
+        let enc_provider_id = if let Some(p) = pii {
+            p.encrypt(provider_id).unwrap_or_default()
+        } else {
+            provider_id.to_string()
+        };
+        let provider_id_idx = if let Some(p) = pii {
+            p.blind_index(provider_id)
+        } else {
+            provider_id.to_string()
+        };
 
         sqlx::query_as::<_, User>(
             "INSERT INTO users (username, password, email, email_idx, full_name, email_verified, auth_provider, auth_provider_id, auth_provider_id_idx, avatar_url, username_idx)
@@ -130,7 +148,11 @@ impl Db {
         .await
     }
 
-    pub async fn change_password(&self, user_id: uuid::Uuid, new_hash: &str) -> Result<(), sqlx::Error> {
+    pub async fn change_password(
+        &self,
+        user_id: uuid::Uuid,
+        new_hash: &str,
+    ) -> Result<(), sqlx::Error> {
         let result = sqlx::query("UPDATE users SET password = $1 WHERE id = $2")
             .bind(new_hash)
             .bind(user_id)
@@ -142,7 +164,11 @@ impl Db {
         Ok(())
     }
 
-    pub async fn set_email_verified(&self, user_id: uuid::Uuid, verified: bool) -> Result<(), sqlx::Error> {
+    pub async fn set_email_verified(
+        &self,
+        user_id: uuid::Uuid,
+        verified: bool,
+    ) -> Result<(), sqlx::Error> {
         let result = sqlx::query("UPDATE users SET email_verified = $1 WHERE id = $2")
             .bind(verified)
             .bind(user_id)
@@ -156,11 +182,21 @@ impl Db {
 
     // === Admin user seeding ===
 
-    pub async fn seed_admin(&self, username: &str, password_hash: &str, email: &str, pii: Option<&PiiService>) -> Result<(), sqlx::Error> {
+    pub async fn seed_admin(
+        &self,
+        username: &str,
+        password_hash: &str,
+        email: &str,
+        pii: Option<&PiiService>,
+    ) -> Result<(), sqlx::Error> {
         let username_idx = username.trim().to_lowercase();
         let (enc_email, email_idx) = if let Some(p) = pii {
             let enc = p.encrypt(email).unwrap_or_default();
-            let idx = if email.is_empty() { String::new() } else { p.blind_index(email) };
+            let idx = if email.is_empty() {
+                String::new()
+            } else {
+                p.blind_index(email)
+            };
             (enc, idx)
         } else {
             (email.to_string(), email.trim().to_lowercase())
@@ -189,7 +225,15 @@ impl Db {
 
     // === Device operations ===
 
-    pub async fn create_device(&self, user_id: uuid::Uuid, name: &str, public_key: &[u8], public_key_sig: Option<&[u8]>, status: &str, fingerprint: Option<&str>) -> Result<Device, sqlx::Error> {
+    pub async fn create_device(
+        &self,
+        user_id: uuid::Uuid,
+        name: &str,
+        public_key: &[u8],
+        public_key_sig: Option<&[u8]>,
+        status: &str,
+        fingerprint: Option<&str>,
+    ) -> Result<Device, sqlx::Error> {
         let approved_at = if status == "approved" {
             Some(chrono::Utc::now())
         } else {
@@ -211,17 +255,26 @@ impl Db {
         .await
     }
 
-    pub async fn get_device_by_fingerprint(&self, user_id: uuid::Uuid, fingerprint: &str) -> Result<Option<Device>, sqlx::Error> {
-        sqlx::query_as::<_, Device>(
-            "SELECT * FROM devices WHERE user_id = $1 AND fingerprint = $2"
-        )
-        .bind(user_id)
-        .bind(fingerprint)
-        .fetch_optional(&self.pool)
-        .await
+    pub async fn get_device_by_fingerprint(
+        &self,
+        user_id: uuid::Uuid,
+        fingerprint: &str,
+    ) -> Result<Option<Device>, sqlx::Error> {
+        sqlx::query_as::<_, Device>("SELECT * FROM devices WHERE user_id = $1 AND fingerprint = $2")
+            .bind(user_id)
+            .bind(fingerprint)
+            .fetch_optional(&self.pool)
+            .await
     }
 
-    pub async fn reregister_device(&self, device_id: uuid::Uuid, name: &str, public_key: &[u8], public_key_sig: Option<&[u8]>, status: &str) -> Result<Device, sqlx::Error> {
+    pub async fn reregister_device(
+        &self,
+        device_id: uuid::Uuid,
+        name: &str,
+        public_key: &[u8],
+        public_key_sig: Option<&[u8]>,
+        status: &str,
+    ) -> Result<Device, sqlx::Error> {
         let approved_at = if status == "approved" {
             Some(chrono::Utc::now())
         } else {
@@ -231,7 +284,7 @@ impl Db {
         let device = sqlx::query_as::<_, Device>(
             "UPDATE devices SET name = $2, public_key = $3, public_key_sig = $4, status = $5,
              approved_at = $6, approved_by_device_id = NULL, last_seen = NOW()
-             WHERE id = $1 RETURNING *"
+             WHERE id = $1 RETURNING *",
         )
         .bind(device_id)
         .bind(name)
@@ -255,7 +308,12 @@ impl Db {
         Ok(device)
     }
 
-    pub async fn set_device_fingerprint(&self, device_id: uuid::Uuid, user_id: uuid::Uuid, fingerprint: &str) -> Result<bool, sqlx::Error> {
+    pub async fn set_device_fingerprint(
+        &self,
+        device_id: uuid::Uuid,
+        user_id: uuid::Uuid,
+        fingerprint: &str,
+    ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             "UPDATE devices SET fingerprint = $1 WHERE id = $2 AND user_id = $3 AND fingerprint IS NULL"
         )
@@ -267,13 +325,14 @@ impl Db {
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn get_devices_by_user(&self, user_id: uuid::Uuid) -> Result<Vec<Device>, sqlx::Error> {
-        sqlx::query_as::<_, Device>(
-            "SELECT * FROM devices WHERE user_id = $1 ORDER BY created_at"
-        )
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await
+    pub async fn get_devices_by_user(
+        &self,
+        user_id: uuid::Uuid,
+    ) -> Result<Vec<Device>, sqlx::Error> {
+        sqlx::query_as::<_, Device>("SELECT * FROM devices WHERE user_id = $1 ORDER BY created_at")
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await
     }
 
     pub async fn get_device_by_id(&self, device_id: uuid::Uuid) -> Result<Device, sqlx::Error> {
@@ -283,7 +342,11 @@ impl Db {
             .await
     }
 
-    pub async fn delete_device(&self, device_id: uuid::Uuid, user_id: uuid::Uuid) -> Result<(), sqlx::Error> {
+    pub async fn delete_device(
+        &self,
+        device_id: uuid::Uuid,
+        user_id: uuid::Uuid,
+    ) -> Result<(), sqlx::Error> {
         let result = sqlx::query("DELETE FROM devices WHERE id = $1 AND user_id = $2")
             .bind(device_id)
             .bind(user_id)
@@ -329,7 +392,12 @@ impl Db {
         .await
     }
 
-    pub async fn get_clipboard_history(&self, user_id: uuid::Uuid, limit: i64, offset: i64) -> Result<Vec<ClipboardEntryWithDevice>, sqlx::Error> {
+    pub async fn get_clipboard_history(
+        &self,
+        user_id: uuid::Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<ClipboardEntryWithDevice>, sqlx::Error> {
         sqlx::query_as::<_, ClipboardEntryWithDevice>(
             "SELECT e.id, e.user_id, e.device_id, d.name as device_name, e.content_type, e.encrypted_data, e.metadata, e.created_at, e.key_version
              FROM clipboard_entries e
@@ -345,7 +413,11 @@ impl Db {
         .await
     }
 
-    pub async fn delete_clipboard_entry(&self, entry_id: uuid::Uuid, user_id: uuid::Uuid) -> Result<(), sqlx::Error> {
+    pub async fn delete_clipboard_entry(
+        &self,
+        entry_id: uuid::Uuid,
+        user_id: uuid::Uuid,
+    ) -> Result<(), sqlx::Error> {
         let result = sqlx::query("DELETE FROM clipboard_entries WHERE id = $1 AND user_id = $2")
             .bind(entry_id)
             .bind(user_id)
@@ -365,20 +437,28 @@ impl Db {
         Ok(())
     }
 
-    pub async fn count_user_clipboard_entries(&self, user_id: uuid::Uuid) -> Result<i64, sqlx::Error> {
-        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM clipboard_entries WHERE user_id = $1")
-            .bind(user_id)
-            .fetch_one(&self.pool)
-            .await?;
+    pub async fn count_user_clipboard_entries(
+        &self,
+        user_id: uuid::Uuid,
+    ) -> Result<i64, sqlx::Error> {
+        let row: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM clipboard_entries WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_one(&self.pool)
+                .await?;
         Ok(row.0)
     }
 
-    pub async fn delete_oldest_clipboard_entries(&self, user_id: uuid::Uuid, count: i64) -> Result<(), sqlx::Error> {
+    pub async fn delete_oldest_clipboard_entries(
+        &self,
+        user_id: uuid::Uuid,
+        count: i64,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "DELETE FROM clipboard_entries WHERE id IN (
                 SELECT id FROM clipboard_entries WHERE user_id = $1
                 ORDER BY created_at ASC LIMIT $2
-            )"
+            )",
         )
         .bind(user_id)
         .bind(count)
@@ -389,7 +469,11 @@ impl Db {
 
     // === Group key operations ===
 
-    pub async fn store_group_keys(&self, from_device_id: uuid::Uuid, keys: &[(uuid::Uuid, Vec<u8>)]) -> Result<(), sqlx::Error> {
+    pub async fn store_group_keys(
+        &self,
+        from_device_id: uuid::Uuid,
+        keys: &[(uuid::Uuid, Vec<u8>)],
+    ) -> Result<(), sqlx::Error> {
         for (device_id, encrypted_key) in keys {
             sqlx::query(
                 "INSERT INTO group_keys (device_id, encrypted_key, from_device_id, updated_at)
@@ -397,7 +481,7 @@ impl Db {
                  ON CONFLICT (device_id) DO UPDATE
                  SET encrypted_key = EXCLUDED.encrypted_key,
                      from_device_id = EXCLUDED.from_device_id,
-                     updated_at = NOW()"
+                     updated_at = NOW()",
             )
             .bind(device_id)
             .bind(encrypted_key)
@@ -410,7 +494,7 @@ impl Db {
 
     pub async fn get_group_key(&self, device_id: uuid::Uuid) -> Result<GroupKeyRow, sqlx::Error> {
         sqlx::query_as::<_, GroupKeyRow>(
-            "SELECT encrypted_key, from_device_id FROM group_keys WHERE device_id = $1"
+            "SELECT encrypted_key, from_device_id FROM group_keys WHERE device_id = $1",
         )
         .bind(device_id)
         .fetch_one(&self.pool)
@@ -427,18 +511,24 @@ impl Db {
         Ok(row.0)
     }
 
-    pub async fn get_approved_devices_by_user(&self, user_id: uuid::Uuid) -> Result<Vec<Device>, sqlx::Error> {
+    pub async fn get_approved_devices_by_user(
+        &self,
+        user_id: uuid::Uuid,
+    ) -> Result<Vec<Device>, sqlx::Error> {
         sqlx::query_as::<_, Device>(
-            "SELECT * FROM devices WHERE user_id = $1 AND status = 'approved' ORDER BY created_at"
+            "SELECT * FROM devices WHERE user_id = $1 AND status = 'approved' ORDER BY created_at",
         )
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
     }
 
-    pub async fn get_pending_devices_by_user(&self, user_id: uuid::Uuid) -> Result<Vec<Device>, sqlx::Error> {
+    pub async fn get_pending_devices_by_user(
+        &self,
+        user_id: uuid::Uuid,
+    ) -> Result<Vec<Device>, sqlx::Error> {
         sqlx::query_as::<_, Device>(
-            "SELECT * FROM devices WHERE user_id = $1 AND status = 'pending' ORDER BY created_at"
+            "SELECT * FROM devices WHERE user_id = $1 AND status = 'pending' ORDER BY created_at",
         )
         .bind(user_id)
         .fetch_all(&self.pool)
@@ -446,7 +536,10 @@ impl Db {
     }
 
     pub async fn update_device_status(
-        &self, device_id: uuid::Uuid, user_id: uuid::Uuid, status: &str,
+        &self,
+        device_id: uuid::Uuid,
+        user_id: uuid::Uuid,
+        status: &str,
         approved_by: Option<uuid::Uuid>,
     ) -> Result<(), sqlx::Error> {
         let approved_at = if status == "approved" {
@@ -471,7 +564,10 @@ impl Db {
     }
 
     pub async fn create_approval_session(
-        &self, pending_device_id: uuid::Uuid, approver_device_id: uuid::Uuid, ttl_secs: i64,
+        &self,
+        pending_device_id: uuid::Uuid,
+        approver_device_id: uuid::Uuid,
+        ttl_secs: i64,
     ) -> Result<DeviceApprovalSession, sqlx::Error> {
         // Delete any existing session for this pending device first
         sqlx::query("DELETE FROM device_approval_sessions WHERE pending_device_id = $1")
@@ -491,7 +587,10 @@ impl Db {
         .await
     }
 
-    pub async fn get_approval_session(&self, pending_device_id: uuid::Uuid) -> Result<Option<DeviceApprovalSession>, sqlx::Error> {
+    pub async fn get_approval_session(
+        &self,
+        pending_device_id: uuid::Uuid,
+    ) -> Result<Option<DeviceApprovalSession>, sqlx::Error> {
         sqlx::query_as::<_, DeviceApprovalSession>(
             "SELECT * FROM device_approval_sessions WHERE pending_device_id = $1 AND status = 'pending' AND expires_at > NOW()"
         )
@@ -500,7 +599,10 @@ impl Db {
         .await
     }
 
-    pub async fn complete_approval_session(&self, session_id: uuid::Uuid) -> Result<(), sqlx::Error> {
+    pub async fn complete_approval_session(
+        &self,
+        session_id: uuid::Uuid,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE device_approval_sessions SET status = 'completed' WHERE id = $1")
             .bind(session_id)
             .execute(&self.pool)
@@ -510,18 +612,25 @@ impl Db {
 
     // === Versioned group key operations ===
 
-    pub async fn get_current_group_key_version(&self, user_id: uuid::Uuid) -> Result<Option<GroupKeyVersion>, sqlx::Error> {
+    pub async fn get_current_group_key_version(
+        &self,
+        user_id: uuid::Uuid,
+    ) -> Result<Option<GroupKeyVersion>, sqlx::Error> {
         sqlx::query_as::<_, GroupKeyVersion>(
-            "SELECT * FROM group_key_versions WHERE user_id = $1 AND is_current = TRUE"
+            "SELECT * FROM group_key_versions WHERE user_id = $1 AND is_current = TRUE",
         )
         .bind(user_id)
         .fetch_optional(&self.pool)
         .await
     }
 
-    pub async fn get_device_group_key(&self, device_id: uuid::Uuid, version: i32) -> Result<DeviceGroupKey, sqlx::Error> {
+    pub async fn get_device_group_key(
+        &self,
+        device_id: uuid::Uuid,
+        version: i32,
+    ) -> Result<DeviceGroupKey, sqlx::Error> {
         sqlx::query_as::<_, DeviceGroupKey>(
-            "SELECT * FROM device_group_keys WHERE device_id = $1 AND version = $2"
+            "SELECT * FROM device_group_keys WHERE device_id = $1 AND version = $2",
         )
         .bind(device_id)
         .bind(version)
@@ -529,7 +638,11 @@ impl Db {
         .await
     }
 
-    pub async fn get_device_group_keys_since(&self, device_id: uuid::Uuid, since_version: i32) -> Result<Vec<DeviceGroupKey>, sqlx::Error> {
+    pub async fn get_device_group_keys_since(
+        &self,
+        device_id: uuid::Uuid,
+        since_version: i32,
+    ) -> Result<Vec<DeviceGroupKey>, sqlx::Error> {
         sqlx::query_as::<_, DeviceGroupKey>(
             "SELECT * FROM device_group_keys WHERE device_id = $1 AND version > $2 ORDER BY version"
         )
@@ -623,13 +736,15 @@ impl Db {
 
     pub async fn list_subscription_plans(&self) -> Result<Vec<SubscriptionPlan>, sqlx::Error> {
         sqlx::query_as::<_, SubscriptionPlan>(
-            "SELECT * FROM subscription_plans ORDER BY sort_order, created_at"
+            "SELECT * FROM subscription_plans ORDER BY sort_order, created_at",
         )
         .fetch_all(&self.pool)
         .await
     }
 
-    pub async fn list_active_subscription_plans(&self) -> Result<Vec<SubscriptionPlan>, sqlx::Error> {
+    pub async fn list_active_subscription_plans(
+        &self,
+    ) -> Result<Vec<SubscriptionPlan>, sqlx::Error> {
         sqlx::query_as::<_, SubscriptionPlan>(
             "SELECT * FROM subscription_plans WHERE is_active = TRUE ORDER BY sort_order, created_at"
         )
@@ -637,14 +752,29 @@ impl Db {
         .await
     }
 
-    pub async fn get_subscription_plan(&self, plan_id: uuid::Uuid) -> Result<SubscriptionPlan, sqlx::Error> {
+    pub async fn get_subscription_plan(
+        &self,
+        plan_id: uuid::Uuid,
+    ) -> Result<SubscriptionPlan, sqlx::Error> {
         sqlx::query_as::<_, SubscriptionPlan>("SELECT * FROM subscription_plans WHERE id = $1")
             .bind(plan_id)
             .fetch_one(&self.pool)
             .await
     }
 
-    pub async fn create_subscription_plan(&self, name: &str, description: &str, price: f64, currency: &str, billing_period: &str, max_devices: i32, max_clipboard_history: i32, allowed_file_types: &serde_json::Value, is_active: bool, sort_order: i32) -> Result<SubscriptionPlan, sqlx::Error> {
+    pub async fn create_subscription_plan(
+        &self,
+        name: &str,
+        description: &str,
+        price: f64,
+        currency: &str,
+        billing_period: &str,
+        max_devices: i32,
+        max_clipboard_history: i32,
+        allowed_file_types: &serde_json::Value,
+        is_active: bool,
+        sort_order: i32,
+    ) -> Result<SubscriptionPlan, sqlx::Error> {
         sqlx::query_as::<_, SubscriptionPlan>(
             "INSERT INTO subscription_plans (name, description, price, currency, billing_period, max_devices, max_clipboard_history, allowed_file_types, is_active, sort_order)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -664,14 +794,27 @@ impl Db {
         .await
     }
 
-    pub async fn update_subscription_plan(&self, id: uuid::Uuid, name: &str, description: &str, price: f64, currency: &str, billing_period: &str, max_devices: i32, max_clipboard_history: i32, allowed_file_types: &serde_json::Value, is_active: bool, sort_order: i32) -> Result<SubscriptionPlan, sqlx::Error> {
+    pub async fn update_subscription_plan(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        description: &str,
+        price: f64,
+        currency: &str,
+        billing_period: &str,
+        max_devices: i32,
+        max_clipboard_history: i32,
+        allowed_file_types: &serde_json::Value,
+        is_active: bool,
+        sort_order: i32,
+    ) -> Result<SubscriptionPlan, sqlx::Error> {
         sqlx::query_as::<_, SubscriptionPlan>(
             "UPDATE subscription_plans
              SET name=$1, description=$2, price=$3, currency=$4, billing_period=$5,
                  max_devices=$6, max_clipboard_history=$7, allowed_file_types=$8,
                  is_active=$9, sort_order=$10, updated_at=NOW()
              WHERE id=$11
-             RETURNING *"
+             RETURNING *",
         )
         .bind(name)
         .bind(description)
@@ -689,13 +832,17 @@ impl Db {
     }
 
     pub async fn delete_subscription_plan(&self, plan_id: uuid::Uuid) -> Result<(), String> {
-        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE subscription_plan_id = $1")
-            .bind(plan_id)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| e.to_string())?;
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM users WHERE subscription_plan_id = $1")
+                .bind(plan_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| e.to_string())?;
         if count.0 > 0 {
-            return Err(format!("cannot delete plan: {} users are still assigned", count.0));
+            return Err(format!(
+                "cannot delete plan: {} users are still assigned",
+                count.0
+            ));
         }
         let result = sqlx::query("DELETE FROM subscription_plans WHERE id = $1")
             .bind(plan_id)
@@ -708,7 +855,11 @@ impl Db {
         Ok(())
     }
 
-    pub async fn assign_user_subscription(&self, user_id: uuid::Uuid, plan_id: uuid::Uuid) -> Result<(), sqlx::Error> {
+    pub async fn assign_user_subscription(
+        &self,
+        user_id: uuid::Uuid,
+        plan_id: uuid::Uuid,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE users SET subscription_plan_id = $1 WHERE id = $2")
             .bind(plan_id)
             .bind(user_id)
@@ -725,20 +876,46 @@ impl Db {
         Ok(())
     }
 
-    pub async fn get_user_subscription(&self, user_id: uuid::Uuid) -> Result<UserSubscriptionInfo, sqlx::Error> {
-        let row = sqlx::query_as::<_, (Option<uuid::Uuid>, Option<String>, Option<String>, Option<rust_decimal::Decimal>, Option<String>, Option<String>, Option<i32>, Option<i32>, Option<serde_json::Value>)>(
+    pub async fn get_user_subscription(
+        &self,
+        user_id: uuid::Uuid,
+    ) -> Result<UserSubscriptionInfo, sqlx::Error> {
+        let row = sqlx::query_as::<
+            _,
+            (
+                Option<uuid::Uuid>,
+                Option<String>,
+                Option<String>,
+                Option<rust_decimal::Decimal>,
+                Option<String>,
+                Option<String>,
+                Option<i32>,
+                Option<i32>,
+                Option<serde_json::Value>,
+            ),
+        >(
             "SELECT sp.id, sp.name, sp.description, sp.price, sp.currency, sp.billing_period,
                     sp.max_devices, sp.max_clipboard_history, sp.allowed_file_types
              FROM users u
              JOIN subscription_plans sp ON sp.id = u.subscription_plan_id
-             WHERE u.id = $1"
+             WHERE u.id = $1",
         )
         .bind(user_id)
         .fetch_optional(&self.pool)
         .await?;
 
         match row {
-            Some((plan_id, plan_name, plan_description, price, currency, billing_period, max_devices, max_clipboard_history, allowed_file_types)) => {
+            Some((
+                plan_id,
+                plan_name,
+                plan_description,
+                price,
+                currency,
+                billing_period,
+                max_devices,
+                max_clipboard_history,
+                allowed_file_types,
+            )) => {
                 let file_types: Vec<String> = allowed_file_types
                     .and_then(|v| serde_json::from_value(v).ok())
                     .unwrap_or_default();
@@ -762,7 +939,7 @@ impl Db {
 
     pub async fn list_download_links(&self) -> Result<Vec<DownloadLink>, sqlx::Error> {
         sqlx::query_as::<_, DownloadLink>(
-            "SELECT * FROM download_links ORDER BY sort_order, created_at"
+            "SELECT * FROM download_links ORDER BY sort_order, created_at",
         )
         .fetch_all(&self.pool)
         .await
@@ -770,13 +947,23 @@ impl Db {
 
     pub async fn list_active_download_links(&self) -> Result<Vec<DownloadLink>, sqlx::Error> {
         sqlx::query_as::<_, DownloadLink>(
-            "SELECT * FROM download_links WHERE is_active = TRUE ORDER BY sort_order, created_at"
+            "SELECT * FROM download_links WHERE is_active = TRUE ORDER BY sort_order, created_at",
         )
         .fetch_all(&self.pool)
         .await
     }
 
-    pub async fn create_download_link(&self, name: &str, url: &str, platform: &str, arch: &str, format: &str, sort_order: i32, is_active: bool, release_id: Option<uuid::Uuid>) -> Result<DownloadLink, sqlx::Error> {
+    pub async fn create_download_link(
+        &self,
+        name: &str,
+        url: &str,
+        platform: &str,
+        arch: &str,
+        format: &str,
+        sort_order: i32,
+        is_active: bool,
+        release_id: Option<uuid::Uuid>,
+    ) -> Result<DownloadLink, sqlx::Error> {
         sqlx::query_as::<_, DownloadLink>(
             "INSERT INTO download_links (name, url, platform, arch, format, sort_order, is_active, release_id)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *"
@@ -786,7 +973,18 @@ impl Db {
         .await
     }
 
-    pub async fn update_download_link(&self, id: uuid::Uuid, name: &str, url: &str, platform: &str, arch: &str, format: &str, sort_order: i32, is_active: bool, release_id: Option<uuid::Uuid>) -> Result<DownloadLink, sqlx::Error> {
+    pub async fn update_download_link(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        url: &str,
+        platform: &str,
+        arch: &str,
+        format: &str,
+        sort_order: i32,
+        is_active: bool,
+        release_id: Option<uuid::Uuid>,
+    ) -> Result<DownloadLink, sqlx::Error> {
         sqlx::query_as::<_, DownloadLink>(
             "UPDATE download_links SET name=$1, url=$2, platform=$3, arch=$4, format=$5, sort_order=$6, is_active=$7, release_id=$8, updated_at=NOW()
              WHERE id=$9 RETURNING *"
@@ -797,17 +995,24 @@ impl Db {
     }
 
     pub async fn delete_download_link(&self, id: uuid::Uuid) -> Result<(), sqlx::Error> {
-        let result = sqlx::query("DELETE FROM download_links WHERE id = $1").bind(id).execute(&self.pool).await?;
-        if result.rows_affected() == 0 { return Err(sqlx::Error::RowNotFound); }
+        let result = sqlx::query("DELETE FROM download_links WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
         Ok(())
     }
 
-    pub async fn list_downloads_for_current_releases(&self) -> Result<Vec<DownloadLink>, sqlx::Error> {
+    pub async fn list_downloads_for_current_releases(
+        &self,
+    ) -> Result<Vec<DownloadLink>, sqlx::Error> {
         sqlx::query_as::<_, DownloadLink>(
             "SELECT dl.* FROM download_links dl
              INNER JOIN app_releases ar ON dl.release_id = ar.id
              WHERE ar.is_current = TRUE AND dl.is_active = TRUE
-             ORDER BY dl.sort_order, dl.created_at"
+             ORDER BY dl.sort_order, dl.created_at",
         )
         .fetch_all(&self.pool)
         .await
@@ -816,17 +1021,19 @@ impl Db {
     // === App Releases ===
 
     pub async fn list_app_releases(&self) -> Result<Vec<AppRelease>, sqlx::Error> {
-        sqlx::query_as::<_, AppRelease>(
-            "SELECT * FROM app_releases ORDER BY created_at DESC"
-        )
-        .fetch_all(&self.pool)
-        .await
+        sqlx::query_as::<_, AppRelease>("SELECT * FROM app_releases ORDER BY created_at DESC")
+            .fetch_all(&self.pool)
+            .await
     }
 
-    pub async fn get_current_release(&self, platform: &str, arch: &str) -> Result<Option<AppRelease>, sqlx::Error> {
+    pub async fn get_current_release(
+        &self,
+        platform: &str,
+        arch: &str,
+    ) -> Result<Option<AppRelease>, sqlx::Error> {
         let row = if arch.is_empty() {
             sqlx::query_as::<_, AppRelease>(
-                "SELECT * FROM app_releases WHERE platform = $1 AND is_current = TRUE LIMIT 1"
+                "SELECT * FROM app_releases WHERE platform = $1 AND is_current = TRUE LIMIT 1",
             )
             .bind(platform)
             .fetch_optional(&self.pool)
@@ -843,7 +1050,15 @@ impl Db {
         Ok(row)
     }
 
-    pub async fn create_app_release(&self, version: &str, platform: &str, arch: &str, download_url: &str, release_notes: &str, is_current: bool) -> Result<AppRelease, sqlx::Error> {
+    pub async fn create_app_release(
+        &self,
+        version: &str,
+        platform: &str,
+        arch: &str,
+        download_url: &str,
+        release_notes: &str,
+        is_current: bool,
+    ) -> Result<AppRelease, sqlx::Error> {
         // If marking as current, unset others for same platform+arch
         if is_current {
             sqlx::query("UPDATE app_releases SET is_current = FALSE, updated_at = NOW() WHERE platform = $1 AND arch = $2")
@@ -860,7 +1075,16 @@ impl Db {
         .await
     }
 
-    pub async fn update_app_release(&self, id: uuid::Uuid, version: &str, platform: &str, arch: &str, download_url: &str, release_notes: &str, is_current: bool) -> Result<AppRelease, sqlx::Error> {
+    pub async fn update_app_release(
+        &self,
+        id: uuid::Uuid,
+        version: &str,
+        platform: &str,
+        arch: &str,
+        download_url: &str,
+        release_notes: &str,
+        is_current: bool,
+    ) -> Result<AppRelease, sqlx::Error> {
         if is_current {
             sqlx::query("UPDATE app_releases SET is_current = FALSE, updated_at = NOW() WHERE platform = $1 AND arch = $2 AND id != $3")
                 .bind(platform).bind(arch).bind(id)
@@ -877,14 +1101,22 @@ impl Db {
     }
 
     pub async fn delete_app_release(&self, id: uuid::Uuid) -> Result<(), sqlx::Error> {
-        let result = sqlx::query("DELETE FROM app_releases WHERE id = $1").bind(id).execute(&self.pool).await?;
-        if result.rows_affected() == 0 { return Err(sqlx::Error::RowNotFound); }
+        let result = sqlx::query("DELETE FROM app_releases WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
         Ok(())
     }
 
     // === Admin operations ===
 
-    pub async fn admin_list_users(&self, pii: Option<&PiiService>) -> Result<Vec<AdminUserRow>, sqlx::Error> {
+    pub async fn admin_list_users(
+        &self,
+        pii: Option<&PiiService>,
+    ) -> Result<Vec<AdminUserRow>, sqlx::Error> {
         let rows = sqlx::query_as::<_, (uuid::Uuid, String, Option<String>, Option<String>, bool, String, bool, DateTime<Utc>, i32, Option<uuid::Uuid>, Option<String>)>(
             "SELECT u.id, u.username, u.email, u.full_name, u.email_verified, COALESCE(u.auth_provider,'local'),
                     u.is_admin, u.created_at, COUNT(d.id)::int AS device_count,
@@ -899,11 +1131,34 @@ impl Db {
         .await?;
 
         let mut users = Vec::new();
-        for (id, username, enc_email, enc_full_name, email_verified, auth_provider, is_admin, created_at, device_count, sub_plan_id, plan_name) in rows {
+        for (
+            id,
+            username,
+            enc_email,
+            enc_full_name,
+            email_verified,
+            auth_provider,
+            is_admin,
+            created_at,
+            device_count,
+            sub_plan_id,
+            plan_name,
+        ) in rows
+        {
             let email = decrypt_optional_field(enc_email.as_deref(), pii);
             let full_name = decrypt_optional_field(enc_full_name.as_deref(), pii);
             users.push(AdminUserRow {
-                id, username, email, full_name, email_verified, auth_provider, is_admin, created_at, device_count, subscription_plan_id: sub_plan_id, subscription_plan_name: plan_name,
+                id,
+                username,
+                email,
+                full_name,
+                email_verified,
+                auth_provider,
+                is_admin,
+                created_at,
+                device_count,
+                subscription_plan_id: sub_plan_id,
+                subscription_plan_name: plan_name,
             });
         }
         Ok(users)
@@ -914,7 +1169,7 @@ impl Db {
             "SELECT
                 (SELECT COUNT(*) FROM users),
                 (SELECT COUNT(*) FROM devices),
-                (SELECT COUNT(*) FROM clipboard_entries)"
+                (SELECT COUNT(*) FROM clipboard_entries)",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -927,14 +1182,22 @@ impl Db {
     }
 
     pub async fn admin_delete_user(&self, user_id: uuid::Uuid) -> Result<(), sqlx::Error> {
-        let result = sqlx::query("DELETE FROM users WHERE id = $1").bind(user_id).execute(&self.pool).await?;
-        if result.rows_affected() == 0 { return Err(sqlx::Error::RowNotFound); }
+        let result = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
         Ok(())
     }
 
     // === Email verification ===
 
-    pub async fn create_email_verification(&self, user_id: uuid::Uuid) -> Result<String, sqlx::Error> {
+    pub async fn create_email_verification(
+        &self,
+        user_id: uuid::Uuid,
+    ) -> Result<String, sqlx::Error> {
         use rand::RngCore;
         use sha2::{Digest, Sha256};
 
@@ -951,7 +1214,7 @@ impl Db {
             .await?;
 
         sqlx::query(
-            "INSERT INTO email_verifications (user_id, token_hash, expires_at) VALUES ($1, $2, $3)"
+            "INSERT INTO email_verifications (user_id, token_hash, expires_at) VALUES ($1, $2, $3)",
         )
         .bind(user_id)
         .bind(&token_hash)
@@ -967,7 +1230,7 @@ impl Db {
         let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
 
         let row = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid, DateTime<Utc>)>(
-            "SELECT id, user_id, expires_at FROM email_verifications WHERE token_hash = $1"
+            "SELECT id, user_id, expires_at FROM email_verifications WHERE token_hash = $1",
         )
         .bind(&token_hash)
         .fetch_optional(&self.pool)
@@ -997,7 +1260,12 @@ impl Db {
 
     // === Token revocation ===
 
-    pub async fn persist_revoked_token(&self, jti: &str, user_id: uuid::Uuid, expires_at: u64) -> Result<(), sqlx::Error> {
+    pub async fn persist_revoked_token(
+        &self,
+        jti: &str,
+        user_id: uuid::Uuid,
+        expires_at: u64,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO revoked_tokens (jti, user_id, expires_at) VALUES ($1, $2, $3) ON CONFLICT (jti) DO NOTHING"
         )
@@ -1010,16 +1278,18 @@ impl Db {
     }
 
     pub async fn is_token_revoked_db(&self, jti: &str) -> Result<bool, sqlx::Error> {
-        let row: Option<(i32,)> = sqlx::query_as(
-            "SELECT 1 FROM revoked_tokens WHERE jti = $1"
-        )
-        .bind(jti)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM revoked_tokens WHERE jti = $1")
+            .bind(jti)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(row.is_some())
     }
 
-    pub async fn revoke_all_user_tokens(&self, user_id: uuid::Uuid, now_epoch: u64) -> Result<(), sqlx::Error> {
+    pub async fn revoke_all_user_tokens(
+        &self,
+        user_id: uuid::Uuid,
+        now_epoch: u64,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE users SET tokens_revoked_before = $1 WHERE id = $2")
             .bind(now_epoch as i64)
             .bind(user_id)
@@ -1069,7 +1339,7 @@ impl Db {
     ) -> Result<Vec<AuditLog>, sqlx::Error> {
         // Build query dynamically based on filters
         let mut query = String::from(
-            "SELECT id, user_id, action, ip_address, user_agent, details, created_at FROM audit_logs WHERE 1=1"
+            "SELECT id, user_id, action, ip_address, user_agent, details, created_at FROM audit_logs WHERE 1=1",
         );
         if user_id_filter.is_some() {
             query.push_str(" AND user_id = $3");
@@ -1119,7 +1389,6 @@ impl Db {
             .await
         }
     }
-
 }
 
 // === Helper types ===
@@ -1152,10 +1421,20 @@ pub struct ClipboardEntryWithDevice {
 // === PII helper functions ===
 
 fn encrypt_user_fields(
-    username: &str, email: &str, full_name: &str,
-    country: Option<&str>, mobile: Option<&str>,
+    username: &str,
+    email: &str,
+    full_name: &str,
+    country: Option<&str>,
+    mobile: Option<&str>,
     pii: Option<&PiiService>,
-) -> (String, String, String, String, Option<String>, Option<String>) {
+) -> (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+) {
     let username_idx = username.trim().to_lowercase();
     if let Some(p) = pii {
         let enc_email = p.encrypt(email).unwrap_or_default();
@@ -1163,11 +1442,24 @@ fn encrypt_user_fields(
         let enc_full_name = p.encrypt(full_name).unwrap_or_default();
         let enc_country = country.map(|c| p.encrypt(c).unwrap_or_default());
         let enc_mobile = mobile.map(|m| p.encrypt(m).unwrap_or_default());
-        (enc_email, email_idx, enc_full_name, username_idx, enc_country, enc_mobile)
+        (
+            enc_email,
+            email_idx,
+            enc_full_name,
+            username_idx,
+            enc_country,
+            enc_mobile,
+        )
     } else {
         let email_idx = email.trim().to_lowercase();
-        (email.to_string(), email_idx, full_name.to_string(), username_idx,
-         country.map(|s| s.to_string()), mobile.map(|s| s.to_string()))
+        (
+            email.to_string(),
+            email_idx,
+            full_name.to_string(),
+            username_idx,
+            country.map(|s| s.to_string()),
+            mobile.map(|s| s.to_string()),
+        )
     }
 }
 
@@ -1181,17 +1473,19 @@ fn decrypt_optional_field(value: Option<&str>, pii: Option<&PiiService>) -> Stri
 
 pub fn detect_platform_arch_format(filename: &str) -> (String, String, String) {
     let lower = filename.to_lowercase();
-    let platform = if lower.contains("windows") || lower.ends_with(".exe") || lower.ends_with(".msi") {
-        "windows"
-    } else if lower.contains("darwin") || lower.contains("macos") || lower.ends_with(".dmg") {
-        "macos"
-    } else if lower.contains("linux") || lower.ends_with(".deb") || lower.ends_with(".appimage") {
-        "linux"
-    } else if lower.ends_with(".apk") {
-        "android"
-    } else {
-        "unknown"
-    };
+    let platform =
+        if lower.contains("windows") || lower.ends_with(".exe") || lower.ends_with(".msi") {
+            "windows"
+        } else if lower.contains("darwin") || lower.contains("macos") || lower.ends_with(".dmg") {
+            "macos"
+        } else if lower.contains("linux") || lower.ends_with(".deb") || lower.ends_with(".appimage")
+        {
+            "linux"
+        } else if lower.ends_with(".apk") {
+            "android"
+        } else {
+            "unknown"
+        };
 
     let arch = if lower.contains("arm64") || lower.contains("aarch64") {
         "arm64"
@@ -1203,15 +1497,25 @@ pub fn detect_platform_arch_format(filename: &str) -> (String, String, String) {
         ""
     };
 
-    let format = if lower.ends_with(".msi") { "msi" }
-    else if lower.ends_with(".exe") { "exe" }
-    else if lower.ends_with(".dmg") { "dmg" }
-    else if lower.ends_with(".deb") { "deb" }
-    else if lower.ends_with(".appimage") { "appimage" }
-    else if lower.ends_with(".apk") { "apk" }
-    else if lower.ends_with(".tar.gz") { "tar.gz" }
-    else if lower.ends_with(".zip") { "zip" }
-    else { "" };
+    let format = if lower.ends_with(".msi") {
+        "msi"
+    } else if lower.ends_with(".exe") {
+        "exe"
+    } else if lower.ends_with(".dmg") {
+        "dmg"
+    } else if lower.ends_with(".deb") {
+        "deb"
+    } else if lower.ends_with(".appimage") {
+        "appimage"
+    } else if lower.ends_with(".apk") {
+        "apk"
+    } else if lower.ends_with(".tar.gz") {
+        "tar.gz"
+    } else if lower.ends_with(".zip") {
+        "zip"
+    } else {
+        ""
+    };
 
     (platform.to_string(), arch.to_string(), format.to_string())
 }

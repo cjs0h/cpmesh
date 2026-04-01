@@ -1,20 +1,28 @@
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 use std::sync::Arc;
-use axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}};
 
+use super::middleware::json_response;
 use crate::AppState;
-use super::middleware::{json_response};
 
-pub async fn handle_list_downloads(
-    State(state): State<Arc<AppState>>,
-) -> Response {
-    let links = state.db.list_active_download_links().await.unwrap_or_default();
+pub async fn handle_list_downloads(State(state): State<Arc<AppState>>) -> Response {
+    let links = state
+        .db
+        .list_active_download_links()
+        .await
+        .unwrap_or_default();
     json_response(StatusCode::OK, links)
 }
 
-pub async fn handle_list_current_release_downloads(
-    State(state): State<Arc<AppState>>,
-) -> Response {
-    let links = state.db.list_downloads_for_current_releases().await.unwrap_or_default();
+pub async fn handle_list_current_release_downloads(State(state): State<Arc<AppState>>) -> Response {
+    let links = state
+        .db
+        .list_downloads_for_current_releases()
+        .await
+        .unwrap_or_default();
     json_response(StatusCode::OK, links)
 }
 
@@ -27,7 +35,11 @@ pub async fn handle_download_file(
     }
 
     // Sanitize: no path traversal
-    if filename.is_empty() || filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+    if filename.is_empty()
+        || filename.contains('/')
+        || filename.contains('\\')
+        || filename.contains("..")
+    {
         return StatusCode::NOT_FOUND.into_response();
     }
 
@@ -51,7 +63,8 @@ pub async fn handle_download_file(
             (axum::http::header::CONTENT_DISPOSITION, &disposition),
         ],
         bytes,
-    ).into_response()
+    )
+        .into_response()
 }
 
 /// Public endpoint: GET /api/updates/check?platform=darwin&arch=arm64&version=0.1.0
@@ -65,20 +78,31 @@ pub async fn handle_check_update(
     let current_version = params.version.unwrap_or_default();
 
     if platform.is_empty() {
-        return json_response(StatusCode::OK, serde_json::json!({"update_available": false}));
+        return json_response(
+            StatusCode::OK,
+            serde_json::json!({"update_available": false}),
+        );
     }
 
     match state.db.get_current_release(&platform, &arch).await {
         Ok(Some(release)) => {
-            let has_update = !current_version.is_empty() && release.version != current_version && is_newer_version(&release.version, &current_version);
-            json_response(StatusCode::OK, serde_json::json!({
-                "update_available": has_update,
-                "version": release.version,
-                "download_url": release.download_url,
-                "release_notes": release.release_notes,
-            }))
+            let has_update = !current_version.is_empty()
+                && release.version != current_version
+                && is_newer_version(&release.version, &current_version);
+            json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "update_available": has_update,
+                    "version": release.version,
+                    "download_url": release.download_url,
+                    "release_notes": release.release_notes,
+                }),
+            )
         }
-        _ => json_response(StatusCode::OK, serde_json::json!({"update_available": false})),
+        _ => json_response(
+            StatusCode::OK,
+            serde_json::json!({"update_available": false}),
+        ),
     }
 }
 
@@ -102,25 +126,41 @@ fn is_newer_version(new_ver: &str, current_ver: &str) -> bool {
     for i in 0..new_parts.len().max(cur_parts.len()) {
         let n = new_parts.get(i).copied().unwrap_or(0);
         let c = cur_parts.get(i).copied().unwrap_or(0);
-        if n > c { return true; }
-        if n < c { return false; }
+        if n > c {
+            return true;
+        }
+        if n < c {
+            return false;
+        }
     }
     false
 }
 
 fn mime_for_download(name: &str) -> &'static str {
     let lower = name.to_lowercase();
-    if lower.ends_with(".exe") { "application/vnd.microsoft.portable-executable" }
-    else if lower.ends_with(".msi") { "application/x-msi" }
-    else if lower.ends_with(".dmg") { "application/x-apple-diskimage" }
-    else if lower.ends_with(".pkg") { "application/vnd.apple.installer+xml" }
-    else if lower.ends_with(".deb") { "application/vnd.debian.binary-package" }
-    else if lower.ends_with(".rpm") { "application/x-rpm" }
-    else if lower.ends_with(".appimage") { "application/x-executable" }
-    else if lower.ends_with(".apk") { "application/vnd.android.package-archive" }
-    else if lower.ends_with(".tar.gz") { "application/gzip" }
-    else if lower.ends_with(".zip") { "application/zip" }
-    else { "application/octet-stream" }
+    if lower.ends_with(".exe") {
+        "application/vnd.microsoft.portable-executable"
+    } else if lower.ends_with(".msi") {
+        "application/x-msi"
+    } else if lower.ends_with(".dmg") {
+        "application/x-apple-diskimage"
+    } else if lower.ends_with(".pkg") {
+        "application/vnd.apple.installer+xml"
+    } else if lower.ends_with(".deb") {
+        "application/vnd.debian.binary-package"
+    } else if lower.ends_with(".rpm") {
+        "application/x-rpm"
+    } else if lower.ends_with(".appimage") {
+        "application/x-executable"
+    } else if lower.ends_with(".apk") {
+        "application/vnd.android.package-archive"
+    } else if lower.ends_with(".tar.gz") {
+        "application/gzip"
+    } else if lower.ends_with(".zip") {
+        "application/zip"
+    } else {
+        "application/octet-stream"
+    }
 }
 
 #[cfg(test)]
@@ -145,10 +185,22 @@ mod tests {
 
     #[test]
     fn test_mime_for_download() {
-        assert_eq!(mime_for_download("app.dmg"), "application/x-apple-diskimage");
-        assert_eq!(mime_for_download("setup.exe"), "application/vnd.microsoft.portable-executable");
-        assert_eq!(mime_for_download("app.apk"), "application/vnd.android.package-archive");
-        assert_eq!(mime_for_download("app.deb"), "application/vnd.debian.binary-package");
+        assert_eq!(
+            mime_for_download("app.dmg"),
+            "application/x-apple-diskimage"
+        );
+        assert_eq!(
+            mime_for_download("setup.exe"),
+            "application/vnd.microsoft.portable-executable"
+        );
+        assert_eq!(
+            mime_for_download("app.apk"),
+            "application/vnd.android.package-archive"
+        );
+        assert_eq!(
+            mime_for_download("app.deb"),
+            "application/vnd.debian.binary-package"
+        );
         assert_eq!(mime_for_download("random.bin"), "application/octet-stream");
     }
 }

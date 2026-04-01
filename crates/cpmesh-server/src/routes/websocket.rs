@@ -1,21 +1,24 @@
-use std::sync::Arc;
-use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
 use axum::{
-    extract::{ConnectInfo, Extension, Query, State, WebSocketUpgrade, ws::{Message, WebSocket}},
+    extract::{
+        ConnectInfo, Extension, Query, State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
+    },
     http::StatusCode,
     response::Response,
 };
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
-use tokio::sync::{mpsc, Mutex};
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use tokio::sync::{Mutex, mpsc};
 use tracing::warn;
 
-use cpmesh_proto::models::*;
+use super::middleware::{AuthClaims, extract_client_ip, json_error, json_response};
 use crate::AppState;
 use crate::ws::Client;
-use super::middleware::{AuthClaims, extract_client_ip, json_error, json_response};
+use cpmesh_proto::models::*;
 
 // WS ticket store (short-lived, single-use)
 lazy_static::lazy_static! {
@@ -47,12 +50,15 @@ pub async fn handle_ws_ticket(
     let ticket: String = ticket_bytes.iter().map(|b| format!("{:02x}", b)).collect();
 
     let mut tickets = TICKETS.lock().await;
-    tickets.insert(ticket.clone(), WsTicket {
-        user_id: claims.user_id,
-        device_id,
-        expires: std::time::Instant::now() + std::time::Duration::from_secs(10),
-        client_ip,
-    });
+    tickets.insert(
+        ticket.clone(),
+        WsTicket {
+            user_id: claims.user_id,
+            device_id,
+            expires: std::time::Instant::now() + std::time::Duration::from_secs(10),
+            client_ip,
+        },
+    );
 
     json_response(StatusCode::OK, json!({"ticket": ticket}))
 }
@@ -64,7 +70,10 @@ async fn validate_ticket(ticket: &str, client_ip: IpAddr) -> Option<(uuid::Uuid,
         return None;
     }
     if t.client_ip != client_ip {
-        warn!("WS ticket IP mismatch: expected {}, got {}", t.client_ip, client_ip);
+        warn!(
+            "WS ticket IP mismatch: expected {}, got {}",
+            t.client_ip, client_ip
+        );
         return None;
     }
     Some((t.user_id, t.device_id))
@@ -100,20 +109,34 @@ pub async fn handle_ws_upgrade(
 
     // Enforce per-user connection limit
     if state.hub.user_connection_count(&user_id.to_string()).await >= 10 {
-        return json_error("too many concurrent connections", StatusCode::TOO_MANY_REQUESTS);
+        return json_error(
+            "too many concurrent connections",
+            StatusCode::TOO_MANY_REQUESTS,
+        );
     }
 
-    let device_name = state.db.get_device_by_id(device_id).await
+    let device_name = state
+        .db
+        .get_device_by_id(device_id)
+        .await
         .map(|d| d.name)
         .unwrap_or_default();
 
     // Opportunistic fingerprint backfill for devices that predate fingerprinting
-    if let Some(fp) = headers.get("x-device-fingerprint").and_then(|v| v.to_str().ok()) {
-        let _ = state.db.set_device_fingerprint(device_id, user_id, fp).await;
+    if let Some(fp) = headers
+        .get("x-device-fingerprint")
+        .and_then(|v| v.to_str().ok())
+    {
+        let _ = state
+            .db
+            .set_device_fingerprint(device_id, user_id, fp)
+            .await;
     }
 
     let state2 = state.clone();
-    ws.on_upgrade(move |socket| handle_ws_connection(socket, state2, user_id, device_id, device_name))
+    ws.on_upgrade(move |socket| {
+        handle_ws_connection(socket, state2, user_id, device_id, device_name)
+    })
 }
 
 async fn handle_ws_connection(
@@ -140,7 +163,8 @@ async fn handle_ws_connection(
         let rotation_msg = serde_json::to_string(&WsMessage {
             msg_type: MSG_ROTATION_NEEDED.to_string(),
             payload: json!({"reason": "rotation_due"}),
-        }).unwrap_or_default();
+        })
+        .unwrap_or_default();
 
         let clients = state.hub.clients.read().await;
         if let Some(user_clients) = clients.get(&user_id.to_string()) {
@@ -173,8 +197,11 @@ async fn handle_ws_connection(
                     if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(text_ref) {
                         match ws_msg.msg_type.as_str() {
                             MSG_CLIPBOARD_PUSH => {
-                                if let Ok(payload) = serde_json::from_value::<ClipboardPushPayload>(ws_msg.payload) {
-                                    handle_clipboard_push(&state, user_id, device_id, payload).await;
+                                if let Ok(payload) =
+                                    serde_json::from_value::<ClipboardPushPayload>(ws_msg.payload)
+                                {
+                                    handle_clipboard_push(&state, user_id, device_id, payload)
+                                        .await;
                                 }
                             }
                             MSG_PING => {
@@ -182,7 +209,8 @@ async fn handle_ws_connection(
                                 let pong = serde_json::to_string(&WsMessage {
                                     msg_type: MSG_PONG.to_string(),
                                     payload: json!({}),
-                                }).unwrap_or_default();
+                                })
+                                .unwrap_or_default();
 
                                 // Find and send directly
                                 let clients = state.hub.clients.read().await;
@@ -228,7 +256,13 @@ async fn handle_clipboard_push(
             if max_history > 0 {
                 if let Ok(count) = state.db.count_user_clipboard_entries(user_id).await {
                     if count >= max_history as i64 {
-                        let _ = state.db.delete_oldest_clipboard_entries(user_id, count - max_history as i64 + 1).await;
+                        let _ = state
+                            .db
+                            .delete_oldest_clipboard_entries(
+                                user_id,
+                                count - max_history as i64 + 1,
+                            )
+                            .await;
                     }
                 }
             }
@@ -239,7 +273,18 @@ async fn handle_clipboard_push(
     let metadata = payload.metadata.unwrap_or_default();
     let key_version = payload.key_version;
 
-    match state.db.create_clipboard_entry(user_id, device_id, &content_type, &payload.encrypted_data, &metadata, key_version).await {
+    match state
+        .db
+        .create_clipboard_entry(
+            user_id,
+            device_id,
+            &content_type,
+            &payload.encrypted_data,
+            &metadata,
+            key_version,
+        )
+        .await
+    {
         Ok(entry) => {
             let broadcast = WsMessage {
                 msg_type: MSG_CLIPBOARD_NEW.to_string(),
@@ -257,7 +302,10 @@ async fn handle_clipboard_push(
                     }
                 }),
             };
-            state.hub.broadcast_to_user(&user_id.to_string(), &device_id.to_string(), &broadcast).await;
+            state
+                .hub
+                .broadcast_to_user(&user_id.to_string(), &device_id.to_string(), &broadcast)
+                .await;
         }
         Err(e) => {
             warn!("Failed to save clipboard entry: {e}");

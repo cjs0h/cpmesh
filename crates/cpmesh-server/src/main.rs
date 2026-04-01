@@ -7,17 +7,17 @@ mod routes;
 mod spa;
 mod ws;
 
+use argon2::PasswordHasher;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
-use argon2::PasswordHasher;
 
 use crate::config::Config;
 use crate::db::Db;
 use crate::pii::PiiService;
-use crate::ws::Hub;
 use crate::routes::auth::PkceCodeStore;
+use crate::ws::Hub;
 
 pub struct RateLimiters {
     pub login: Arc<routes::middleware::IpRateLimiter>,
@@ -90,7 +90,9 @@ async fn main() {
     } else {
         warn!("PII_MASTER_KEY and/or PII_HMAC_KEY not set. PII encryption disabled.");
         if !config.insecure_dev {
-            error!("FATAL: Refusing to start without PII encryption keys. Set CPNET_INSECURE_DEV=1 to bypass.");
+            error!(
+                "FATAL: Refusing to start without PII encryption keys. Set CPNET_INSECURE_DEV=1 to bypass."
+            );
             std::process::exit(1);
         }
         None
@@ -117,14 +119,26 @@ async fn main() {
         if admin_password.is_empty() {
             warn!("INITIAL_ADMIN_PASSWORD is empty, skipping admin seeding");
         } else {
-            if (admin_password == "changeme123" || admin_password == "admin123") && !config.insecure_dev {
-                error!("FATAL: Refusing to start with weak admin password. Set CPNET_INSECURE_DEV=1 to bypass.");
+            if (admin_password == "changeme123" || admin_password == "admin123")
+                && !config.insecure_dev
+            {
+                error!(
+                    "FATAL: Refusing to start with weak admin password. Set CPNET_INSECURE_DEV=1 to bypass."
+                );
                 std::process::exit(1);
             }
             let salt = argon2::password_hash::SaltString::generate(&mut rand::rngs::OsRng);
             match argon2::Argon2::default().hash_password(admin_password.as_bytes(), &salt) {
                 Ok(hash) => {
-                    if let Err(e) = db.seed_admin(&config.initial_admin, &hash.to_string(), &config.initial_admin_email, pii.as_ref()).await {
+                    if let Err(e) = db
+                        .seed_admin(
+                            &config.initial_admin,
+                            &hash.to_string(),
+                            &config.initial_admin_email,
+                            pii.as_ref(),
+                        )
+                        .await
+                    {
                         warn!("Could not seed admin {:?}: {e}", config.initial_admin);
                     } else {
                         info!("Admin account {:?} ready", config.initial_admin);
@@ -136,14 +150,19 @@ async fn main() {
     }
 
     // Build auth service with RS256 keys from file paths
-    let private_pem = std::fs::read_to_string(&config.jwt_private_key_path)
-        .unwrap_or_else(|e| {
-            error!("FATAL: Cannot read JWT private key from '{}': {e}", config.jwt_private_key_path);
-            std::process::exit(1);
-        });
-    let public_keys_json = std::fs::read_to_string(&config.jwt_public_keys_path)
-        .unwrap_or_else(|e| {
-            error!("FATAL: Cannot read JWT public keys from '{}': {e}", config.jwt_public_keys_path);
+    let private_pem = std::fs::read_to_string(&config.jwt_private_key_path).unwrap_or_else(|e| {
+        error!(
+            "FATAL: Cannot read JWT private key from '{}': {e}",
+            config.jwt_private_key_path
+        );
+        std::process::exit(1);
+    });
+    let public_keys_json =
+        std::fs::read_to_string(&config.jwt_public_keys_path).unwrap_or_else(|e| {
+            error!(
+                "FATAL: Cannot read JWT public keys from '{}': {e}",
+                config.jwt_public_keys_path
+            );
             std::process::exit(1);
         });
     let auth = match routes::auth_service::AuthService::new(
@@ -153,7 +172,10 @@ async fn main() {
         Some(db.pool.clone()),
     ) {
         Ok(a) => {
-            info!("JWT signing: RS256 (kid={}, key={})", config.jwt_active_kid, config.jwt_private_key_path);
+            info!(
+                "JWT signing: RS256 (kid={}, key={})",
+                config.jwt_active_kid, config.jwt_private_key_path
+            );
             a
         }
         Err(e) => {
@@ -165,9 +187,9 @@ async fn main() {
     let email_svc = email::EmailService::from_env();
 
     let rate_limiters = RateLimiters {
-        login: routes::middleware::build_rate_limiter(5),       // 5 per minute
-        register: routes::middleware::build_rate_limiter(3),    // 3 per minute
-        refresh: routes::middleware::build_rate_limiter(10),    // 10 per minute
+        login: routes::middleware::build_rate_limiter(5), // 5 per minute
+        register: routes::middleware::build_rate_limiter(3), // 3 per minute
+        refresh: routes::middleware::build_rate_limiter(10), // 10 per minute
     };
 
     let state = Arc::new(AppState {
@@ -200,7 +222,9 @@ async fn main() {
 
     let addr: SocketAddr = config.addr.parse().unwrap_or_else(|_| {
         warn!("Invalid ADDR '{}', using 0.0.0.0:8080", config.addr);
-        "0.0.0.0:8080".parse().expect("default address parse failed")
+        "0.0.0.0:8080"
+            .parse()
+            .expect("default address parse failed")
     });
 
     info!("cpmesh server listening on {addr}");
@@ -210,12 +234,17 @@ async fn main() {
         info!("No ALLOWED_ORIGINS set: CORS disabled (same-origin only)");
     }
 
-    let listener = TcpListener::bind(addr).await.expect("Failed to bind TCP listener");
-
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(shutdown_signal())
+    let listener = TcpListener::bind(addr)
         .await
-        .expect("Axum server failed to start");
+        .expect("Failed to bind TCP listener");
+
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .expect("Axum server failed to start");
 
     info!("Server stopped");
 }

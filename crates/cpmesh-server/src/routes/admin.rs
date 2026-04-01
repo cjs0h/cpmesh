@@ -1,14 +1,25 @@
-use std::sync::Arc;
-use std::net::SocketAddr;
-use axum::{extract::{ConnectInfo, Extension, Multipart, Path, State}, http::StatusCode, response::{IntoResponse, Response}};
+use axum::{
+    extract::{ConnectInfo, Extension, Multipart, Path, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 use serde_json::json;
+use std::net::SocketAddr;
+use std::sync::Arc;
 
-use crate::AppState;
-use crate::models::{AUDIT_ADMIN_DELETE_USER, AUDIT_ADMIN_ASSIGN_SUB, AUDIT_ADMIN_REMOVE_SUB};
 use super::middleware::{AuthClaims, extract_client_ip, json_error, json_response};
+use crate::AppState;
+use crate::models::{AUDIT_ADMIN_ASSIGN_SUB, AUDIT_ADMIN_DELETE_USER, AUDIT_ADMIN_REMOVE_SUB};
 
 /// Fire-and-forget audit log for admin actions.
-fn admin_audit(pool: &sqlx::PgPool, admin_id: uuid::Uuid, action: &'static str, ip: &str, ua: Option<&str>, details: &serde_json::Value) {
+fn admin_audit(
+    pool: &sqlx::PgPool,
+    admin_id: uuid::Uuid,
+    action: &'static str,
+    ip: &str,
+    ua: Option<&str>,
+    details: &serde_json::Value,
+) {
     let pool = pool.clone();
     let ip = ip.to_string();
     let ua = ua.map(String::from);
@@ -27,18 +38,14 @@ fn admin_audit(pool: &sqlx::PgPool, admin_id: uuid::Uuid, action: &'static str, 
     });
 }
 
-pub async fn handle_admin_list_users(
-    State(state): State<Arc<AppState>>,
-) -> Response {
+pub async fn handle_admin_list_users(State(state): State<Arc<AppState>>) -> Response {
     match state.db.admin_list_users(state.pii.as_ref()).await {
         Ok(users) => json_response(StatusCode::OK, users),
         Err(_) => json_error("failed to list users", StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
-pub async fn handle_admin_get_stats(
-    State(state): State<Arc<AppState>>,
-) -> Response {
+pub async fn handle_admin_get_stats(State(state): State<Arc<AppState>>) -> Response {
     match state.db.admin_get_stats().await {
         Ok(mut stats) => {
             stats.active_connections = state.hub.total_connections().await;
@@ -63,8 +70,17 @@ pub async fn handle_admin_delete_user(
     }
 
     let ip = extract_client_ip(&headers, &addr, state.config.trust_proxy_headers);
-    let ua = headers.get(axum::http::header::USER_AGENT).and_then(|v| v.to_str().ok());
-    admin_audit(&state.db.pool, claims.user_id, AUDIT_ADMIN_DELETE_USER, &ip.to_string(), ua, &json!({"deleted_user_id": user_id.to_string()}));
+    let ua = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok());
+    admin_audit(
+        &state.db.pool,
+        claims.user_id,
+        AUDIT_ADMIN_DELETE_USER,
+        &ip.to_string(),
+        ua,
+        &json!({"deleted_user_id": user_id.to_string()}),
+    );
 
     StatusCode::NO_CONTENT.into_response()
 }
@@ -93,12 +109,24 @@ pub async fn handle_admin_assign_subscription(
         return json_error("plan not found", StatusCode::NOT_FOUND);
     }
     if let Err(_) = state.db.assign_user_subscription(user_id, plan_id).await {
-        return json_error("failed to assign subscription", StatusCode::INTERNAL_SERVER_ERROR);
+        return json_error(
+            "failed to assign subscription",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
     }
 
     let ip = extract_client_ip(&headers, &addr, state.config.trust_proxy_headers);
-    let ua = headers.get(axum::http::header::USER_AGENT).and_then(|v| v.to_str().ok());
-    admin_audit(&state.db.pool, claims.user_id, AUDIT_ADMIN_ASSIGN_SUB, &ip.to_string(), ua, &json!({"target_user_id": user_id.to_string(), "plan_id": req.plan_id}));
+    let ua = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok());
+    admin_audit(
+        &state.db.pool,
+        claims.user_id,
+        AUDIT_ADMIN_ASSIGN_SUB,
+        &ip.to_string(),
+        ua,
+        &json!({"target_user_id": user_id.to_string(), "plan_id": req.plan_id}),
+    );
 
     json_response(StatusCode::OK, json!({"message": "subscription assigned"}))
 }
@@ -111,12 +139,24 @@ pub async fn handle_admin_remove_subscription(
     Path(user_id): Path<uuid::Uuid>,
 ) -> Response {
     if let Err(_) = state.db.remove_user_subscription(user_id).await {
-        return json_error("failed to remove subscription", StatusCode::INTERNAL_SERVER_ERROR);
+        return json_error(
+            "failed to remove subscription",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
     }
 
     let ip = extract_client_ip(&headers, &addr, state.config.trust_proxy_headers);
-    let ua = headers.get(axum::http::header::USER_AGENT).and_then(|v| v.to_str().ok());
-    admin_audit(&state.db.pool, claims.user_id, AUDIT_ADMIN_REMOVE_SUB, &ip.to_string(), ua, &json!({"target_user_id": user_id.to_string()}));
+    let ua = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok());
+    admin_audit(
+        &state.db.pool,
+        claims.user_id,
+        AUDIT_ADMIN_REMOVE_SUB,
+        &ip.to_string(),
+        ua,
+        &json!({"target_user_id": user_id.to_string()}),
+    );
 
     json_response(StatusCode::OK, json!({"message": "subscription removed"}))
 }
@@ -143,21 +183,40 @@ pub async fn handle_admin_list_plans(State(state): State<Arc<AppState>>) -> Resp
 #[derive(serde::Deserialize)]
 pub struct PlanBody {
     pub name: String,
-    #[serde(default)] pub description: String,
-    #[serde(default)] pub price: f64,
-    #[serde(default = "default_currency")] pub currency: String,
-    #[serde(default = "default_billing_period")] pub billing_period: String,
-    #[serde(default = "default_max_devices")] pub max_devices: i32,
-    #[serde(default = "default_max_history")] pub max_clipboard_history: i32,
-    #[serde(default)] pub allowed_file_types: Vec<String>,
-    #[serde(default = "default_true")] pub is_active: bool,
-    #[serde(default)] pub sort_order: i32,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub price: f64,
+    #[serde(default = "default_currency")]
+    pub currency: String,
+    #[serde(default = "default_billing_period")]
+    pub billing_period: String,
+    #[serde(default = "default_max_devices")]
+    pub max_devices: i32,
+    #[serde(default = "default_max_history")]
+    pub max_clipboard_history: i32,
+    #[serde(default)]
+    pub allowed_file_types: Vec<String>,
+    #[serde(default = "default_true")]
+    pub is_active: bool,
+    #[serde(default)]
+    pub sort_order: i32,
 }
-fn default_currency() -> String { "USD".to_string() }
-fn default_billing_period() -> String { "monthly".to_string() }
-fn default_max_devices() -> i32 { 5 }
-fn default_max_history() -> i32 { 100 }
-fn default_true() -> bool { true }
+fn default_currency() -> String {
+    "USD".to_string()
+}
+fn default_billing_period() -> String {
+    "monthly".to_string()
+}
+fn default_max_devices() -> i32 {
+    5
+}
+fn default_max_history() -> i32 {
+    100
+}
+fn default_true() -> bool {
+    true
+}
 
 pub async fn handle_admin_create_plan(
     State(state): State<Arc<AppState>>,
@@ -167,7 +226,22 @@ pub async fn handle_admin_create_plan(
         return json_error("name is required", StatusCode::BAD_REQUEST);
     }
     let ft = serde_json::to_value(&req.allowed_file_types).unwrap_or_default();
-    match state.db.create_subscription_plan(&req.name, &req.description, req.price, &req.currency, &req.billing_period, req.max_devices, req.max_clipboard_history, &ft, req.is_active, req.sort_order).await {
+    match state
+        .db
+        .create_subscription_plan(
+            &req.name,
+            &req.description,
+            req.price,
+            &req.currency,
+            &req.billing_period,
+            req.max_devices,
+            req.max_clipboard_history,
+            &ft,
+            req.is_active,
+            req.sort_order,
+        )
+        .await
+    {
         Ok(plan) => json_response(StatusCode::CREATED, plan),
         Err(_) => json_error("failed to create plan", StatusCode::INTERNAL_SERVER_ERROR),
     }
@@ -182,7 +256,23 @@ pub async fn handle_admin_update_plan(
         return json_error("name is required", StatusCode::BAD_REQUEST);
     }
     let ft = serde_json::to_value(&req.allowed_file_types).unwrap_or_default();
-    match state.db.update_subscription_plan(plan_id, &req.name, &req.description, req.price, &req.currency, &req.billing_period, req.max_devices, req.max_clipboard_history, &ft, req.is_active, req.sort_order).await {
+    match state
+        .db
+        .update_subscription_plan(
+            plan_id,
+            &req.name,
+            &req.description,
+            req.price,
+            &req.currency,
+            &req.billing_period,
+            req.max_devices,
+            req.max_clipboard_history,
+            &ft,
+            req.is_active,
+            req.sort_order,
+        )
+        .await
+    {
         Ok(plan) => json_response(StatusCode::OK, plan),
         Err(_) => json_error("failed to update plan", StatusCode::INTERNAL_SERVER_ERROR),
     }
@@ -203,7 +293,10 @@ pub async fn handle_admin_delete_plan(
 pub async fn handle_admin_list_downloads(State(state): State<Arc<AppState>>) -> Response {
     match state.db.list_download_links().await {
         Ok(links) => json_response(StatusCode::OK, links),
-        Err(_) => json_error("failed to list downloads", StatusCode::INTERNAL_SERVER_ERROR),
+        Err(_) => json_error(
+            "failed to list downloads",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 
@@ -211,14 +304,22 @@ pub async fn handle_admin_list_downloads(State(state): State<Arc<AppState>>) -> 
 pub struct DownloadBody {
     pub name: String,
     pub url: String,
-    #[serde(default = "default_unknown")] pub platform: String,
-    #[serde(default)] pub arch: String,
-    #[serde(default)] pub format: String,
-    #[serde(default)] pub sort_order: i32,
-    #[serde(default = "default_true")] pub is_active: bool,
-    #[serde(default)] pub release_id: Option<String>,
+    #[serde(default = "default_unknown")]
+    pub platform: String,
+    #[serde(default)]
+    pub arch: String,
+    #[serde(default)]
+    pub format: String,
+    #[serde(default)]
+    pub sort_order: i32,
+    #[serde(default = "default_true")]
+    pub is_active: bool,
+    #[serde(default)]
+    pub release_id: Option<String>,
 }
-fn default_unknown() -> String { "unknown".to_string() }
+fn default_unknown() -> String {
+    "unknown".to_string()
+}
 
 pub async fn handle_admin_create_download(
     State(state): State<Arc<AppState>>,
@@ -227,12 +328,30 @@ pub async fn handle_admin_create_download(
     if req.name.is_empty() || req.url.is_empty() {
         return json_error("name and url are required", StatusCode::BAD_REQUEST);
     }
-    let release_id = req.release_id.as_deref()
+    let release_id = req
+        .release_id
+        .as_deref()
         .filter(|s| !s.is_empty())
         .and_then(|s| uuid::Uuid::parse_str(s).ok());
-    match state.db.create_download_link(&req.name, &req.url, &req.platform, &req.arch, &req.format, req.sort_order, req.is_active, release_id).await {
+    match state
+        .db
+        .create_download_link(
+            &req.name,
+            &req.url,
+            &req.platform,
+            &req.arch,
+            &req.format,
+            req.sort_order,
+            req.is_active,
+            release_id,
+        )
+        .await
+    {
         Ok(link) => json_response(StatusCode::CREATED, link),
-        Err(_) => json_error("failed to create download link", StatusCode::INTERNAL_SERVER_ERROR),
+        Err(_) => json_error(
+            "failed to create download link",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 
@@ -244,12 +363,31 @@ pub async fn handle_admin_update_download(
     if req.name.is_empty() || req.url.is_empty() {
         return json_error("name and url are required", StatusCode::BAD_REQUEST);
     }
-    let release_id = req.release_id.as_deref()
+    let release_id = req
+        .release_id
+        .as_deref()
         .filter(|s| !s.is_empty())
         .and_then(|s| uuid::Uuid::parse_str(s).ok());
-    match state.db.update_download_link(link_id, &req.name, &req.url, &req.platform, &req.arch, &req.format, req.sort_order, req.is_active, release_id).await {
+    match state
+        .db
+        .update_download_link(
+            link_id,
+            &req.name,
+            &req.url,
+            &req.platform,
+            &req.arch,
+            &req.format,
+            req.sort_order,
+            req.is_active,
+            release_id,
+        )
+        .await
+    {
         Ok(link) => json_response(StatusCode::OK, link),
-        Err(_) => json_error("failed to update download link", StatusCode::INTERNAL_SERVER_ERROR),
+        Err(_) => json_error(
+            "failed to update download link",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 
@@ -279,18 +417,22 @@ pub async fn handle_admin_test_smtp(
     }
 
     match state.email.test_connection(&req.to_email) {
-        Ok(_) => json_response(StatusCode::OK, json!({"message": "Test email sent successfully."})),
+        Ok(_) => json_response(
+            StatusCode::OK,
+            json!({"message": "Test email sent successfully."}),
+        ),
         Err(e) => json_response(StatusCode::OK, json!({"error": e})),
     }
 }
 
-pub async fn handle_admin_test_oidc(
-    State(state): State<Arc<AppState>>,
-) -> Response {
+pub async fn handle_admin_test_oidc(State(state): State<Arc<AppState>>) -> Response {
     let issuer_url = &state.config.oidc_issuer_url;
 
     if issuer_url.is_empty() {
-        return json_response(StatusCode::OK, json!({"error": "OIDC_ISSUER_URL is not configured in env."}));
+        return json_response(
+            StatusCode::OK,
+            json!({"error": "OIDC_ISSUER_URL is not configured in env."}),
+        );
     }
 
     let discovery_url = format!(
@@ -298,9 +440,17 @@ pub async fn handle_admin_test_oidc(
         issuer_url.trim_end_matches('/'),
     );
 
-    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build() {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
         Ok(c) => c,
-        Err(e) => return json_response(StatusCode::OK, json!({"error": format!("HTTP client error: {e}")})),
+        Err(e) => {
+            return json_response(
+                StatusCode::OK,
+                json!({"error": format!("HTTP client error: {e}")}),
+            );
+        }
     };
 
     match client.get(&discovery_url).send().await {
@@ -309,20 +459,35 @@ pub async fn handle_admin_test_oidc(
                 match resp.json::<serde_json::Value>().await {
                     Ok(doc) => {
                         let issuer = doc.get("issuer").and_then(|v| v.as_str()).unwrap_or("");
-                        let auth_ep = doc.get("authorization_endpoint").and_then(|v| v.as_str()).unwrap_or("");
-                        json_response(StatusCode::OK, json!({
-                            "message": "OIDC discovery successful.",
-                            "issuer": issuer,
-                            "authorization_endpoint": auth_ep,
-                        }))
+                        let auth_ep = doc
+                            .get("authorization_endpoint")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        json_response(
+                            StatusCode::OK,
+                            json!({
+                                "message": "OIDC discovery successful.",
+                                "issuer": issuer,
+                                "authorization_endpoint": auth_ep,
+                            }),
+                        )
                     }
-                    Err(e) => json_response(StatusCode::OK, json!({"error": format!("Failed to parse discovery document: {e}")})),
+                    Err(e) => json_response(
+                        StatusCode::OK,
+                        json!({"error": format!("Failed to parse discovery document: {e}")}),
+                    ),
                 }
             } else {
-                json_response(StatusCode::OK, json!({"error": format!("Discovery endpoint returned HTTP {}", resp.status())}))
+                json_response(
+                    StatusCode::OK,
+                    json!({"error": format!("Discovery endpoint returned HTTP {}", resp.status())}),
+                )
             }
         }
-        Err(e) => json_response(StatusCode::OK, json!({"error": format!("Failed to connect to issuer: {e}")})),
+        Err(e) => json_response(
+            StatusCode::OK,
+            json!({"error": format!("Failed to connect to issuer: {e}")}),
+        ),
     }
 }
 
@@ -334,12 +499,18 @@ pub async fn handle_admin_upload_binary(
 ) -> Response {
     let downloads_dir = &state.config.downloads_dir;
     if downloads_dir.is_empty() {
-        return json_error("DOWNLOADS_DIR not configured", StatusCode::INTERNAL_SERVER_ERROR);
+        return json_error(
+            "DOWNLOADS_DIR not configured",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
     }
 
     // Ensure directory exists
     if let Err(e) = tokio::fs::create_dir_all(downloads_dir).await {
-        return json_error(&format!("cannot create downloads dir: {e}"), StatusCode::INTERNAL_SERVER_ERROR);
+        return json_error(
+            &format!("cannot create downloads dir: {e}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
     }
 
     let mut uploaded = Vec::new();
@@ -351,13 +522,22 @@ pub async fn handle_admin_upload_binary(
         };
 
         // Sanitize filename
-        if file_name.is_empty() || file_name.contains('/') || file_name.contains('\\') || file_name.contains("..") {
+        if file_name.is_empty()
+            || file_name.contains('/')
+            || file_name.contains('\\')
+            || file_name.contains("..")
+        {
             return json_error("invalid filename", StatusCode::BAD_REQUEST);
         }
 
         let data = match field.bytes().await {
             Ok(d) => d,
-            Err(e) => return json_error(&format!("failed to read upload: {e}"), StatusCode::BAD_REQUEST),
+            Err(e) => {
+                return json_error(
+                    &format!("failed to read upload: {e}"),
+                    StatusCode::BAD_REQUEST,
+                );
+            }
         };
 
         // Max 500MB per file
@@ -367,13 +547,19 @@ pub async fn handle_admin_upload_binary(
 
         let dest = std::path::Path::new(downloads_dir).join(&file_name);
         if let Err(e) = tokio::fs::write(&dest, &data).await {
-            return json_error(&format!("failed to write file: {e}"), StatusCode::INTERNAL_SERVER_ERROR);
+            return json_error(
+                &format!("failed to write file: {e}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
         }
 
         // Auto-create download link entry
         let url = format!("/api/downloads/{}", file_name);
         let (platform, arch, format) = crate::db::detect_platform_arch_format(&file_name);
-        let _ = state.db.create_download_link(&file_name, &url, &platform, &arch, &format, 0, true, None).await;
+        let _ = state
+            .db
+            .create_download_link(&file_name, &url, &platform, &arch, &format, 0, true, None)
+            .await;
 
         uploaded.push(json!({
             "filename": file_name,
@@ -401,11 +587,15 @@ pub async fn handle_admin_list_releases(State(state): State<Arc<AppState>>) -> R
 #[derive(serde::Deserialize)]
 pub struct ReleaseBody {
     pub version: String,
-    #[serde(default = "default_unknown")] pub platform: String,
-    #[serde(default)] pub arch: String,
+    #[serde(default = "default_unknown")]
+    pub platform: String,
+    #[serde(default)]
+    pub arch: String,
     pub download_url: String,
-    #[serde(default)] pub release_notes: String,
-    #[serde(default)] pub is_current: bool,
+    #[serde(default)]
+    pub release_notes: String,
+    #[serde(default)]
+    pub is_current: bool,
 }
 
 pub async fn handle_admin_create_release(
@@ -413,11 +603,28 @@ pub async fn handle_admin_create_release(
     axum::Json(req): axum::Json<ReleaseBody>,
 ) -> Response {
     if req.version.is_empty() || req.download_url.is_empty() {
-        return json_error("version and download_url are required", StatusCode::BAD_REQUEST);
+        return json_error(
+            "version and download_url are required",
+            StatusCode::BAD_REQUEST,
+        );
     }
-    match state.db.create_app_release(&req.version, &req.platform, &req.arch, &req.download_url, &req.release_notes, req.is_current).await {
+    match state
+        .db
+        .create_app_release(
+            &req.version,
+            &req.platform,
+            &req.arch,
+            &req.download_url,
+            &req.release_notes,
+            req.is_current,
+        )
+        .await
+    {
         Ok(rel) => json_response(StatusCode::CREATED, rel),
-        Err(_) => json_error("failed to create release", StatusCode::INTERNAL_SERVER_ERROR),
+        Err(_) => json_error(
+            "failed to create release",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 
@@ -427,11 +634,29 @@ pub async fn handle_admin_update_release(
     axum::Json(req): axum::Json<ReleaseBody>,
 ) -> Response {
     if req.version.is_empty() || req.download_url.is_empty() {
-        return json_error("version and download_url are required", StatusCode::BAD_REQUEST);
+        return json_error(
+            "version and download_url are required",
+            StatusCode::BAD_REQUEST,
+        );
     }
-    match state.db.update_app_release(release_id, &req.version, &req.platform, &req.arch, &req.download_url, &req.release_notes, req.is_current).await {
+    match state
+        .db
+        .update_app_release(
+            release_id,
+            &req.version,
+            &req.platform,
+            &req.arch,
+            &req.download_url,
+            &req.release_notes,
+            req.is_current,
+        )
+        .await
+    {
         Ok(rel) => json_response(StatusCode::OK, rel),
-        Err(_) => json_error("failed to update release", StatusCode::INTERNAL_SERVER_ERROR),
+        Err(_) => json_error(
+            "failed to update release",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 
@@ -461,11 +686,21 @@ pub async fn handle_admin_list_audit_logs(
 ) -> Response {
     let limit = query.limit.unwrap_or(50).min(500);
     let offset = query.offset.unwrap_or(0);
-    let user_id = query.user_id.as_deref().and_then(|s| uuid::Uuid::parse_str(s).ok());
+    let user_id = query
+        .user_id
+        .as_deref()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok());
     let action = query.action.as_deref();
 
-    match state.db.list_audit_logs(limit, offset, user_id, action).await {
+    match state
+        .db
+        .list_audit_logs(limit, offset, user_id, action)
+        .await
+    {
         Ok(logs) => json_response(StatusCode::OK, logs),
-        Err(_) => json_error("failed to list audit logs", StatusCode::INTERNAL_SERVER_ERROR),
+        Err(_) => json_error(
+            "failed to list audit logs",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }

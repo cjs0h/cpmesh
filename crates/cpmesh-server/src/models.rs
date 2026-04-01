@@ -201,4 +201,3 @@ pub const AUDIT_TOKEN_REVOKE_ALL: &str = "token_revoke_all";
 pub const AUDIT_DEVICE_APPROVE: &str = "device_approve";
 pub const AUDIT_DEVICE_REJECT: &str = "device_reject";
 pub const AUDIT_GROUP_KEY_ROTATE: &str = "group_key_rotate";
-
