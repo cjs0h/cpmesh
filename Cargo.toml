@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
-
-[workspace.package]
-license = "MIT OR Apache-2.0"
 members = [
     "crates/cpmesh-proto",
     "crates/cpmesh-server",
 ]
 exclude = ["desktop-tauri/src-tauri"]
+
+[workspace.package]
+license = "MIT OR Apache-2.0"
