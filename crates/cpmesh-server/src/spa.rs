@@ -10,16 +10,16 @@ pub async fn spa_handler(uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
 
     // Try serving the exact file
-    if !path.is_empty() {
-        if let Some(file) = WebAssets::get(path) {
-            let mime = mime_guess::from_path(path).first_or_octet_stream();
-            return (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, mime.as_ref())],
-                file.data,
-            )
-                .into_response();
-        }
+    if !path.is_empty()
+        && let Some(file) = WebAssets::get(path)
+    {
+        let mime = mime_guess::from_path(path).first_or_octet_stream();
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, mime.as_ref())],
+            file.data,
+        )
+            .into_response();
     }
 
     // Fallback to index.html for SPA routing

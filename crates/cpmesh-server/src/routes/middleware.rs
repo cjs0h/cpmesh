@@ -47,13 +47,14 @@ pub async fn auth_middleware(
     match state.db.get_user_by_id(claims.user_id).await {
         Ok(user) => {
             // Check if token was issued before bulk revocation
-            if let Some(revoked_before) = user.tokens_revoked_before {
-                if revoked_before > 0 && (claims.iat as i64) < revoked_before {
-                    return json_error(
-                        "session has been revoked, please log in again",
-                        StatusCode::UNAUTHORIZED,
-                    );
-                }
+            if let Some(revoked_before) = user.tokens_revoked_before
+                && revoked_before > 0
+                && (claims.iat as i64) < revoked_before
+            {
+                return json_error(
+                    "session has been revoked, please log in again",
+                    StatusCode::UNAUTHORIZED,
+                );
             }
         }
         Err(_) => {
@@ -161,12 +162,11 @@ pub async fn security_headers(req: Request, next: Next) -> Response {
 
 fn extract_token(req: &Request) -> Option<String> {
     // Check Authorization header
-    if let Some(auth) = req.headers().get(header::AUTHORIZATION) {
-        if let Ok(auth_str) = auth.to_str() {
-            if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                return Some(token.to_string());
-            }
-        }
+    if let Some(auth) = req.headers().get(header::AUTHORIZATION)
+        && let Ok(auth_str) = auth.to_str()
+        && let Some(token) = auth_str.strip_prefix("Bearer ")
+    {
+        return Some(token.to_string());
     }
     // Check query param (for WebSocket)
     if let Some(query) = req.uri().query() {
@@ -185,14 +185,12 @@ pub fn extract_client_ip(
     addr: &SocketAddr,
     trust_proxy: bool,
 ) -> IpAddr {
-    if trust_proxy {
-        if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-            if let Some(first) = xff.split(',').next() {
-                if let Ok(ip) = first.trim().parse::<IpAddr>() {
-                    return ip;
-                }
-            }
-        }
+    if trust_proxy
+        && let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
+        && let Some(first) = xff.split(',').next()
+        && let Ok(ip) = first.trim().parse::<IpAddr>()
+    {
+        return ip;
     }
     addr.ip()
 }

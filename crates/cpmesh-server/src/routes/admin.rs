@@ -65,7 +65,7 @@ pub async fn handle_admin_delete_user(
     if user_id == claims.user_id {
         return json_error("cannot delete yourself", StatusCode::BAD_REQUEST);
     }
-    if let Err(_) = state.db.admin_delete_user(user_id).await {
+    if state.db.admin_delete_user(user_id).await.is_err() {
         return json_error("user not found", StatusCode::NOT_FOUND);
     }
 
@@ -108,7 +108,12 @@ pub async fn handle_admin_assign_subscription(
     if state.db.get_subscription_plan(plan_id).await.is_err() {
         return json_error("plan not found", StatusCode::NOT_FOUND);
     }
-    if let Err(_) = state.db.assign_user_subscription(user_id, plan_id).await {
+    if state
+        .db
+        .assign_user_subscription(user_id, plan_id)
+        .await
+        .is_err()
+    {
         return json_error(
             "failed to assign subscription",
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -138,7 +143,7 @@ pub async fn handle_admin_remove_subscription(
     headers: axum::http::HeaderMap,
     Path(user_id): Path<uuid::Uuid>,
 ) -> Response {
-    if let Err(_) = state.db.remove_user_subscription(user_id).await {
+    if state.db.remove_user_subscription(user_id).await.is_err() {
         return json_error(
             "failed to remove subscription",
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -165,7 +170,7 @@ pub async fn handle_admin_verify_email(
     State(state): State<Arc<AppState>>,
     Path(user_id): Path<uuid::Uuid>,
 ) -> Response {
-    if let Err(_) = state.db.set_email_verified(user_id, true).await {
+    if state.db.set_email_verified(user_id, true).await.is_err() {
         return json_error("user not found", StatusCode::NOT_FOUND);
     }
     json_response(StatusCode::OK, json!({"message": "email verified"}))
@@ -228,18 +233,18 @@ pub async fn handle_admin_create_plan(
     let ft = serde_json::to_value(&req.allowed_file_types).unwrap_or_default();
     match state
         .db
-        .create_subscription_plan(
-            &req.name,
-            &req.description,
-            req.price,
-            &req.currency,
-            &req.billing_period,
-            req.max_devices,
-            req.max_clipboard_history,
-            &ft,
-            req.is_active,
-            req.sort_order,
-        )
+        .create_subscription_plan(&crate::db::SubscriptionPlanParams {
+            name: &req.name,
+            description: &req.description,
+            price: req.price,
+            currency: &req.currency,
+            billing_period: &req.billing_period,
+            max_devices: req.max_devices,
+            max_clipboard_history: req.max_clipboard_history,
+            allowed_file_types: &ft,
+            is_active: req.is_active,
+            sort_order: req.sort_order,
+        })
         .await
     {
         Ok(plan) => json_response(StatusCode::CREATED, plan),
@@ -260,16 +265,18 @@ pub async fn handle_admin_update_plan(
         .db
         .update_subscription_plan(
             plan_id,
-            &req.name,
-            &req.description,
-            req.price,
-            &req.currency,
-            &req.billing_period,
-            req.max_devices,
-            req.max_clipboard_history,
-            &ft,
-            req.is_active,
-            req.sort_order,
+            &crate::db::SubscriptionPlanParams {
+                name: &req.name,
+                description: &req.description,
+                price: req.price,
+                currency: &req.currency,
+                billing_period: &req.billing_period,
+                max_devices: req.max_devices,
+                max_clipboard_history: req.max_clipboard_history,
+                allowed_file_types: &ft,
+                is_active: req.is_active,
+                sort_order: req.sort_order,
+            },
         )
         .await
     {
@@ -335,16 +342,16 @@ pub async fn handle_admin_create_download(
         .and_then(|s| uuid::Uuid::parse_str(s).ok());
     match state
         .db
-        .create_download_link(
-            &req.name,
-            &req.url,
-            &req.platform,
-            &req.arch,
-            &req.format,
-            req.sort_order,
-            req.is_active,
+        .create_download_link(&crate::db::DownloadLinkParams {
+            name: &req.name,
+            url: &req.url,
+            platform: &req.platform,
+            arch: &req.arch,
+            format: &req.format,
+            sort_order: req.sort_order,
+            is_active: req.is_active,
             release_id,
-        )
+        })
         .await
     {
         Ok(link) => json_response(StatusCode::CREATED, link),
@@ -372,14 +379,16 @@ pub async fn handle_admin_update_download(
         .db
         .update_download_link(
             link_id,
-            &req.name,
-            &req.url,
-            &req.platform,
-            &req.arch,
-            &req.format,
-            req.sort_order,
-            req.is_active,
-            release_id,
+            &crate::db::DownloadLinkParams {
+                name: &req.name,
+                url: &req.url,
+                platform: &req.platform,
+                arch: &req.arch,
+                format: &req.format,
+                sort_order: req.sort_order,
+                is_active: req.is_active,
+                release_id,
+            },
         )
         .await
     {
@@ -395,7 +404,7 @@ pub async fn handle_admin_delete_download(
     State(state): State<Arc<AppState>>,
     Path(link_id): Path<uuid::Uuid>,
 ) -> Response {
-    if let Err(_) = state.db.delete_download_link(link_id).await {
+    if state.db.delete_download_link(link_id).await.is_err() {
         return json_error("download link not found", StatusCode::NOT_FOUND);
     }
     StatusCode::NO_CONTENT.into_response()
@@ -558,7 +567,16 @@ pub async fn handle_admin_upload_binary(
         let (platform, arch, format) = crate::db::detect_platform_arch_format(&file_name);
         let _ = state
             .db
-            .create_download_link(&file_name, &url, &platform, &arch, &format, 0, true, None)
+            .create_download_link(&crate::db::DownloadLinkParams {
+                name: &file_name,
+                url: &url,
+                platform: &platform,
+                arch: &arch,
+                format: &format,
+                sort_order: 0,
+                is_active: true,
+                release_id: None,
+            })
             .await;
 
         uploaded.push(json!({
@@ -610,14 +628,14 @@ pub async fn handle_admin_create_release(
     }
     match state
         .db
-        .create_app_release(
-            &req.version,
-            &req.platform,
-            &req.arch,
-            &req.download_url,
-            &req.release_notes,
-            req.is_current,
-        )
+        .create_app_release(&crate::db::AppReleaseParams {
+            version: &req.version,
+            platform: &req.platform,
+            arch: &req.arch,
+            download_url: &req.download_url,
+            release_notes: &req.release_notes,
+            is_current: req.is_current,
+        })
         .await
     {
         Ok(rel) => json_response(StatusCode::CREATED, rel),
@@ -643,12 +661,14 @@ pub async fn handle_admin_update_release(
         .db
         .update_app_release(
             release_id,
-            &req.version,
-            &req.platform,
-            &req.arch,
-            &req.download_url,
-            &req.release_notes,
-            req.is_current,
+            &crate::db::AppReleaseParams {
+                version: &req.version,
+                platform: &req.platform,
+                arch: &req.arch,
+                download_url: &req.download_url,
+                release_notes: &req.release_notes,
+                is_current: req.is_current,
+            },
         )
         .await
     {
@@ -664,7 +684,7 @@ pub async fn handle_admin_delete_release(
     State(state): State<Arc<AppState>>,
     Path(release_id): Path<uuid::Uuid>,
 ) -> Response {
-    if let Err(_) = state.db.delete_app_release(release_id).await {
+    if state.db.delete_app_release(release_id).await.is_err() {
         return json_error("release not found", StatusCode::NOT_FOUND);
     }
     StatusCode::NO_CONTENT.into_response()

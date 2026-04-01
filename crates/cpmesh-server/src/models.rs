@@ -99,7 +99,7 @@ pub struct AdminStats {
     pub active_connections: i64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct UserSubscriptionInfo {
     pub plan_id: Option<uuid::Uuid>,
     pub plan_name: Option<String>,
@@ -110,22 +110,6 @@ pub struct UserSubscriptionInfo {
     pub max_devices: Option<i32>,
     pub max_clipboard_history: Option<i32>,
     pub allowed_file_types: Vec<String>,
-}
-
-impl Default for UserSubscriptionInfo {
-    fn default() -> Self {
-        Self {
-            plan_id: None,
-            plan_name: None,
-            plan_description: None,
-            price: None,
-            currency: None,
-            billing_period: None,
-            max_devices: None,
-            max_clipboard_history: None,
-            allowed_file_types: vec![],
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]

@@ -45,109 +45,108 @@ pub async fn handle_register_device(
     };
 
     // Check if this device already exists by fingerprint
-    if let Some(ref fp) = req.fingerprint {
-        if let Ok(Some(existing_device)) =
+    if let Some(ref fp) = req.fingerprint
+        && let Ok(Some(existing_device)) =
             state.db.get_device_by_fingerprint(claims.user_id, fp).await
-        {
-            let is_same_keys = existing_device.public_key == req.public_key;
+    {
+        let is_same_keys = existing_device.public_key == req.public_key;
 
-            if is_same_keys {
-                // Same device, same keys — simple reconnect: return existing device + new token
-                let access_token = match state
-                    .auth
-                    .generate_access_token(claims.user_id, Some(existing_device.id))
-                {
-                    Ok(t) => t,
-                    Err(_) => {
-                        return json_error("internal error", StatusCode::INTERNAL_SERVER_ERROR);
-                    }
-                };
-                return json_response(
-                    StatusCode::OK,
-                    json!({
-                        "device": {
-                            "id": existing_device.id.to_string(),
-                            "status": existing_device.status,
-                            "is_reregistration": false,
-                        },
-                        "access_token": access_token,
-                    }),
-                );
-            }
-
-            // Same device, different keys (reinstall) — re-register
-            // If this is the user's only device, auto-approve to prevent deadlock
-            let status = if existing.len() <= 1 {
-                "approved"
-            } else {
-                "pending"
-            };
-
-            let device = match state
-                .db
-                .reregister_device(
-                    existing_device.id,
-                    &req.name,
-                    &req.public_key,
-                    req.public_key_sig.as_deref(),
-                    status,
-                )
-                .await
-            {
-                Ok(d) => d,
-                Err(_) => {
-                    return json_error(
-                        "failed to re-register device",
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                    );
-                }
-            };
-
+        if is_same_keys {
+            // Same device, same keys — simple reconnect: return existing device + new token
             let access_token = match state
                 .auth
-                .generate_access_token(claims.user_id, Some(device.id))
+                .generate_access_token(claims.user_id, Some(existing_device.id))
             {
                 Ok(t) => t,
-                Err(_) => return json_error("internal error", StatusCode::INTERNAL_SERVER_ERROR),
+                Err(_) => {
+                    return json_error("internal error", StatusCode::INTERNAL_SERVER_ERROR);
+                }
             };
+            return json_response(
+                StatusCode::OK,
+                json!({
+                    "device": {
+                        "id": existing_device.id.to_string(),
+                        "status": existing_device.status,
+                        "is_reregistration": false,
+                    },
+                    "access_token": access_token,
+                }),
+            );
+        }
 
-            // Audit log for re-registration
-            let ip = extract_client_ip(&headers, &addr, state.config.trust_proxy_headers);
-            let ua = headers
-                .get(axum::http::header::USER_AGENT)
-                .and_then(|v| v.to_str().ok())
-                .map(String::from);
-            let pool = state.db.pool.clone();
-            let uid = claims.user_id;
-            let dev_id = device.id;
-            let dev_name = device.name.clone();
-            let dev_status = device.status.clone();
-            let ip_str = ip.to_string();
-            tokio::spawn(async move {
-                let _ = sqlx::query(
+        // Same device, different keys (reinstall) — re-register
+        // If this is the user's only device, auto-approve to prevent deadlock
+        let status = if existing.len() <= 1 {
+            "approved"
+        } else {
+            "pending"
+        };
+
+        let device = match state
+            .db
+            .reregister_device(
+                existing_device.id,
+                &req.name,
+                &req.public_key,
+                req.public_key_sig.as_deref(),
+                status,
+            )
+            .await
+        {
+            Ok(d) => d,
+            Err(_) => {
+                return json_error(
+                    "failed to re-register device",
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                );
+            }
+        };
+
+        let access_token = match state
+            .auth
+            .generate_access_token(claims.user_id, Some(device.id))
+        {
+            Ok(t) => t,
+            Err(_) => return json_error("internal error", StatusCode::INTERNAL_SERVER_ERROR),
+        };
+
+        // Audit log for re-registration
+        let ip = extract_client_ip(&headers, &addr, state.config.trust_proxy_headers);
+        let ua = headers
+            .get(axum::http::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        let pool = state.db.pool.clone();
+        let uid = claims.user_id;
+        let dev_id = device.id;
+        let dev_name = device.name.clone();
+        let dev_status = device.status.clone();
+        let ip_str = ip.to_string();
+        tokio::spawn(async move {
+            let _ = sqlx::query(
                     "INSERT INTO audit_logs (user_id, action, ip_address, user_agent, details) VALUES ($1, $2, $3, $4, $5)"
                 )
                 .bind(Some(uid))
                 .bind(AUDIT_DEVICE_REGISTER)
                 .bind(&ip_str)
                 .bind(ua.as_deref())
-                .bind(&json!({"device_id": dev_id.to_string(), "device_name": dev_name, "status": dev_status, "is_reregistration": true}))
+                .bind(json!({"device_id": dev_id.to_string(), "device_name": dev_name, "status": dev_status, "is_reregistration": true}))
                 .execute(&pool)
                 .await;
-            });
+        });
 
-            return json_response(
-                StatusCode::OK,
-                json!({
-                    "device": {
-                        "id": device.id.to_string(),
-                        "status": device.status,
-                        "is_reregistration": true,
-                    },
-                    "access_token": access_token,
-                }),
-            );
-        }
+        return json_response(
+            StatusCode::OK,
+            json!({
+                "device": {
+                    "id": device.id.to_string(),
+                    "status": device.status,
+                    "is_reregistration": true,
+                },
+                "access_token": access_token,
+            }),
+        );
     }
 
     // New device registration (no fingerprint match)
@@ -219,7 +218,7 @@ pub async fn handle_register_device(
         .bind(AUDIT_DEVICE_REGISTER)
         .bind(&ip_str)
         .bind(ua.as_deref())
-        .bind(&json!({"device_id": dev_id.to_string(), "device_name": dev_name, "status": dev_status}))
+        .bind(json!({"device_id": dev_id.to_string(), "device_name": dev_name, "status": dev_status}))
         .execute(&pool)
         .await;
     });
@@ -278,7 +277,12 @@ pub async fn handle_delete_device(
         .map(|d| d.status == "approved")
         .unwrap_or(false);
 
-    if let Err(_) = state.db.delete_device(device_id, claims.user_id).await {
+    if state
+        .db
+        .delete_device(device_id, claims.user_id)
+        .await
+        .is_err()
+    {
         return json_error("device not found", StatusCode::NOT_FOUND);
     }
 
@@ -311,7 +315,7 @@ pub async fn handle_delete_device(
         .bind(AUDIT_DEVICE_DELETE)
         .bind(&ip_str)
         .bind(ua.as_deref())
-        .bind(&json!({"device_id": device_id.to_string(), "was_approved": was_approved}))
+        .bind(json!({"device_id": device_id.to_string(), "was_approved": was_approved}))
         .execute(&pool)
         .await;
     });
@@ -466,7 +470,7 @@ pub async fn handle_store_group_keys(
     }
 
     // Store in both legacy and versioned tables for migration
-    if let Err(_) = state.db.store_group_keys(device_id, &keys).await {
+    if state.db.store_group_keys(device_id, &keys).await.is_err() {
         return json_error(
             "failed to store group keys",
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -671,7 +675,7 @@ pub async fn handle_rotate_group_key(
         .bind(AUDIT_GROUP_KEY_ROTATE)
         .bind(&ip_str)
         .bind(ua.as_deref())
-        .bind(&json!({"new_version": req.new_version, "device_id": device_id.to_string()}))
+        .bind(json!({"new_version": req.new_version, "device_id": device_id.to_string()}))
         .execute(&pool)
         .await;
     });

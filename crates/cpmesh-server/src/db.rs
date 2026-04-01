@@ -4,6 +4,59 @@ use sqlx::postgres::PgPoolOptions;
 use crate::models::*;
 use crate::pii::PiiService;
 
+pub struct CreateUserParams<'a> {
+    pub username: &'a str,
+    pub password_hash: &'a str,
+    pub email: &'a str,
+    pub full_name: &'a str,
+    pub country: Option<&'a str>,
+    pub mobile: Option<&'a str>,
+    pub pii: Option<&'a PiiService>,
+}
+
+pub struct CreateOidcUserParams<'a> {
+    pub username: &'a str,
+    pub email: &'a str,
+    pub full_name: &'a str,
+    pub provider: &'a str,
+    pub provider_id: &'a str,
+    pub avatar_url: Option<&'a str>,
+    pub pii: Option<&'a PiiService>,
+}
+
+pub struct SubscriptionPlanParams<'a> {
+    pub name: &'a str,
+    pub description: &'a str,
+    pub price: f64,
+    pub currency: &'a str,
+    pub billing_period: &'a str,
+    pub max_devices: i32,
+    pub max_clipboard_history: i32,
+    pub allowed_file_types: &'a serde_json::Value,
+    pub is_active: bool,
+    pub sort_order: i32,
+}
+
+pub struct DownloadLinkParams<'a> {
+    pub name: &'a str,
+    pub url: &'a str,
+    pub platform: &'a str,
+    pub arch: &'a str,
+    pub format: &'a str,
+    pub sort_order: i32,
+    pub is_active: bool,
+    pub release_id: Option<uuid::Uuid>,
+}
+
+pub struct AppReleaseParams<'a> {
+    pub version: &'a str,
+    pub platform: &'a str,
+    pub arch: &'a str,
+    pub download_url: &'a str,
+    pub release_notes: &'a str,
+    pub is_current: bool,
+}
+
 pub struct Db {
     pub pool: PgPool,
 }
@@ -24,26 +77,24 @@ impl Db {
 
     // === User operations ===
 
-    pub async fn create_user(
-        &self,
-        username: &str,
-        password_hash: &str,
-        email: &str,
-        full_name: &str,
-        country: Option<&str>,
-        mobile: Option<&str>,
-        pii: Option<&PiiService>,
-    ) -> Result<User, sqlx::Error> {
+    pub async fn create_user(&self, params: CreateUserParams<'_>) -> Result<User, sqlx::Error> {
         let (enc_email, email_idx, enc_full_name, username_idx, enc_country, enc_mobile) =
-            encrypt_user_fields(username, email, full_name, country, mobile, pii);
+            encrypt_user_fields(
+                params.username,
+                params.email,
+                params.full_name,
+                params.country,
+                params.mobile,
+                params.pii,
+            );
 
         sqlx::query_as::<_, User>(
             "INSERT INTO users (username, password, email, email_idx, full_name, country, mobile, username_idx, email_verified, auth_provider)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, FALSE, 'local')
              RETURNING *"
         )
-        .bind(username)
-        .bind(password_hash)
+        .bind(params.username)
+        .bind(params.password_hash)
         .bind(&enc_email)
         .bind(&email_idx)
         .bind(&enc_full_name)
@@ -109,25 +160,25 @@ impl Db {
     /// Create a user from an OIDC provider. Email is auto-verified, no password.
     pub async fn create_oidc_user(
         &self,
-        username: &str,
-        email: &str,
-        full_name: &str,
-        provider: &str,
-        provider_id: &str,
-        avatar_url: Option<&str>,
-        pii: Option<&PiiService>,
+        params: CreateOidcUserParams<'_>,
     ) -> Result<User, sqlx::Error> {
-        let (enc_email, email_idx, enc_full_name, username_idx, _, _) =
-            encrypt_user_fields(username, email, full_name, None, None, pii);
-        let enc_provider_id = if let Some(p) = pii {
-            p.encrypt(provider_id).unwrap_or_default()
+        let (enc_email, email_idx, enc_full_name, username_idx, _, _) = encrypt_user_fields(
+            params.username,
+            params.email,
+            params.full_name,
+            None,
+            None,
+            params.pii,
+        );
+        let enc_provider_id = if let Some(p) = params.pii {
+            p.encrypt(params.provider_id).unwrap_or_default()
         } else {
-            provider_id.to_string()
+            params.provider_id.to_string()
         };
-        let provider_id_idx = if let Some(p) = pii {
-            p.blind_index(provider_id)
+        let provider_id_idx = if let Some(p) = params.pii {
+            p.blind_index(params.provider_id)
         } else {
-            provider_id.to_string()
+            params.provider_id.to_string()
         };
 
         sqlx::query_as::<_, User>(
@@ -135,14 +186,14 @@ impl Db {
              VALUES ($1, '', $2, $3, $4, TRUE, $5, $6, $7, $8, $9)
              RETURNING *"
         )
-        .bind(username)
+        .bind(params.username)
         .bind(&enc_email)
         .bind(&email_idx)
         .bind(&enc_full_name)
-        .bind(provider)
+        .bind(params.provider)
         .bind(&enc_provider_id)
         .bind(&provider_id_idx)
-        .bind(avatar_url)
+        .bind(params.avatar_url)
         .bind(&username_idx)
         .fetch_one(&self.pool)
         .await
@@ -764,32 +815,23 @@ impl Db {
 
     pub async fn create_subscription_plan(
         &self,
-        name: &str,
-        description: &str,
-        price: f64,
-        currency: &str,
-        billing_period: &str,
-        max_devices: i32,
-        max_clipboard_history: i32,
-        allowed_file_types: &serde_json::Value,
-        is_active: bool,
-        sort_order: i32,
+        params: &SubscriptionPlanParams<'_>,
     ) -> Result<SubscriptionPlan, sqlx::Error> {
         sqlx::query_as::<_, SubscriptionPlan>(
             "INSERT INTO subscription_plans (name, description, price, currency, billing_period, max_devices, max_clipboard_history, allowed_file_types, is_active, sort_order)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              RETURNING *"
         )
-        .bind(name)
-        .bind(description)
-        .bind(sqlx::types::Decimal::try_from(price).unwrap_or_default())
-        .bind(currency)
-        .bind(billing_period)
-        .bind(max_devices)
-        .bind(max_clipboard_history)
-        .bind(allowed_file_types)
-        .bind(is_active)
-        .bind(sort_order)
+        .bind(params.name)
+        .bind(params.description)
+        .bind(sqlx::types::Decimal::try_from(params.price).unwrap_or_default())
+        .bind(params.currency)
+        .bind(params.billing_period)
+        .bind(params.max_devices)
+        .bind(params.max_clipboard_history)
+        .bind(params.allowed_file_types)
+        .bind(params.is_active)
+        .bind(params.sort_order)
         .fetch_one(&self.pool)
         .await
     }
@@ -797,16 +839,7 @@ impl Db {
     pub async fn update_subscription_plan(
         &self,
         id: uuid::Uuid,
-        name: &str,
-        description: &str,
-        price: f64,
-        currency: &str,
-        billing_period: &str,
-        max_devices: i32,
-        max_clipboard_history: i32,
-        allowed_file_types: &serde_json::Value,
-        is_active: bool,
-        sort_order: i32,
+        params: &SubscriptionPlanParams<'_>,
     ) -> Result<SubscriptionPlan, sqlx::Error> {
         sqlx::query_as::<_, SubscriptionPlan>(
             "UPDATE subscription_plans
@@ -816,16 +849,16 @@ impl Db {
              WHERE id=$11
              RETURNING *",
         )
-        .bind(name)
-        .bind(description)
-        .bind(sqlx::types::Decimal::try_from(price).unwrap_or_default())
-        .bind(currency)
-        .bind(billing_period)
-        .bind(max_devices)
-        .bind(max_clipboard_history)
-        .bind(allowed_file_types)
-        .bind(is_active)
-        .bind(sort_order)
+        .bind(params.name)
+        .bind(params.description)
+        .bind(sqlx::types::Decimal::try_from(params.price).unwrap_or_default())
+        .bind(params.currency)
+        .bind(params.billing_period)
+        .bind(params.max_devices)
+        .bind(params.max_clipboard_history)
+        .bind(params.allowed_file_types)
+        .bind(params.is_active)
+        .bind(params.sort_order)
         .bind(id)
         .fetch_one(&self.pool)
         .await
@@ -955,20 +988,20 @@ impl Db {
 
     pub async fn create_download_link(
         &self,
-        name: &str,
-        url: &str,
-        platform: &str,
-        arch: &str,
-        format: &str,
-        sort_order: i32,
-        is_active: bool,
-        release_id: Option<uuid::Uuid>,
+        params: &DownloadLinkParams<'_>,
     ) -> Result<DownloadLink, sqlx::Error> {
         sqlx::query_as::<_, DownloadLink>(
             "INSERT INTO download_links (name, url, platform, arch, format, sort_order, is_active, release_id)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *"
         )
-        .bind(name).bind(url).bind(platform).bind(arch).bind(format).bind(sort_order).bind(is_active).bind(release_id)
+        .bind(params.name)
+        .bind(params.url)
+        .bind(params.platform)
+        .bind(params.arch)
+        .bind(params.format)
+        .bind(params.sort_order)
+        .bind(params.is_active)
+        .bind(params.release_id)
         .fetch_one(&self.pool)
         .await
     }
@@ -976,20 +1009,21 @@ impl Db {
     pub async fn update_download_link(
         &self,
         id: uuid::Uuid,
-        name: &str,
-        url: &str,
-        platform: &str,
-        arch: &str,
-        format: &str,
-        sort_order: i32,
-        is_active: bool,
-        release_id: Option<uuid::Uuid>,
+        params: &DownloadLinkParams<'_>,
     ) -> Result<DownloadLink, sqlx::Error> {
         sqlx::query_as::<_, DownloadLink>(
             "UPDATE download_links SET name=$1, url=$2, platform=$3, arch=$4, format=$5, sort_order=$6, is_active=$7, release_id=$8, updated_at=NOW()
              WHERE id=$9 RETURNING *"
         )
-        .bind(name).bind(url).bind(platform).bind(arch).bind(format).bind(sort_order).bind(is_active).bind(release_id).bind(id)
+        .bind(params.name)
+        .bind(params.url)
+        .bind(params.platform)
+        .bind(params.arch)
+        .bind(params.format)
+        .bind(params.sort_order)
+        .bind(params.is_active)
+        .bind(params.release_id)
+        .bind(id)
         .fetch_one(&self.pool)
         .await
     }
@@ -1052,17 +1086,12 @@ impl Db {
 
     pub async fn create_app_release(
         &self,
-        version: &str,
-        platform: &str,
-        arch: &str,
-        download_url: &str,
-        release_notes: &str,
-        is_current: bool,
+        params: &AppReleaseParams<'_>,
     ) -> Result<AppRelease, sqlx::Error> {
         // If marking as current, unset others for same platform+arch
-        if is_current {
+        if params.is_current {
             sqlx::query("UPDATE app_releases SET is_current = FALSE, updated_at = NOW() WHERE platform = $1 AND arch = $2")
-                .bind(platform).bind(arch)
+                .bind(params.platform).bind(params.arch)
                 .execute(&self.pool)
                 .await?;
         }
@@ -1070,7 +1099,12 @@ impl Db {
             "INSERT INTO app_releases (version, platform, arch, download_url, release_notes, is_current)
              VALUES ($1, $2, $3, $4, $5, $6) RETURNING *"
         )
-        .bind(version).bind(platform).bind(arch).bind(download_url).bind(release_notes).bind(is_current)
+        .bind(params.version)
+        .bind(params.platform)
+        .bind(params.arch)
+        .bind(params.download_url)
+        .bind(params.release_notes)
+        .bind(params.is_current)
         .fetch_one(&self.pool)
         .await
     }
@@ -1078,16 +1112,11 @@ impl Db {
     pub async fn update_app_release(
         &self,
         id: uuid::Uuid,
-        version: &str,
-        platform: &str,
-        arch: &str,
-        download_url: &str,
-        release_notes: &str,
-        is_current: bool,
+        params: &AppReleaseParams<'_>,
     ) -> Result<AppRelease, sqlx::Error> {
-        if is_current {
+        if params.is_current {
             sqlx::query("UPDATE app_releases SET is_current = FALSE, updated_at = NOW() WHERE platform = $1 AND arch = $2 AND id != $3")
-                .bind(platform).bind(arch).bind(id)
+                .bind(params.platform).bind(params.arch).bind(id)
                 .execute(&self.pool)
                 .await?;
         }
@@ -1095,7 +1124,13 @@ impl Db {
             "UPDATE app_releases SET version=$1, platform=$2, arch=$3, download_url=$4, release_notes=$5, is_current=$6, updated_at=NOW()
              WHERE id=$7 RETURNING *"
         )
-        .bind(version).bind(platform).bind(arch).bind(download_url).bind(release_notes).bind(is_current).bind(id)
+        .bind(params.version)
+        .bind(params.platform)
+        .bind(params.arch)
+        .bind(params.download_url)
+        .bind(params.release_notes)
+        .bind(params.is_current)
+        .bind(id)
         .fetch_one(&self.pool)
         .await
     }
@@ -1203,7 +1238,7 @@ impl Db {
 
         let mut token_bytes = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut token_bytes);
-        let token = hex::encode(&token_bytes);
+        let token = hex::encode(token_bytes);
         let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
         let expires_at = chrono::Utc::now() + chrono::Duration::hours(24);
 
@@ -1299,7 +1334,7 @@ impl Db {
     }
 
     pub async fn cleanup_expired_revoked_tokens(&self) -> Result<u64, sqlx::Error> {
-        let now = chrono::Utc::now().timestamp() as i64;
+        let now = chrono::Utc::now().timestamp();
         let result = sqlx::query("DELETE FROM revoked_tokens WHERE expires_at < $1")
             .bind(now)
             .execute(&self.pool)

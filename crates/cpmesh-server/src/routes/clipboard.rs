@@ -22,26 +22,25 @@ pub async fn handle_get_clipboard_history(
     Extension(claims): Extension<AuthClaims>,
     Query(query): Query<PaginationQuery>,
 ) -> Response {
-    let mut limit = query.limit.unwrap_or(50).min(100).max(1);
+    let mut limit = query.limit.unwrap_or(50).clamp(1, 100);
     let offset = query.offset.unwrap_or(0).max(0);
 
     // Enforce subscription clipboard history limit
-    if let Ok(sub) = state.db.get_user_subscription(claims.user_id).await {
-        if let Some(max_history) = sub.max_clipboard_history {
-            if max_history > 0 {
-                if offset >= max_history as i64 {
-                    return json_response(
-                        StatusCode::OK,
-                        json!({
-                            "entries": [],
-                            "has_more": false,
-                        }),
-                    );
-                }
-                if offset + limit > max_history as i64 {
-                    limit = max_history as i64 - offset;
-                }
-            }
+    if let Ok(sub) = state.db.get_user_subscription(claims.user_id).await
+        && let Some(max_history) = sub.max_clipboard_history
+        && max_history > 0
+    {
+        if offset >= max_history as i64 {
+            return json_response(
+                StatusCode::OK,
+                json!({
+                    "entries": [],
+                    "has_more": false,
+                }),
+            );
+        }
+        if offset + limit > max_history as i64 {
+            limit = max_history as i64 - offset;
         }
     }
 
@@ -83,10 +82,11 @@ pub async fn handle_delete_clipboard_entry(
     Extension(claims): Extension<AuthClaims>,
     Path(entry_id): Path<uuid::Uuid>,
 ) -> Response {
-    if let Err(_) = state
+    if state
         .db
         .delete_clipboard_entry(entry_id, claims.user_id)
         .await
+        .is_err()
     {
         return json_error("entry not found", StatusCode::NOT_FOUND);
     }
@@ -97,7 +97,12 @@ pub async fn handle_clear_clipboard(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<AuthClaims>,
 ) -> Response {
-    if let Err(_) = state.db.clear_clipboard_history(claims.user_id).await {
+    if state
+        .db
+        .clear_clipboard_history(claims.user_id)
+        .await
+        .is_err()
+    {
         return json_error("failed to clear history", StatusCode::INTERNAL_SERVER_ERROR);
     }
     StatusCode::NO_CONTENT.into_response()

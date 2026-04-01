@@ -97,7 +97,12 @@ pub async fn handle_change_password(
         Err(_) => return json_error("internal error", StatusCode::INTERNAL_SERVER_ERROR),
     };
 
-    if let Err(_) = state.db.change_password(claims.user_id, &hash).await {
+    if state
+        .db
+        .change_password(claims.user_id, &hash)
+        .await
+        .is_err()
+    {
         return json_error(
             "failed to change password",
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -121,7 +126,7 @@ pub async fn handle_change_password(
         .bind(AUDIT_PASSWORD_CHANGE)
         .bind(&ip_str)
         .bind(ua.as_deref())
-        .bind(&json!({}))
+        .bind(json!({}))
         .execute(&pool)
         .await;
     });

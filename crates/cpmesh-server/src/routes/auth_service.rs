@@ -179,10 +179,10 @@ impl AuthService {
         }
 
         // DB check is done in middleware via check_revoked_db_async
-        if !data.claims.jti.is_empty() {
-            if let Some(ref pool) = self.pool {
-                let _ = (data.claims.jti.clone(), pool.clone());
-            }
+        if !data.claims.jti.is_empty()
+            && let Some(ref pool) = self.pool
+        {
+            let _ = (data.claims.jti.clone(), pool.clone());
         }
 
         let user_id = uuid::Uuid::parse_str(&data.claims.user_id)

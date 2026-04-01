@@ -320,7 +320,7 @@ pub async fn handle_approve_device(
         .bind(AUDIT_DEVICE_APPROVE)
         .bind(&ip_str)
         .bind(ua.as_deref())
-        .bind(&json!({"pending_device_id": pending_device_id.to_string(), "device_name": dev_name, "new_key_version": req.new_version}))
+        .bind(json!({"pending_device_id": pending_device_id.to_string(), "device_name": dev_name, "new_key_version": req.new_version}))
         .execute(&pool)
         .await;
     });
@@ -376,7 +376,7 @@ pub async fn handle_reject_device(
         .bind(AUDIT_DEVICE_REJECT)
         .bind(&ip_str)
         .bind(ua.as_deref())
-        .bind(&json!({"pending_device_id": pending_device_id.to_string()}))
+        .bind(json!({"pending_device_id": pending_device_id.to_string()}))
         .execute(&pool)
         .await;
     });

@@ -353,15 +353,15 @@ pub async fn handle_register(
 
     let user = match state
         .db
-        .create_user(
-            &username,
-            &hash,
-            &email,
-            &full_name,
+        .create_user(crate::db::CreateUserParams {
+            username: &username,
+            password_hash: &hash,
+            email: &email,
+            full_name: &full_name,
             country,
             mobile,
-            state.pii.as_ref(),
-        )
+            pii: state.pii.as_ref(),
+        })
         .await
     {
         Ok(u) => u,
@@ -379,13 +379,12 @@ pub async fn handle_register(
     };
 
     // Send verification email
-    if let Ok(token) = state.db.create_email_verification(user.id).await {
-        if let Err(e) = state
+    if let Ok(token) = state.db.create_email_verification(user.id).await
+        && let Err(e) = state
             .email
             .send_verification_email(&email, &full_name, &token)
-        {
-            warn!("Failed to send verification email: {e}");
-        }
+    {
+        warn!("Failed to send verification email: {e}");
     }
 
     let ip = extract_client_ip(&headers, &addr, state.config.trust_proxy_headers);
@@ -515,15 +514,15 @@ pub async fn handle_refresh(
     match state.auth.validate_refresh_token(&req.refresh_token) {
         RefreshResult::Ok(claims, old_jti, old_exp) => {
             // Check bulk revocation
-            if let Ok(user) = state.db.get_user_by_id(claims.user_id).await {
-                if let Some(revoked_before) = user.tokens_revoked_before {
-                    if revoked_before > 0 && (claims.iat as i64) < revoked_before {
-                        return json_error(
-                            "session has been revoked, please log in again",
-                            StatusCode::UNAUTHORIZED,
-                        );
-                    }
-                }
+            if let Ok(user) = state.db.get_user_by_id(claims.user_id).await
+                && let Some(revoked_before) = user.tokens_revoked_before
+                && revoked_before > 0
+                && (claims.iat as i64) < revoked_before
+            {
+                return json_error(
+                    "session has been revoked, please log in again",
+                    StatusCode::UNAUTHORIZED,
+                );
             }
 
             // Revoke the old refresh token (single-use enforcement)
@@ -831,12 +830,11 @@ pub async fn handle_social_callback(
                 .get("csrf")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            if let Some(ref c_state) = cookie_state {
-                if csrf != c_state {
-                    let redirect =
-                        format!("{}?social_error=invalid+state+parameter", frontend_login);
-                    return Redirect::to(&redirect).into_response();
-                }
+            if let Some(ref c_state) = cookie_state
+                && csrf != c_state
+            {
+                let redirect = format!("{}?social_error=invalid+state+parameter", frontend_login);
+                return Redirect::to(&redirect).into_response();
             }
             client_redirect = state_json
                 .get("client_redirect")
@@ -848,21 +846,19 @@ pub async fn handle_social_callback(
                 .map(|s| s.to_string());
 
             // Re-validate client_redirect scheme on callback
-            if let Some(ref cr) = client_redirect {
-                if !cr.starts_with("cpmesh://") {
-                    let redirect =
-                        format!("{}?social_error=invalid+client+redirect", frontend_login);
-                    return Redirect::to(&redirect).into_response();
-                }
+            if let Some(ref cr) = client_redirect
+                && !cr.starts_with("cpmesh://")
+            {
+                let redirect = format!("{}?social_error=invalid+client+redirect", frontend_login);
+                return Redirect::to(&redirect).into_response();
             }
         } else {
             // Plain CSRF token (web client flow)
-            if let Some(ref c_state) = cookie_state {
-                if q_state != c_state {
-                    let redirect =
-                        format!("{}?social_error=invalid+state+parameter", frontend_login);
-                    return Redirect::to(&redirect).into_response();
-                }
+            if let Some(ref c_state) = cookie_state
+                && q_state != c_state
+            {
+                let redirect = format!("{}?social_error=invalid+state+parameter", frontend_login);
+                return Redirect::to(&redirect).into_response();
             }
         }
     }
@@ -1117,15 +1113,15 @@ pub async fn handle_social_callback(
 
             match state
                 .db
-                .create_oidc_user(
-                    &username,
-                    &email,
-                    &name,
-                    &provider_name,
-                    &sub,
-                    picture.as_deref(),
-                    state.pii.as_ref(),
-                )
+                .create_oidc_user(crate::db::CreateOidcUserParams {
+                    username: &username,
+                    email: &email,
+                    full_name: &name,
+                    provider: &provider_name,
+                    provider_id: &sub,
+                    avatar_url: picture.as_deref(),
+                    pii: state.pii.as_ref(),
+                })
                 .await
             {
                 Ok(u) => u,
@@ -1292,7 +1288,7 @@ fn extract_cookie(headers: &axum::http::HeaderMap, name: &str) -> Option<String>
         .flat_map(|s| s.split(';'))
         .map(|s| s.trim())
         .find(|s| s.starts_with(&format!("{}=", name)))
-        .map(|s| s.splitn(2, '=').nth(1).unwrap_or("").to_string())
+        .map(|s| s.split_once('=').map(|x| x.1).unwrap_or("").to_string())
 }
 
 fn friendly_provider_name(issuer_url: &str) -> String {

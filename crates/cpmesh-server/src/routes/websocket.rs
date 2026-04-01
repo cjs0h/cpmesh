@@ -167,10 +167,10 @@ async fn handle_ws_connection(
         .unwrap_or_default();
 
         let clients = state.hub.clients.read().await;
-        if let Some(user_clients) = clients.get(&user_id.to_string()) {
-            if let Some(client) = user_clients.get(&device_id.to_string()) {
-                let _ = client.tx.send(rotation_msg);
-            }
+        if let Some(user_clients) = clients.get(&user_id.to_string())
+            && let Some(client) = user_clients.get(&device_id.to_string())
+        {
+            let _ = client.tx.send(rotation_msg);
         }
     }
 
@@ -214,10 +214,10 @@ async fn handle_ws_connection(
 
                                 // Find and send directly
                                 let clients = state.hub.clients.read().await;
-                                if let Some(user_clients) = clients.get(&uid) {
-                                    if let Some(client) = user_clients.get(&did) {
-                                        let _ = client.tx.send(pong);
-                                    }
+                                if let Some(user_clients) = clients.get(&uid)
+                                    && let Some(client) = user_clients.get(&did)
+                                {
+                                    let _ = client.tx.send(pong);
                                 }
                             }
                             _ => {}
@@ -252,20 +252,15 @@ async fn handle_clipboard_push(
             }
         }
         // Check clipboard history limit
-        if let Some(max_history) = sub.max_clipboard_history {
-            if max_history > 0 {
-                if let Ok(count) = state.db.count_user_clipboard_entries(user_id).await {
-                    if count >= max_history as i64 {
-                        let _ = state
-                            .db
-                            .delete_oldest_clipboard_entries(
-                                user_id,
-                                count - max_history as i64 + 1,
-                            )
-                            .await;
-                    }
-                }
-            }
+        if let Some(max_history) = sub.max_clipboard_history
+            && max_history > 0
+            && let Ok(count) = state.db.count_user_clipboard_entries(user_id).await
+            && count >= max_history as i64
+        {
+            let _ = state
+                .db
+                .delete_oldest_clipboard_entries(user_id, count - max_history as i64 + 1)
+                .await;
         }
     }
 
