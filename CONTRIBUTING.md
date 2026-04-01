@@ -2,11 +2,14 @@
 
 Thank you for your interest in contributing to cpmesh! This document provides guidelines and instructions for contributing.
 
-## Getting Started
+## Before You Start
 
-1. Fork the repository on GitHub
-2. Clone your fork locally
-3. Create a new branch for your feature or bug fix
+**Every contribution must start with a GitHub issue.** Whether it's a bug fix, new feature, or documentation improvement — open an issue first (or find an existing one) so the change can be discussed before any code is written. This helps avoid duplicated effort and ensures your contribution aligns with the project's direction.
+
+1. Open or find a related [GitHub issue](https://github.com/cjs0h/cpmesh/issues)
+2. Wait for maintainer approval before starting work on larger changes
+3. Fork the repository and clone your fork locally
+4. Create a new branch for your feature or bug fix
 
 ## Development Setup
 
@@ -50,10 +53,11 @@ npx tauri dev
 
 ## Pull Request Guidelines
 
+- **Reference the GitHub issue** in your PR description (e.g., `Closes #42`)
 - Keep PRs focused on a single change
 - Describe what the PR does and why
-- Link any related issues
 - Make sure CI passes
+- PRs without a linked issue may be closed
 
 ## Reporting Bugs
 

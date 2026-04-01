@@ -1,5 +1,13 @@
 # cpmesh
 
+[![Server CI](https://github.com/cjs0h/cpmesh/actions/workflows/server.yml/badge.svg)](https://github.com/cjs0h/cpmesh/actions/workflows/server.yml)
+[![Web CI](https://github.com/cjs0h/cpmesh/actions/workflows/web.yml/badge.svg)](https://github.com/cjs0h/cpmesh/actions/workflows/web.yml)
+[![Desktop CI](https://github.com/cjs0h/cpmesh/actions/workflows/desktop.yml/badge.svg)](https://github.com/cjs0h/cpmesh/actions/workflows/desktop.yml)
+
+> **Warning:** This project is under heavy development and has not reached a stable release. APIs, configuration, and behavior may change without notice. Use at your own risk.
+
+**Website:** [cpmesh.com](https://cpmesh.com) | **Source:** [GitHub](https://github.com/cjs0h/cpmesh)
+
 Cross-platform encrypted clipboard sharing. Copy on one device, paste on any other instantly and securely.
 
 ## What is cpmesh?
@@ -38,7 +46,7 @@ Desktop App                  Browser
 ### 1. Clone the repo and create local config
 
 ```bash
-git clone https://github.com/cpmesh/cpmesh
+git clone https://github.com/cjs0h/cpmesh
 cd cpmesh
 cp .env.example .env
 ./scripts/generate-dev-jwt.sh
@@ -86,7 +94,7 @@ cargo build --release -p cpmesh-server
 
 ### 5. Install the desktop app
 
-Download the latest release from the [Releases page](https://github.com/cpmesh/cpmesh/releases) or build from source:
+Download the latest release from the [Releases page](https://github.com/cjs0h/cpmesh/releases) or build from source:
 
 ```bash
 # Requires Rust, Node.js 18+, and Tauri CLI

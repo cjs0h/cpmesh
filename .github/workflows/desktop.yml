@@ -1,0 +1,99 @@
+name: Desktop CI
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "desktop-tauri/**"
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "desktop-tauri/**"
+
+jobs:
+  check:
+    name: Svelte Check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: desktop-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop-tauri/package-lock.json
+      - run: npm ci
+      - run: npm run check
+
+  build:
+    name: Build (${{ matrix.platform }})
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - platform: macos
+            os: macos-latest
+            target: aarch64-apple-darwin
+          - platform: windows
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop-tauri/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop-tauri/src-tauri -> target
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            pkg-config \
+            patchelf
+
+      - name: Install frontend dependencies
+        working-directory: desktop-tauri
+        run: npm ci
+
+      - name: Rust tests
+        working-directory: desktop-tauri/src-tauri
+        run: cargo test
+
+      - name: Build Tauri app
+        working-directory: desktop-tauri
+        run: npx tauri build --target ${{ matrix.target }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.platform }}
+          path: |
+            desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.deb
+            desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.AppImage
+            desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.dmg
+            desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.exe
+            desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.msi
+          if-no-files-found: ignore

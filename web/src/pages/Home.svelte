@@ -1,7 +1,7 @@
 <script lang="ts">
   import Icon from '../components/Icon.svelte';
 
-  const GITHUB_URL = 'https://github.com/cpmesh/cpmesh';
+  const GITHUB_URL = 'https://github.com/cjs0h/cpmesh';
 
   // --- Download types ---
   interface DownloadLink {
@@ -808,7 +808,7 @@
 
         <div class="space-y-3">
           {#each [
-            { num: '1', cmd: 'git clone https://github.com/cpmesh/cpmesh && cd cpmesh' },
+            { num: '1', cmd: 'git clone https://github.com/cjs0h/cpmesh && cd cpmesh' },
             { num: '2', cmd: 'docker compose up -d' },
             { num: '3', cmd: 'open http://localhost:39271' },
           ] as step}
