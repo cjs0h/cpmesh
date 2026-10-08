@@ -1,0 +1,22 @@
+[package]
+name = "cpmesh-vector-gen"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Generates golden crypto vectors for the cpmesh-mcp TypeScript package by running the exact Rust crypto from the desktop client. Output: JSON on stdout."
+
+# Standalone workspace (the repo root workspace only includes crates/*).
+[workspace]
+
+[dependencies]
+p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+serde_json = "1"
+base64 = "0.22"
+pem = "3"
+thiserror = "1"
+zeroize = "1"
