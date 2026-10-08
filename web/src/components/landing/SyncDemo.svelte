@@ -94,6 +94,9 @@
     return d.toTimeString().slice(0, 8);
   }
 
+  // The log always renders LOG_ROWS rows (blank ones padded at the end) so the
+  // panel keeps a constant height and nothing below the hero shifts.
+  const LOG_ROWS = 4;
   const log = $derived.by<LogLine[]>(() => {
     const lines: LogLine[] = [];
     const push = (who: string, tone: string, msg: string) => lines.push({ t: stamp(0), who, tone, msg });
@@ -101,7 +104,9 @@
     if (phase !== 'appear') push('crypto', '#ff7a59', `AES-256-GCM · nonce ${nonce}`);
     if (phase === 'toRelay' || phase === 'fanOut' || delivered) push('relay', '#9db0c7', 'forwarded ciphertext → 2 devices');
     if (delivered) for (const t of targets) push(t.id, t.tone, 'decrypted ✓ pasted');
-    return lines.slice(-4);
+    const visible = lines.slice(-LOG_ROWS);
+    while (visible.length < LOG_ROWS) visible.push({ t: '', who: '', tone: '', msg: '' });
+    return visible;
   });
 
   $effect(() => {
@@ -245,11 +250,11 @@
     <div class="absolute right-3 top-3 font-mono text-[10px] uppercase tracking-[0.16em] text-dim">e2e · aes-256-gcm</div>
   </div>
 
-  <!-- Event log -->
+  <!-- Event log (fixed height: LOG_ROWS lines of leading-5 plus py-3) -->
   {#if !compact}
-    <div class="glass mt-3 rounded-xl px-4 py-3 font-mono text-[11px] leading-5">
+    <div class="glass mt-3 h-[6.5rem] overflow-hidden rounded-xl px-4 py-3 font-mono text-[11px] leading-5">
       {#each log as line, i (i)}
-        <div class="flex gap-3 text-muted animate-[fade-in_0.3s_ease-out]">
+        <div class="flex h-5 gap-3 text-muted {line.msg ? 'animate-[fade-in_0.3s_ease-out]' : 'invisible'}">
           <span class="shrink-0 text-dim">{line.t}</span>
           <span class="w-14 shrink-0 font-semibold" style="color: {line.tone};">{line.who}</span>
           <span class="min-w-0 truncate">{line.msg}</span>
