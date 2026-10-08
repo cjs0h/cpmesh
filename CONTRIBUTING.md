@@ -16,7 +16,7 @@ Thank you for your interest in contributing to cpmesh! This document provides gu
 ### Server
 
 ```bash
-# Requires Rust 1.75+ and a running PostgreSQL instance
+# Requires Rust 1.94+ and a running PostgreSQL instance
 cp .env.example .env
 # Generate repo-local dev JWT keys
 ./scripts/generate-dev-jwt.sh
@@ -31,6 +31,7 @@ cargo run -p cpmesh-server
 ### Web Dashboard
 
 ```bash
+# Requires Node.js 22.12+ (24 LTS recommended)
 cd web
 npm install
 npm run dev
@@ -39,15 +40,59 @@ npm run dev
 ### Desktop App
 
 ```bash
+# Requires Node.js 22.17+ (24 LTS recommended)
 cd desktop-tauri
 npm install
 npx tauri dev
 ```
 
+## Testing
+
+All suites run in CI; please run the ones relevant to your change locally first.
+
+### Rust
+
+```bash
+# Server + shared proto crate: unit tests, router tests (no database needed) and wire-format tests
+cargo test --workspace
+
+# Desktop crate: crypto, key exchange, local history (SQLite), config and WebSocket client tests
+cd desktop-tauri/src-tauri && cargo test
+```
+
+The server's PostgreSQL integration tests (`crates/cpmesh-server/tests/db.rs`) are skipped unless
+`TEST_DATABASE_URL` is set. Each test migrates into its own throwaway schema, so any scratch
+database works — for example with Docker:
+
+```bash
+docker run --rm -d --name cpmesh-test-pg -e POSTGRES_PASSWORD=pw -p 127.0.0.1:55432:5432 postgres:16-alpine
+TEST_DATABASE_URL=postgres://postgres:pw@127.0.0.1:55432/postgres cargo test -p cpmesh-server --test db
+docker rm -f cpmesh-test-pg
+```
+
+Lints are enforced with warnings denied, so also run:
+
+```bash
+cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings
+cd desktop-tauri/src-tauri && cargo fmt --check && cargo clippy --all-targets -- -D warnings
+```
+
+### Frontends
+
+Both frontends use [Vitest](https://vitest.dev/) for unit tests and `svelte-check` for type checking:
+
+```bash
+cd web && npm run check && npm test
+cd desktop-tauri && npm run check && npm test
+```
+
+Tests live next to the code they cover (`*.test.ts`). Modules that use Svelte runes must be
+tested from a `*.svelte.test.ts` file so the runes are compiled.
+
 ## Submitting Changes
 
 1. Make sure your code compiles without warnings (`cargo check`, `cargo clippy`)
-2. Test your changes locally
+2. Add or update tests for your change and make sure the relevant suites pass
 3. Commit your changes with a clear, descriptive commit message
 4. Push to your fork and submit a pull request
 

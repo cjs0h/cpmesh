@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 license.workspace = true
 
+[lib]
+name = "cpmesh_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "cpmesh-server"
 path = "src/main.rs"
@@ -14,40 +18,38 @@ cpmesh-proto = { path = "../cpmesh-proto" }
 
 # Web framework
 axum = { version = "0.8", features = ["ws", "macros", "multipart"] }
-axum-extra = { version = "0.10", features = ["typed-header"] }
-tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "fs"] }
+tower-http = { version = "0.7", features = ["cors"] }
 
 # Async
 tokio = { version = "1", features = ["full"] }
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "rust_decimal"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "uuid", "chrono", "json", "rust_decimal"] }
 
 # Auth
-jsonwebtoken = "9"
-argon2 = "0.5"
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
+argon2 = "0.6"
 
 # Crypto (PII encryption)
-aes-gcm = "0.10"
-hmac = "0.12"
-sha2 = "0.10"
-rand = "0.8"
+aes-gcm = "0.11"
+hmac = "0.13"
+sha2 = "0.11"
+rand = "0.10"
 
-# Email
-lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls-tls", "builder", "hostname"] }
+# Email (blocking SmtpTransport; rustls with the aws-lc-rs provider shared by reqwest/sqlx/jsonwebtoken)
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "rustls", "aws-lc-rs", "webpki-roots", "builder", "hostname"] }
 
 # HTTP client (for OIDC)
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls"] }
 urlencoding = "2"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-base64 = "0.22"
+base64 = "0.23"
 
 # Rate limiting
-governor = "0.8"
+governor = "0.10"
 
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -55,12 +57,16 @@ chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-thiserror = "2"
 regex = "1"
-rust_decimal = { version = "1", features = ["db-postgres"] }
-lazy_static = "1"
+rust_decimal = "1"
 futures-util = "0.3"
 
 # Static file embedding
 rust-embed = "8"
 mime_guess = "2"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+aws-lc-rs = "1"
+tempfile = "3"

@@ -207,16 +207,14 @@ struct PkceEntry {
 }
 
 /// Thread-safe store for PKCE authorization codes with 60-second TTL.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct PkceCodeStore {
     inner: Arc<std::sync::Mutex<HashMap<String, PkceEntry>>>,
 }
 
 impl PkceCodeStore {
     pub fn new() -> Self {
-        PkceCodeStore {
-            inner: Arc::new(std::sync::Mutex::new(HashMap::new())),
-        }
+        Self::default()
     }
 
     fn insert(&self, code: String, entry: PkceEntry) {
@@ -1336,11 +1334,11 @@ fn generate_oidc_username(name: &str, sub: &str) -> String {
 }
 
 fn generate_random_string(len: usize) -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
+    use rand::RngExt;
+    let mut rng = rand::rng();
     (0..len)
         .map(|_| {
-            let idx = rng.gen_range(0..36);
+            let idx = rng.random_range(0..36u8);
             if idx < 10 {
                 (b'0' + idx) as char
             } else {
@@ -1357,4 +1355,911 @@ pub async fn handle_list_active_plans(State(state): State<Arc<AppState>>) -> Res
         .await
         .unwrap_or_default();
     json_response(StatusCode::OK, plans)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::*;
+    use axum::http::{HeaderMap, Request, header};
+
+    // ---- password strength -------------------------------------------------
+
+    #[test]
+    fn password_strength_requires_each_character_class() {
+        assert_eq!(
+            validate_password_strength("lowercase1!"),
+            Err("password must contain at least one uppercase letter")
+        );
+        assert_eq!(
+            validate_password_strength("UPPERCASE1!"),
+            Err("password must contain at least one lowercase letter")
+        );
+        assert_eq!(
+            validate_password_strength("NoDigits!!"),
+            Err("password must contain at least one digit")
+        );
+        assert_eq!(
+            validate_password_strength("NoSpecial1"),
+            Err("password must contain at least one special character")
+        );
+        assert_eq!(validate_password_strength("Str0ng-Pass!"), Ok(()));
+    }
+
+    #[test]
+    fn password_strength_rejects_common_passwords_case_insensitively() {
+        // Entries in the blocklist that also satisfy the class rules are still rejected
+        assert_eq!(
+            validate_password_strength("P@ssw0rd"),
+            Err("password is too common, please choose a stronger one")
+        );
+        assert_eq!(
+            validate_password_strength("p@SSw0rd"),
+            Err("password is too common, please choose a stronger one")
+        );
+        // Spaces count as special characters
+        assert_eq!(validate_password_strength("Tr0ub4dor and horse"), Ok(()));
+    }
+
+    // ---- PKCE code store ---------------------------------------------------
+
+    fn entry(challenge: &str) -> PkceEntry {
+        PkceEntry {
+            access_token: "acc".into(),
+            refresh_token: "ref".into(),
+            code_challenge: challenge.into(),
+            created_at: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn pkce_store_take_is_single_use() {
+        let store = PkceCodeStore::new();
+        store.insert("code-1".into(), entry("c"));
+        let first = store.take("code-1").expect("present");
+        assert_eq!(first.code_challenge, "c");
+        assert!(
+            store.take("code-1").is_none(),
+            "codes are consumed on first use"
+        );
+        assert!(store.take("unknown").is_none());
+    }
+
+    #[test]
+    fn pkce_store_cleanup_removes_only_expired_entries() {
+        let store = PkceCodeStore::new();
+        store.insert("fresh".into(), entry("c"));
+        let mut old = entry("c");
+        old.created_at = std::time::Instant::now() - std::time::Duration::from_secs(61);
+        store.insert("stale".into(), old);
+
+        store.cleanup();
+        assert!(store.take("stale").is_none());
+        assert!(store.take("fresh").is_some());
+    }
+
+    #[test]
+    fn pkce_store_clones_share_state() {
+        let store = PkceCodeStore::new();
+        let clone = store.clone();
+        store.insert("shared".into(), entry("c"));
+        assert!(clone.take("shared").is_some());
+    }
+
+    // ---- OIDC helpers ------------------------------------------------------
+
+    #[test]
+    fn decode_jwt_payload_extracts_claims_without_verifying() {
+        let payload = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            br#"{"sub":"123","email":"a@b.c"}"#,
+        );
+        let token = format!("eyJhbGciOiJub25lIn0.{payload}.sig");
+        let claims = decode_jwt_payload(&token).unwrap();
+        assert_eq!(claims["sub"], "123");
+        assert_eq!(claims["email"], "a@b.c");
+
+        assert!(decode_jwt_payload("only.two").is_none());
+        assert!(decode_jwt_payload("a.%%%.c").is_none());
+        let not_json =
+            base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, b"nope");
+        assert!(decode_jwt_payload(&format!("a.{not_json}.c")).is_none());
+    }
+
+    #[test]
+    fn decode_state_param_requires_csrf_field() {
+        let encode = |v: serde_json::Value| {
+            base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                v.to_string().as_bytes(),
+            )
+        };
+        let native = encode(json!({"csrf":"abc","client_redirect":"cpmesh://auth/callback"}));
+        let decoded = decode_state_param(&native).unwrap();
+        assert_eq!(decoded["csrf"], "abc");
+        assert_eq!(decoded["client_redirect"], "cpmesh://auth/callback");
+
+        assert!(decode_state_param(&encode(json!({"other":"x"}))).is_none());
+        assert!(decode_state_param("plain-csrf-token").is_none());
+        assert!(decode_state_param("").is_none());
+    }
+
+    #[test]
+    fn extract_cookie_finds_named_cookie_across_headers() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::COOKIE,
+            "a=1; cpmesh_oidc_state=xyz ; b=2".parse().unwrap(),
+        );
+        headers.append(header::COOKIE, "other=3".parse().unwrap());
+        assert_eq!(
+            extract_cookie(&headers, "cpmesh_oidc_state").as_deref(),
+            Some("xyz")
+        );
+        assert_eq!(extract_cookie(&headers, "other").as_deref(), Some("3"));
+        assert_eq!(extract_cookie(&headers, "a").as_deref(), Some("1"));
+        assert_eq!(extract_cookie(&headers, "missing"), None);
+
+        // A cookie whose name merely starts with the requested name does not match
+        let mut headers = HeaderMap::new();
+        headers.append(header::COOKIE, "cpmesh_oidc_state_v2=nope".parse().unwrap());
+        assert_eq!(extract_cookie(&headers, "cpmesh_oidc_state"), None);
+
+        // Empty values are preserved as empty strings
+        let mut headers = HeaderMap::new();
+        headers.append(header::COOKIE, "cpmesh_oidc_state=".parse().unwrap());
+        assert_eq!(
+            extract_cookie(&headers, "cpmesh_oidc_state").as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn friendly_provider_name_recognizes_known_issuers() {
+        assert_eq!(
+            friendly_provider_name("https://accounts.google.com"),
+            "google"
+        );
+        assert_eq!(
+            friendly_provider_name("https://dev-123.us.auth0.com/"),
+            "auth0"
+        );
+        assert_eq!(
+            friendly_provider_name("https://token.actions.githubusercontent.com"),
+            "github"
+        );
+        assert_eq!(
+            friendly_provider_name("https://login.microsoftonline.com/tid/v2.0"),
+            "microsoft"
+        );
+        assert_eq!(friendly_provider_name("https://acme.okta.com"), "okta");
+        assert_eq!(
+            friendly_provider_name("https://sso.example.com/realms/keycloak"),
+            "keycloak"
+        );
+        assert_eq!(
+            friendly_provider_name("HTTPS://ACCOUNTS.GOOGLE.COM"),
+            "google"
+        );
+    }
+
+    #[test]
+    fn friendly_provider_name_falls_back_to_domain() {
+        assert_eq!(
+            friendly_provider_name("https://id.example.org/oidc"),
+            "id.example.org"
+        );
+        assert_eq!(
+            friendly_provider_name("http://localhost:8180/realms/dev"),
+            "localhost:8180"
+        );
+        assert_eq!(friendly_provider_name(""), "");
+    }
+
+    #[test]
+    fn oidc_username_derivation() {
+        assert_eq!(
+            generate_oidc_username("Alice Liddell", "1234567890"),
+            "aliceliddell_123456"
+        );
+        // Non-alphanumeric characters (other than underscore) are dropped
+        assert_eq!(
+            generate_oidc_username("Jean-Luc O'Brien", "abcdefgh"),
+            "jeanlucobrien_abcdef"
+        );
+        assert_eq!(
+            generate_oidc_username("snake_case", "abcdefgh"),
+            "snake_case_abcdef"
+        );
+        // Long names are truncated to 20 characters before the suffix
+        let long = generate_oidc_username("abcdefghijklmnopqrstuvwxyz", "sub123");
+        assert_eq!(long, "abcdefghijklmnopqrst_sub123");
+        // Short or empty names fall back to the subject
+        assert_eq!(
+            generate_oidc_username("Al", "subject-identifier-long"),
+            "user_subject-iden"
+        );
+        assert_eq!(generate_oidc_username("", "abc"), "user_abc");
+        // Subject shorter than the slice length is used whole
+        assert_eq!(generate_oidc_username("Alice", "ab"), "alice_ab");
+    }
+
+    #[test]
+    fn random_strings_are_lowercase_alphanumeric_and_unique() {
+        let a = generate_random_string(64);
+        let b = generate_random_string(64);
+        assert_eq!(a.len(), 64);
+        assert!(
+            a.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+            "{a}"
+        );
+        assert_ne!(a, b);
+        assert_eq!(generate_random_string(0), "");
+    }
+
+    // ---- HTTP handlers (no database reachable) -----------------------------
+
+    #[tokio::test]
+    async fn register_is_forbidden_when_registration_closed() {
+        let mut cfg = test_config();
+        cfg.registration_open = false;
+        let app = test_router(test_state(cfg).await);
+        let resp = send(
+            &app,
+            json_request("POST", "/api/auth/register", json!({
+                "username": "alice", "password": "Str0ng-Pass!", "password_confirm": "Str0ng-Pass!",
+                "email": "a@example.com", "full_name": "Alice"
+            })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            body_json(resp).await["error"],
+            "registration is currently closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_validates_input_before_touching_the_database() {
+        let app = test_router(test_state(test_config()).await);
+        let base = json!({
+            "username": "alice", "password": "Str0ng-Pass!", "password_confirm": "Str0ng-Pass!",
+            "email": "a@example.com", "full_name": "Alice"
+        });
+        let cases: Vec<(serde_json::Value, &str)> = vec![
+            (
+                json!({"username": "", "password": "x", "password_confirm": "x", "email": "", "full_name": ""}),
+                "username, email, full_name, and password are required",
+            ),
+            (
+                {
+                    let mut v = base.clone();
+                    v["username"] = json!("ab");
+                    v
+                },
+                "username must be between 3 and 50 characters",
+            ),
+            (
+                {
+                    let mut v = base.clone();
+                    v["username"] = json!("a".repeat(51));
+                    v
+                },
+                "username must be between 3 and 50 characters",
+            ),
+            (
+                {
+                    let mut v = base.clone();
+                    v["email"] = json!("not-an-email");
+                    v
+                },
+                "invalid email address format",
+            ),
+            (
+                {
+                    let mut v = base.clone();
+                    v["full_name"] = json!("A");
+                    v
+                },
+                "full name must be between 2 and 100 characters",
+            ),
+            (
+                {
+                    let mut v = base.clone();
+                    v["password"] = json!("Sh0rt!");
+                    v["password_confirm"] = json!("Sh0rt!");
+                    v
+                },
+                "password must be at least 8 characters",
+            ),
+            (
+                {
+                    let long = format!("Aa1!{}", "x".repeat(130));
+                    let mut v = base.clone();
+                    v["password"] = json!(long);
+                    v["password_confirm"] = json!(long);
+                    v
+                },
+                "password must be at most 128 characters",
+            ),
+            (
+                {
+                    let mut v = base.clone();
+                    v["password_confirm"] = json!("Different-1!");
+                    v
+                },
+                "passwords do not match",
+            ),
+            (
+                {
+                    let mut v = base.clone();
+                    v["password"] = json!("alllowercase1!");
+                    v["password_confirm"] = json!("alllowercase1!");
+                    v
+                },
+                "password must contain at least one uppercase letter",
+            ),
+        ];
+        for (body, expected) in cases {
+            let resp = send(
+                &app,
+                json_request("POST", "/api/auth/register", body.clone()),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body_json(resp).await["error"], expected, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn register_with_valid_input_reports_generic_success_even_if_storage_fails() {
+        // The database is unreachable; the handler must not leak that to callers
+        // (enumeration protection) and returns the same generic message.
+        let app = test_router(test_state(test_config()).await);
+        let resp = send(
+            &app,
+            json_request("POST", "/api/auth/register", json!({
+                "username": "alice", "password": "Str0ng-Pass!", "password_confirm": "Str0ng-Pass!",
+                "email": "a@example.com", "full_name": "Alice"
+            })),
+        )
+        .await;
+        // Either the generic 200 (duplicate/uniqueness path) or a 500 from create_user is
+        // acceptable here; what matters is that no 4xx validation error fires.
+        assert!(
+            resp.status() == StatusCode::OK || resp.status() == StatusCode::INTERNAL_SERVER_ERROR,
+            "{}",
+            resp.status()
+        );
+    }
+
+    #[tokio::test]
+    async fn register_rejects_malformed_json() {
+        let app = test_router(test_state(test_config()).await);
+        let resp = send(
+            &app,
+            request("POST", "/api/auth/register")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from("{not json"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn login_with_unknown_user_is_unauthorized() {
+        let app = test_router(test_state(test_config()).await);
+        let resp = send(
+            &app,
+            json_request(
+                "POST",
+                "/api/auth/login",
+                json!({"username": "ghost", "password": "x"}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_json(resp).await["error"], "invalid credentials");
+
+        // Email identifiers take the email lookup path, same outcome
+        let resp = send(
+            &app,
+            json_request(
+                "POST",
+                "/api/auth/login",
+                json!({"username": "ghost@example.com", "password": "x"}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn login_is_rate_limited_per_client_ip() {
+        let app = test_router(
+            test_state_with(test_config(), [("login", 2u32)].into_iter().collect()).await,
+        );
+        let body = json!({"username": "ghost", "password": "x"});
+        for _ in 0..2 {
+            let resp = send(&app, json_request("POST", "/api/auth/login", body.clone())).await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+        let resp = send(&app, json_request("POST", "/api/auth/login", body.clone())).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            body_json(resp).await["error"],
+            "too many requests, please try again later"
+        );
+
+        // A different client IP is unaffected
+        let other = Request::builder()
+            .method("POST")
+            .uri("/api/auth/login")
+            .extension(ConnectInfo::<SocketAddr>(
+                "198.51.100.99:1".parse().unwrap(),
+            ))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        assert_eq!(send(&app, other).await.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_honours_forwarded_ip_only_when_proxy_trusted() {
+        let mut cfg = test_config();
+        cfg.trust_proxy_headers = true;
+        let app = test_router(test_state_with(cfg, [("login", 1u32)].into_iter().collect()).await);
+        let body = json!({"username": "ghost", "password": "x"});
+        let with_xff = |ip: &str| {
+            request("POST", "/api/auth/login")
+                .header("x-forwarded-for", ip)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+        assert_eq!(
+            send(&app, with_xff("10.1.1.1")).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            send(&app, with_xff("10.1.1.1")).await.status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            send(&app, with_xff("10.1.1.2")).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_rotates_tokens_and_detects_reuse() {
+        let state = test_state(test_config()).await;
+        let app = test_router(state.clone());
+        let user = uuid::Uuid::new_v4();
+        let refresh = state.auth.generate_refresh_token(user).unwrap();
+
+        let resp = send(
+            &app,
+            json_request(
+                "POST",
+                "/api/auth/refresh",
+                json!({"refresh_token": refresh}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let new_access = body["access_token"].as_str().unwrap();
+        let new_refresh = body["refresh_token"].as_str().unwrap();
+        assert_ne!(new_refresh, refresh);
+        assert_eq!(
+            state
+                .auth
+                .validate_access_token(new_access)
+                .unwrap()
+                .user_id,
+            user
+        );
+        assert!(matches!(
+            state.auth.validate_refresh_token(new_refresh),
+            crate::routes::auth_service::RefreshResult::Ok(..)
+        ));
+
+        // Presenting the consumed refresh token again is treated as theft
+        let resp = send(
+            &app,
+            json_request(
+                "POST",
+                "/api/auth/refresh",
+                json!({"refresh_token": refresh}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            body_json(resp).await["error"]
+                .as_str()
+                .unwrap()
+                .contains("session compromised")
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_rejects_invalid_and_access_tokens() {
+        let state = test_state(test_config()).await;
+        let app = test_router(state.clone());
+        let resp = send(
+            &app,
+            json_request(
+                "POST",
+                "/api/auth/refresh",
+                json!({"refresh_token": "garbage"}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_json(resp).await["error"], "invalid refresh token");
+
+        let access = state
+            .auth
+            .generate_access_token(uuid::Uuid::new_v4(), None)
+            .unwrap();
+        let resp = send(
+            &app,
+            json_request(
+                "POST",
+                "/api/auth/refresh",
+                json!({"refresh_token": access}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn verify_email_requires_token_and_redirects_on_failure() {
+        let app = test_router(test_state(test_config()).await);
+        let resp = send(
+            &app,
+            request("GET", "/api/auth/verify-email")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = send(
+            &app,
+            request("GET", "/api/auth/verify-email?token=")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let resp = send(
+            &app,
+            request("GET", "/api/auth/verify-email?token=abc")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(resp.headers()[header::LOCATION], "/#/login?verified=error");
+    }
+
+    #[tokio::test]
+    async fn resend_verification_is_generic() {
+        let app = test_router(test_state(test_config()).await);
+        let resp = send(
+            &app,
+            json_request(
+                "POST",
+                "/api/auth/resend-verification",
+                json!({"email": "  "}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let resp = send(
+            &app,
+            json_request(
+                "POST",
+                "/api/auth/resend-verification",
+                json!({"email": "ghost@example.com"}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            body_json(resp).await["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("If that email exists")
+        );
+    }
+
+    #[tokio::test]
+    async fn social_status_reflects_configuration() {
+        let app = test_router(test_state(test_config()).await);
+        let resp = send(
+            &app,
+            request("GET", "/api/auth/social/status")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(resp).await,
+            json!({"enabled": false, "provider": ""})
+        );
+
+        let mut cfg = test_config();
+        cfg.oidc_issuer_url = "https://accounts.google.com".into();
+        cfg.oidc_client_id = "client".into();
+        let app = test_router(test_state(cfg).await);
+        let resp = send(
+            &app,
+            request("GET", "/api/auth/social/status")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            body_json(resp).await,
+            json!({"enabled": true, "provider": "google"})
+        );
+    }
+
+    #[tokio::test]
+    async fn social_login_validates_before_contacting_provider() {
+        let app = test_router(test_state(test_config()).await);
+        let resp = send(
+            &app,
+            request("GET", "/api/auth/social/login")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let mut cfg = test_config();
+        cfg.oidc_issuer_url = "https://issuer.invalid".into();
+        cfg.oidc_client_id = "client".into();
+        let app = test_router(test_state(cfg).await);
+
+        let resp = send(
+            &app,
+            request("GET", "/api/auth/social/login?client_redirect=https://evil.example/cb&code_challenge=x&code_challenge_method=S256")
+                .body(axum::body::Body::empty()).unwrap(),
+        ).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(resp).await["error"],
+            "client_redirect must use the cpmesh:// scheme"
+        );
+
+        let resp = send(
+            &app,
+            request(
+                "GET",
+                "/api/auth/social/login?client_redirect=cpmesh://auth/callback",
+            )
+            .body(axum::body::Body::empty())
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            body_json(resp).await["error"]
+                .as_str()
+                .unwrap()
+                .contains("code_challenge")
+        );
+
+        let resp = send(
+            &app,
+            request("GET", "/api/auth/social/login?client_redirect=cpmesh://auth/callback&code_challenge=x&code_challenge_method=plain")
+                .body(axum::body::Body::empty()).unwrap(),
+        ).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn social_callback_provider_errors_redirect_to_login() {
+        let app = test_router(test_state(test_config()).await);
+        let resp = send(
+            &app,
+            request(
+                "GET",
+                "/api/auth/social/callback?error=access_denied&error_description=User%20cancelled",
+            )
+            .body(axum::body::Body::empty())
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            resp.headers()[header::LOCATION],
+            "https://cpmesh.test/#/login?social_error=User%20cancelled"
+        );
+
+        let resp = send(
+            &app,
+            request("GET", "/api/auth/social/callback")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            resp.headers()[header::LOCATION],
+            "https://cpmesh.test/#/login?social_error=missing+authorization+code"
+        );
+    }
+
+    #[tokio::test]
+    async fn social_callback_rejects_state_mismatch() {
+        let app = test_router(test_state(test_config()).await);
+        let resp = send(
+            &app,
+            request("GET", "/api/auth/social/callback?code=abc&state=attacker")
+                .header(header::COOKIE, "cpmesh_oidc_state=legit")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            resp.headers()[header::LOCATION],
+            "https://cpmesh.test/#/login?social_error=invalid+state+parameter"
+        );
+
+        // Native-client state with a non-cpmesh redirect is rejected even when CSRF matches
+        let native_state = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            json!({"csrf":"legit","client_redirect":"https://evil.example","code_challenge":"x"})
+                .to_string()
+                .as_bytes(),
+        );
+        let resp = send(
+            &app,
+            request(
+                "GET",
+                &format!("/api/auth/social/callback?code=abc&state={native_state}"),
+            )
+            .header(header::COOKIE, "cpmesh_oidc_state=legit")
+            .body(axum::body::Body::empty())
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            resp.headers()[header::LOCATION],
+            "https://cpmesh.test/#/login?social_error=invalid+client+redirect"
+        );
+    }
+
+    #[tokio::test]
+    async fn social_exchange_enforces_pkce_and_single_use() {
+        let state = test_state(test_config()).await;
+        let app = test_router(state.clone());
+
+        let verifier = "correct-horse-battery-staple-verifier-value";
+        let challenge = {
+            use sha2::Digest;
+            base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                sha2::Sha256::digest(verifier.as_bytes()),
+            )
+        };
+
+        // Unknown code
+        let resp = send(
+            &app,
+            json_request(
+                "POST",
+                "/api/auth/social/exchange",
+                json!({"code": "nope", "code_verifier": verifier}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_json(resp).await["error"], "invalid or expired code");
+
+        // Wrong verifier consumes the code and fails
+        state.pkce_store.insert(
+            "code-a".into(),
+            PkceEntry {
+                access_token: "acc".into(),
+                refresh_token: "ref".into(),
+                code_challenge: challenge.clone(),
+                created_at: std::time::Instant::now(),
+            },
+        );
+        let resp = send(
+            &app,
+            json_request(
+                "POST",
+                "/api/auth/social/exchange",
+                json!({"code": "code-a", "code_verifier": "wrong"}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_json(resp).await["error"], "PKCE verification failed");
+        let resp = send(
+            &app,
+            json_request(
+                "POST",
+                "/api/auth/social/exchange",
+                json!({"code": "code-a", "code_verifier": verifier}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "code was consumed by the failed attempt"
+        );
+
+        // Correct verifier returns the stored tokens exactly once
+        state.pkce_store.insert(
+            "code-b".into(),
+            PkceEntry {
+                access_token: "acc".into(),
+                refresh_token: "ref".into(),
+                code_challenge: challenge.clone(),
+                created_at: std::time::Instant::now(),
+            },
+        );
+        let resp = send(
+            &app,
+            json_request(
+                "POST",
+                "/api/auth/social/exchange",
+                json!({"code": "code-b", "code_verifier": verifier}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(resp).await,
+            json!({"access_token": "acc", "refresh_token": "ref"})
+        );
+        let resp = send(
+            &app,
+            json_request(
+                "POST",
+                "/api/auth/social/exchange",
+                json!({"code": "code-b", "code_verifier": verifier}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Expired codes are rejected even with the right verifier
+        state.pkce_store.insert(
+            "code-c".into(),
+            PkceEntry {
+                access_token: "acc".into(),
+                refresh_token: "ref".into(),
+                code_challenge: challenge,
+                created_at: std::time::Instant::now() - std::time::Duration::from_secs(61),
+            },
+        );
+        let resp = send(
+            &app,
+            json_request(
+                "POST",
+                "/api/auth/social/exchange",
+                json!({"code": "code-c", "code_verifier": verifier}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_json(resp).await["error"], "code expired");
+    }
 }

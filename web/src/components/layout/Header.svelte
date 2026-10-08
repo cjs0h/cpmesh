@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { location } from 'svelte-spa-router';
+  import { router } from 'svelte-spa-router';
   import { userState, resetUserState } from '../../lib/stores/user.svelte';
   import { disconnectWS } from '../../lib/ws';
   import Icon from '../Icon.svelte';
@@ -23,7 +23,7 @@
     '/admin/stats': 'Stats',
   };
 
-  let pageTitle = $derived(pageTitles[$location] || 'Dashboard');
+  let pageTitle = $derived(pageTitles[router.location] || 'Dashboard');
   let displayName = $derived(userState.fullName || userState.username || '??');
   let initials = $derived(
     userState.fullName

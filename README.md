@@ -84,7 +84,7 @@ The server listens on port `8080` inside the container. The default Docker Compo
 The server can also be built and run directly:
 
 ```bash
-# Requires Rust 1.75+ and a running PostgreSQL instance
+# Requires Rust 1.94+ and a running PostgreSQL instance
 cp .env.example .env
 ./scripts/generate-dev-jwt.sh
 # Fill the required values in .env, then:
@@ -97,7 +97,7 @@ cargo build --release -p cpmesh-server
 Download the latest release from the [Releases page](https://github.com/cjs0h/cpmesh/releases) or build from source:
 
 ```bash
-# Requires Rust, Node.js 18+, and Tauri CLI
+# Requires Rust 1.94+, Node.js 22.17+ (24 LTS recommended), and Tauri CLI
 cd desktop-tauri
 npm install
 npx tauri build
@@ -113,8 +113,22 @@ Open the desktop app, enter your server URL and the admin credentials from your 
 |-----------|----------|------|-------------|
 | Server | `crates/cpmesh-server/` | Rust, Axum, SQLx, PostgreSQL | REST API, WebSocket relay, and web dashboard host |
 | Shared Proto | `crates/cpmesh-proto/` | Rust | Shared WebSocket message types and API request/response types |
-| Desktop App | `desktop-tauri/` | Rust, Tauri v2, SvelteKit | Desktop client with tray integration and local device state |
-| Web Dashboard | `web/` | Svelte 5, TypeScript, Vite | Admin UI, device management, clipboard history, and marketing pages |
+| Desktop App | `desktop-tauri/` | Rust, Tauri v2, SvelteKit 3 | Desktop client with tray integration and local device state |
+| Web Dashboard | `web/` | Svelte 5, TypeScript, Vite 8 | Admin UI, device management, clipboard history, and marketing pages |
+
+## Testing
+
+Every component ships with an automated test suite; see [CONTRIBUTING.md](CONTRIBUTING.md#testing) for details.
+
+```bash
+cargo test --workspace                       # server + shared proto (unit, router and wire-format tests)
+cd desktop-tauri/src-tauri && cargo test     # desktop crypto, history, config and protocol tests
+cd web && npm test                           # web dashboard (Vitest)
+cd desktop-tauri && npm test                 # desktop frontend (Vitest)
+```
+
+The PostgreSQL-backed integration tests in `crates/cpmesh-server/tests/db.rs` run only when
+`TEST_DATABASE_URL` points at a database you can create schemas in; otherwise they are skipped.
 
 ## Configuration
 

@@ -45,28 +45,11 @@ impl ApiClient {
 
     // === Auth ===
 
-    pub async fn register(
-        &self,
-        username: &str,
-        email: &str,
-        full_name: &str,
-        password: &str,
-        password_confirm: &str,
-        country: Option<&str>,
-        mobile: Option<&str>,
-    ) -> Result<(), ApiError> {
+    pub async fn register(&self, req: &RegisterRequest) -> Result<(), ApiError> {
         let resp = self
             .client
             .post(format!("{}/api/auth/register", self.base_url))
-            .json(&RegisterRequest {
-                username: username.to_string(),
-                password: password.to_string(),
-                password_confirm: password_confirm.to_string(),
-                email: email.to_string(),
-                full_name: full_name.to_string(),
-                country: country.map(|s| s.to_string()),
-                mobile: mobile.map(|s| s.to_string()),
-            })
+            .json(req)
             .send()
             .await?;
 
@@ -146,7 +129,10 @@ impl ApiClient {
 
     pub async fn delete_device(&self, device_id: &str) -> Result<(), ApiError> {
         let resp = self
-            .authed_request(reqwest::Method::DELETE, &format!("/api/devices/{device_id}"))
+            .authed_request(
+                reqwest::Method::DELETE,
+                &format!("/api/devices/{device_id}"),
+            )
             .send()
             .await?;
 
@@ -173,11 +159,7 @@ impl ApiClient {
     }
 
     pub async fn store_group_keys(&self, keys: &[StoreGroupKeyEntry]) -> Result<(), ApiError> {
-        let resp = self
-            .authed_post("/api/group-key")
-            .json(keys)
-            .send()
-            .await?;
+        let resp = self.authed_post("/api/group-key").json(keys).send().await?;
 
         if resp.status() == StatusCode::OK {
             Ok(())
@@ -196,7 +178,10 @@ impl ApiClient {
         self.authed_get_json("/api/device-approvals/pending").await
     }
 
-    pub async fn begin_approval(&self, pending_device_id: &str) -> Result<ApprovalSessionResponse, ApiError> {
+    pub async fn begin_approval(
+        &self,
+        pending_device_id: &str,
+    ) -> Result<ApprovalSessionResponse, ApiError> {
         let resp = self
             .authed_post(&format!("/api/device-approvals/{pending_device_id}/begin"))
             .send()
@@ -214,7 +199,9 @@ impl ApiClient {
         req: &ApproveDeviceRequest,
     ) -> Result<serde_json::Value, ApiError> {
         let resp = self
-            .authed_post(&format!("/api/device-approvals/{pending_device_id}/approve"))
+            .authed_post(&format!(
+                "/api/device-approvals/{pending_device_id}/approve"
+            ))
             .json(req)
             .send()
             .await?;
@@ -243,7 +230,10 @@ impl ApiClient {
     // === Versioned Group Keys ===
 
     #[allow(dead_code)]
-    pub async fn get_current_group_keys(&self, since_version: Option<i32>) -> Result<GroupKeysResponse, ApiError> {
+    pub async fn get_current_group_keys(
+        &self,
+        since_version: Option<i32>,
+    ) -> Result<GroupKeysResponse, ApiError> {
         let path = match since_version {
             Some(v) => format!("/api/group-keys/current?since_version={v}"),
             None => "/api/group-keys/current".to_string(),
@@ -251,13 +241,19 @@ impl ApiClient {
         let resp = self.authed_get(&path).send().await?;
         match resp.status() {
             StatusCode::OK => Ok(resp.json().await?),
-            StatusCode::NOT_FOUND => Err(ApiError::Server { status: 404, message: "no group keys".to_string() }),
+            StatusCode::NOT_FOUND => Err(ApiError::Server {
+                status: 404,
+                message: "no group keys".to_string(),
+            }),
             _ => Err(read_error(resp).await),
         }
     }
 
     #[allow(dead_code)]
-    pub async fn rotate_group_key(&self, req: &RotateGroupKeyRequest) -> Result<serde_json::Value, ApiError> {
+    pub async fn rotate_group_key(
+        &self,
+        req: &RotateGroupKeyRequest,
+    ) -> Result<serde_json::Value, ApiError> {
         let resp = self
             .authed_post("/api/group-keys/rotate")
             .json(req)
@@ -294,11 +290,7 @@ impl ApiClient {
 
     // === Account ===
 
-    pub async fn change_password(
-        &self,
-        current: &str,
-        new_password: &str,
-    ) -> Result<(), ApiError> {
+    pub async fn change_password(&self, current: &str, new_password: &str) -> Result<(), ApiError> {
         let resp = self
             .authed_request(reqwest::Method::PUT, "/api/me/password")
             .json(&ChangePasswordRequest {
@@ -321,7 +313,12 @@ impl ApiClient {
 
     // === Updates ===
 
-    pub async fn check_update(&self, platform: &str, arch: &str, current_version: &str) -> Result<UpdateCheckResponse, ApiError> {
+    pub async fn check_update(
+        &self,
+        platform: &str,
+        arch: &str,
+        current_version: &str,
+    ) -> Result<UpdateCheckResponse, ApiError> {
         let resp = self
             .client
             .get(format!(
@@ -374,18 +371,120 @@ impl ApiClient {
 async fn read_error(resp: reqwest::Response) -> ApiError {
     let status = resp.status().as_u16();
     let body = resp.text().await.unwrap_or_default();
+    parse_error_body(status, &body)
+}
 
-    if let Ok(err_obj) = serde_json::from_str::<serde_json::Value>(&body) {
-        if let Some(msg) = err_obj.get("error").and_then(|v| v.as_str()) {
-            return ApiError::Server {
-                status,
-                message: msg.to_string(),
-            };
-        }
+/// Builds an [`ApiError::Server`] from a response body, preferring the server's
+/// `{"error": "..."}` message and falling back to the raw body.
+fn parse_error_body(status: u16, body: &str) -> ApiError {
+    if let Ok(err_obj) = serde_json::from_str::<serde_json::Value>(body)
+        && let Some(msg) = err_obj.get("error").and_then(|v| v.as_str())
+    {
+        return ApiError::Server {
+            status,
+            message: msg.to_string(),
+        };
     }
 
     ApiError::Server {
         status,
-        message: body,
+        message: body.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_strips_trailing_slashes_from_base_url() {
+        assert_eq!(
+            ApiClient::new("https://cpmesh.example/").base_url,
+            "https://cpmesh.example"
+        );
+        assert_eq!(
+            ApiClient::new("https://cpmesh.example///").base_url,
+            "https://cpmesh.example"
+        );
+        assert_eq!(
+            ApiClient::new("http://localhost:8080").base_url,
+            "http://localhost:8080"
+        );
+    }
+
+    #[test]
+    fn tokens_start_empty_and_can_be_set() {
+        let mut client = ApiClient::new("https://cpmesh.example");
+        assert_eq!(client.access_token(), None);
+        assert_eq!(client.refresh_token(), None);
+        client.set_tokens("acc".into(), "ref".into());
+        assert_eq!(client.access_token(), Some("acc"));
+        assert_eq!(client.refresh_token(), Some("ref"));
+    }
+
+    #[test]
+    fn authed_request_adds_bearer_header_only_when_token_present() {
+        let mut client = ApiClient::new("https://cpmesh.example");
+        let req = client
+            .authed_request(reqwest::Method::GET, "/api/me")
+            .build()
+            .unwrap();
+        assert_eq!(req.url().as_str(), "https://cpmesh.example/api/me");
+        assert!(req.headers().get("authorization").is_none());
+
+        client.set_tokens("tok".into(), "ref".into());
+        let req = client
+            .authed_request(reqwest::Method::DELETE, "/api/devices/abc")
+            .build()
+            .unwrap();
+        assert_eq!(req.method(), reqwest::Method::DELETE);
+        assert_eq!(req.url().path(), "/api/devices/abc");
+        assert_eq!(
+            req.headers()
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer tok"
+        );
+    }
+
+    #[test]
+    fn parse_error_body_prefers_json_error_field() {
+        let err = parse_error_body(401, r#"{"error":"invalid credentials"}"#);
+        match err {
+            ApiError::Server { status, message } => {
+                assert_eq!(status, 401);
+                assert_eq!(message, "invalid credentials");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_error_body_falls_back_to_raw_body() {
+        for body in [
+            "plain text failure",
+            r#"{"message":"no error key"}"#,
+            "",
+            "{",
+        ] {
+            match parse_error_body(500, body) {
+                ApiError::Server { status, message } => {
+                    assert_eq!(status, 500);
+                    assert_eq!(message, body);
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn api_error_display_includes_status_and_message() {
+        let err = ApiError::Server {
+            status: 409,
+            message: "version conflict".into(),
+        };
+        assert_eq!(err.to_string(), "Server error (409): version conflict");
     }
 }

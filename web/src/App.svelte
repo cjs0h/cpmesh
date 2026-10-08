@@ -1,5 +1,5 @@
 <script lang="ts">
-  import Router, { push, location } from 'svelte-spa-router';
+  import Router from 'svelte-spa-router';
   import { isLoggedIn } from './lib/auth';
   import { fetchCurrentUser, userState } from './lib/stores/user.svelte';
   import { connectWS, disconnectWS } from './lib/ws';

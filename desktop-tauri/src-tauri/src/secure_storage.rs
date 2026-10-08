@@ -14,73 +14,106 @@ pub enum StoreError {
 /// Backends:
 /// - Windows: DPAPI via `keyring` crate (Credential Manager)
 /// - macOS:   Keychain via `keyring` crate
-/// - Linux:   libsecret via `keyring` crate, with file-based fallback (0600 perms)
+/// - Linux:   Secret Service via `keyring` crate, with file-based fallback (0600 perms)
 /// - Android: file-based (OS File-Based Encryption handles at-rest encryption)
 /// - iOS:     file-based (app container encryption via OS)
 pub struct SecureStore {
+    #[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
     service: String,
     config_dir: PathBuf,
+    backend: Backend,
+}
+
+/// Where secrets are persisted. Only one variant is constructed per platform in
+/// production builds; tests exercise the file backend everywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum Backend {
+    /// OS credential store first, falling back to files when it is unavailable.
+    Keyring,
+    /// Files in the config directory only.
+    File,
 }
 
 impl SecureStore {
+    /// Creates a store using the platform default backend.
     pub fn new(service: &str, config_dir: &Path) -> Self {
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let backend = Backend::File;
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let backend = Backend::Keyring;
+
+        Self::with_backend(service, config_dir, backend)
+    }
+
+    /// Creates a store that never touches the OS credential store.
+    ///
+    /// Useful for environments without a keyring daemon and for tests, which must
+    /// not read or overwrite a user's real credentials.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn file_only(service: &str, config_dir: &Path) -> Self {
+        Self::with_backend(service, config_dir, Backend::File)
+    }
+
+    fn with_backend(service: &str, config_dir: &Path, backend: Backend) -> Self {
         SecureStore {
             service: service.to_string(),
             config_dir: config_dir.to_path_buf(),
+            backend,
         }
     }
 
     /// Store a secret value.
     pub fn save(&self, key: &str, value: &str) -> Result<(), StoreError> {
-        #[cfg(any(target_os = "android", target_os = "ios"))]
-        {
-            return self.save_file(key, value);
-        }
-
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        {
-            // Try keyring first, fall back to file on failure
-            match self.save_keyring(key, value) {
-                Ok(()) => Ok(()),
-                Err(e) => {
-                    log::warn!("Keyring save failed ({e}), falling back to file storage");
-                    self.save_file(key, value)
+        match self.backend {
+            Backend::File => self.save_file(key, value),
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            Backend::Keyring => {
+                // Try keyring first, fall back to file on failure
+                match self.save_keyring(key, value) {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        log::warn!("Keyring save failed ({e}), falling back to file storage");
+                        self.save_file(key, value)
+                    }
                 }
             }
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            Backend::Keyring => self.save_file(key, value),
         }
     }
 
     /// Load a secret value. Returns None if not found.
     pub fn load(&self, key: &str) -> Result<Option<String>, StoreError> {
-        #[cfg(any(target_os = "android", target_os = "ios"))]
-        {
-            return self.load_file(key);
-        }
-
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        {
-            // Try keyring first, fall back to file
-            match self.load_keyring(key) {
-                Ok(Some(v)) => Ok(Some(v)),
-                Ok(None) => self.load_file(key), // might be in file from a previous fallback
-                Err(_) => self.load_file(key),
+        match self.backend {
+            Backend::File => self.load_file(key),
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            Backend::Keyring => {
+                // Try keyring first, fall back to file
+                match self.load_keyring(key) {
+                    Ok(Some(v)) => Ok(Some(v)),
+                    Ok(None) => self.load_file(key), // might be in file from a previous fallback
+                    Err(_) => self.load_file(key),
+                }
             }
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            Backend::Keyring => self.load_file(key),
         }
     }
 
     /// Delete a secret value.
     pub fn delete(&self, key: &str) -> Result<(), StoreError> {
-        #[cfg(any(target_os = "android", target_os = "ios"))]
-        {
-            return self.delete_file(key);
-        }
-
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        {
-            // Delete from both locations
-            let _ = self.delete_keyring(key);
-            let _ = self.delete_file(key);
-            Ok(())
+        match self.backend {
+            Backend::File => self.delete_file(key),
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            Backend::Keyring => {
+                // Delete from both locations
+                let _ = self.delete_keyring(key);
+                let _ = self.delete_file(key);
+                Ok(())
+            }
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            Backend::Keyring => self.delete_file(key),
         }
     }
 
@@ -90,7 +123,8 @@ impl SecureStore {
     fn save_keyring(&self, key: &str, value: &str) -> Result<(), StoreError> {
         let entry = keyring::Entry::new(&self.service, key)
             .map_err(|e| StoreError::Keyring(e.to_string()))?;
-        entry.set_password(value)
+        entry
+            .set_password(value)
             .map_err(|e| StoreError::Keyring(format!("save '{key}': {e}")))?;
         Ok(())
     }
@@ -152,5 +186,101 @@ impl SecureStore {
 
     fn secret_file_path(&self, key: &str) -> PathBuf {
         self.config_dir.join(format!(".secret_{key}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn store(dir: &TempDir) -> SecureStore {
+        SecureStore::file_only("cpmesh-test", dir.path())
+    }
+
+    #[test]
+    fn file_backend_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+
+        assert_eq!(store.load("access_token").unwrap(), None);
+        store.save("access_token", "tok-123").unwrap();
+        assert_eq!(
+            store.load("access_token").unwrap().as_deref(),
+            Some("tok-123")
+        );
+
+        // Overwrite
+        store.save("access_token", "tok-456").unwrap();
+        assert_eq!(
+            store.load("access_token").unwrap().as_deref(),
+            Some("tok-456")
+        );
+    }
+
+    #[test]
+    fn file_backend_uses_hidden_file_in_config_dir() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        store.save("refresh_token", "r").unwrap();
+        assert!(dir.path().join(".secret_refresh_token").is_file());
+    }
+
+    #[test]
+    fn file_backend_creates_missing_config_dir() {
+        let dir = TempDir::new().unwrap();
+        let nested = dir.path().join("does").join("not").join("exist");
+        let store = SecureStore::file_only("cpmesh-test", &nested);
+        store.save("k", "v").unwrap();
+        assert_eq!(store.load("k").unwrap().as_deref(), Some("v"));
+    }
+
+    #[test]
+    fn file_backend_delete_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        store.save("k", "v").unwrap();
+        store.delete("k").unwrap();
+        assert_eq!(store.load("k").unwrap(), None);
+        // Deleting a missing key is not an error
+        store.delete("k").unwrap();
+    }
+
+    #[test]
+    fn keys_are_isolated() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        store.save("a", "1").unwrap();
+        store.save("b", "2").unwrap();
+        assert_eq!(store.load("a").unwrap().as_deref(), Some("1"));
+        assert_eq!(store.load("b").unwrap().as_deref(), Some("2"));
+        store.delete("a").unwrap();
+        assert_eq!(store.load("a").unwrap(), None);
+        assert_eq!(store.load("b").unwrap().as_deref(), Some("2"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backend_restricts_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        store.save("k", "v").unwrap();
+        let mode = std::fs::metadata(dir.path().join(".secret_k"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn new_picks_platform_default_backend() {
+        let dir = TempDir::new().unwrap();
+        let store = SecureStore::new("cpmesh-test", dir.path());
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        assert_eq!(store.backend, Backend::File);
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        assert_eq!(store.backend, Backend::Keyring);
+        assert_eq!(store.service, "cpmesh-test");
     }
 }

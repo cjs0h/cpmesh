@@ -20,7 +20,7 @@ pub fn build_rate_limiter(per_minute: u32) -> Arc<IpRateLimiter> {
     )))
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthClaims {
     pub user_id: uuid::Uuid,
     pub device_id: Option<uuid::Uuid>,
@@ -224,4 +224,171 @@ pub fn json_error(message: &str, status: StatusCode) -> Response {
 
 pub fn json_response<T: serde::Serialize>(status: StatusCode, data: T) -> Response {
     (status, axum::Json(data)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+    use axum::routing::get;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    fn addr(ip: &str) -> SocketAddr {
+        format!("{ip}:5555").parse().unwrap()
+    }
+
+    #[test]
+    fn client_ip_ignores_forwarded_header_when_proxy_untrusted() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "10.0.0.1".parse().unwrap());
+        assert_eq!(
+            extract_client_ip(&headers, &addr("198.51.100.7"), false),
+            "198.51.100.7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn client_ip_uses_first_forwarded_entry_when_proxy_trusted() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", " 10.0.0.1 , 10.0.0.2".parse().unwrap());
+        assert_eq!(
+            extract_client_ip(&headers, &addr("198.51.100.7"), true),
+            "10.0.0.1".parse::<IpAddr>().unwrap()
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "2001:db8::1".parse().unwrap());
+        assert_eq!(
+            extract_client_ip(&headers, &addr("198.51.100.7"), true),
+            "2001:db8::1".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn client_ip_falls_back_on_missing_or_invalid_forwarded_header() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            extract_client_ip(&headers, &addr("198.51.100.7"), true),
+            "198.51.100.7".parse::<IpAddr>().unwrap()
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "not-an-ip, 10.0.0.2".parse().unwrap());
+        assert_eq!(
+            extract_client_ip(&headers, &addr("198.51.100.7"), true),
+            "198.51.100.7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn extract_token_prefers_bearer_header_then_query() {
+        let req = Request::builder()
+            .uri("/ws?ticket=abc&token=from-query")
+            .header(header::AUTHORIZATION, "Bearer from-header")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(extract_token(&req).as_deref(), Some("from-header"));
+
+        let req = Request::builder()
+            .uri("/ws?ticket=abc&token=from-query")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(extract_token(&req).as_deref(), Some("from-query"));
+    }
+
+    #[test]
+    fn extract_token_rejects_non_bearer_schemes_and_missing() {
+        let req = Request::builder()
+            .uri("/api/me")
+            .header(header::AUTHORIZATION, "Basic dXNlcjpwdw==")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(extract_token(&req), None);
+
+        let req = Request::builder()
+            .uri("/api/me?other=1")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(extract_token(&req), None);
+
+        // "Bearer" without a space is not a bearer token
+        let req = Request::builder()
+            .uri("/api/me")
+            .header(header::AUTHORIZATION, "Bearertoken")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(extract_token(&req), None);
+    }
+
+    #[test]
+    fn rate_limiter_allows_quota_then_denies_per_key() {
+        let limiter = build_rate_limiter(3);
+        let a: IpAddr = "10.0.0.1".parse().unwrap();
+        let b: IpAddr = "10.0.0.2".parse().unwrap();
+        for _ in 0..3 {
+            assert!(limiter.check_key(&a).is_ok());
+        }
+        assert!(
+            limiter.check_key(&a).is_err(),
+            "4th request within a minute is denied"
+        );
+        // Other keys have their own quota
+        assert!(limiter.check_key(&b).is_ok());
+    }
+
+    #[tokio::test]
+    async fn json_error_and_json_response_shapes() {
+        let resp = json_error("nope", StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "application/json");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"error": "nope"})
+        );
+
+        let resp = json_response(StatusCode::CREATED, serde_json::json!({"id": 1}));
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"id": 1})
+        );
+    }
+
+    #[tokio::test]
+    async fn security_headers_are_added_to_every_response() {
+        let app = axum::Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(security_headers));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let h = resp.headers();
+        assert_eq!(h["x-content-type-options"], "nosniff");
+        assert_eq!(h["x-frame-options"], "DENY");
+        assert_eq!(h["referrer-policy"], "no-referrer");
+        assert_eq!(h["x-xss-protection"], "1; mode=block");
+        assert_eq!(
+            h["strict-transport-security"],
+            "max-age=63072000; includeSubDomains"
+        );
+        assert!(
+            h["permissions-policy"]
+                .to_str()
+                .unwrap()
+                .contains("clipboard-read=(self)")
+        );
+        let csp = h["content-security-policy"].to_str().unwrap();
+        assert!(csp.contains("default-src 'self'"));
+        assert!(csp.contains("frame-ancestors 'none'"));
+        assert!(csp.contains("connect-src 'self' wss: ws:"));
+    }
 }

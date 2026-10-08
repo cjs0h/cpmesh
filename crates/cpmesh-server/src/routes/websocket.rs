@@ -8,10 +8,11 @@ use axum::{
 };
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
+use rand::Rng;
 use serde_json::json;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::sync::{Mutex, mpsc};
 use tracing::warn;
 
@@ -21,9 +22,8 @@ use crate::ws::Client;
 use cpmesh_proto::models::*;
 
 // WS ticket store (short-lived, single-use)
-lazy_static::lazy_static! {
-    static ref TICKETS: Mutex<HashMap<String, WsTicket>> = Mutex::new(HashMap::new());
-}
+static TICKETS: LazyLock<Mutex<HashMap<String, WsTicket>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 struct WsTicket {
     user_id: uuid::Uuid,
@@ -46,7 +46,7 @@ pub async fn handle_ws_ticket(
     let client_ip = extract_client_ip(&headers, &addr, state.config.trust_proxy_headers);
 
     let mut ticket_bytes = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut ticket_bytes);
+    rand::rng().fill_bytes(&mut ticket_bytes);
     let ticket: String = ticket_bytes.iter().map(|b| format!("{:02x}", b)).collect();
 
     let mut tickets = TICKETS.lock().await;

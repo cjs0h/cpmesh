@@ -10,7 +10,7 @@
 		type DeviceInfo,
 		type PendingDevice,
 		type ApprovalSession
-	} from '$lib/api';
+	} from '#lib/api.js';
 	import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
 	let devices = $state<DeviceInfo[]>([]);
@@ -228,7 +228,7 @@
 {#if approving}
 	<div class="modal-overlay" onclick={closeApprovalModal} role="presentation">
 		<!-- svelte-ignore a11y_click_events_have_key_events -->
-		<div class="modal card" onclick={(e) => e.stopPropagation()} role="dialog">
+		<div class="modal card" onclick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" tabindex="-1">
 			<h2>Approve "{approvingDeviceName}"</h2>
 
 			{#if approvalSession}

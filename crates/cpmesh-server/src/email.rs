@@ -11,24 +11,34 @@ pub struct EmailService {
 }
 
 impl EmailService {
+    /// Builds the service from process environment variables.
     pub fn from_env() -> Self {
-        let port_str = std::env::var("SMTP_PORT").unwrap_or_else(|_| "587".to_string());
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    /// Builds the service from an arbitrary variable source.
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let var = |key: &str| lookup(key).unwrap_or_default();
+
+        let port_str = lookup("SMTP_PORT").unwrap_or_else(|| "587".to_string());
         let port = port_str.parse().unwrap_or(587);
-        let tls_str = std::env::var("SMTP_TLS").unwrap_or_else(|_| "true".to_string());
+        let tls_str = lookup("SMTP_TLS").unwrap_or_else(|| "true".to_string());
         let use_tls = !matches!(tls_str.to_lowercase().as_str(), "false" | "0");
 
         EmailService {
-            host: std::env::var("SMTP_HOST").unwrap_or_default(),
+            host: var("SMTP_HOST"),
             port,
-            username: std::env::var("SMTP_USERNAME").unwrap_or_default(),
-            password: std::env::var("SMTP_PASSWORD").unwrap_or_default(),
-            from: std::env::var("SMTP_FROM").unwrap_or_default(),
+            username: var("SMTP_USERNAME"),
+            password: var("SMTP_PASSWORD"),
+            from: var("SMTP_FROM"),
             use_tls,
-            base_url: std::env::var("BASE_URL")
-                .unwrap_or_default()
-                .trim_end_matches('/')
-                .to_string(),
+            base_url: var("BASE_URL").trim_end_matches('/').to_string(),
         }
+    }
+
+    /// A service with no SMTP host configured; every send becomes a no-op.
+    pub fn disabled() -> Self {
+        Self::from_lookup(|_| None)
     }
 
     pub fn is_configured(&self) -> bool {
@@ -161,5 +171,100 @@ impl EmailService {
         mailer.send(&email).map_err(|e| format!("SMTP send: {e}"))?;
         info!("Verification email sent to {to}");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn service_from(vars: &[(&str, &str)]) -> EmailService {
+        let map: HashMap<&str, &str> = vars.iter().copied().collect();
+        EmailService::from_lookup(|k| map.get(k).map(|v| v.to_string()))
+    }
+
+    #[test]
+    fn disabled_service_is_not_configured() {
+        let svc = EmailService::disabled();
+        assert!(!svc.is_configured());
+        assert_eq!(svc.port, 587);
+        assert!(svc.use_tls);
+        assert_eq!(svc.base_url, "");
+    }
+
+    #[test]
+    fn requires_both_host_and_from_to_be_configured() {
+        assert!(!service_from(&[("SMTP_HOST", "smtp.example")]).is_configured());
+        assert!(!service_from(&[("SMTP_FROM", "noreply@example")]).is_configured());
+        assert!(
+            service_from(&[
+                ("SMTP_HOST", "smtp.example"),
+                ("SMTP_FROM", "noreply@example")
+            ])
+            .is_configured()
+        );
+    }
+
+    #[test]
+    fn parses_port_tls_and_base_url() {
+        let svc = service_from(&[
+            ("SMTP_HOST", "smtp.example"),
+            ("SMTP_PORT", "465"),
+            ("SMTP_USERNAME", "user"),
+            ("SMTP_PASSWORD", "pw"),
+            ("SMTP_FROM", "noreply@example"),
+            ("SMTP_TLS", "FALSE"),
+            ("BASE_URL", "https://cpmesh.example/"),
+        ]);
+        assert_eq!(svc.host, "smtp.example");
+        assert_eq!(svc.port, 465);
+        assert_eq!(svc.username, "user");
+        assert_eq!(svc.password, "pw");
+        assert_eq!(svc.from, "noreply@example");
+        assert!(!svc.use_tls);
+        assert_eq!(svc.base_url, "https://cpmesh.example");
+
+        assert!(!service_from(&[("SMTP_TLS", "0")]).use_tls);
+        assert!(service_from(&[("SMTP_TLS", "yes")]).use_tls);
+        assert_eq!(service_from(&[("SMTP_PORT", "not-a-port")]).port, 587);
+    }
+
+    #[test]
+    fn sending_without_configuration_is_a_silent_noop() {
+        let svc = EmailService::disabled();
+        svc.send_verification_email("a@example.com", "Alice", "tok")
+            .unwrap();
+        svc.send_duplicate_registration_notice("a@example.com", "Alice")
+            .unwrap();
+    }
+
+    #[test]
+    fn test_connection_without_configuration_is_an_error() {
+        let err = EmailService::disabled()
+            .test_connection("a@example.com")
+            .unwrap_err();
+        assert!(err.contains("not configured"), "{err}");
+    }
+
+    #[test]
+    fn invalid_addresses_fail_before_any_network_io() {
+        let svc = service_from(&[
+            ("SMTP_HOST", "smtp.invalid"),
+            ("SMTP_FROM", "definitely not an address"),
+        ]);
+        let err = svc
+            .send_verification_email("a@example.com", "Alice", "tok")
+            .unwrap_err();
+        assert!(err.starts_with("invalid from"), "{err}");
+
+        let svc = service_from(&[
+            ("SMTP_HOST", "smtp.invalid"),
+            ("SMTP_FROM", "ok@example.com"),
+        ]);
+        let err = svc
+            .send_duplicate_registration_notice("<<not valid>>", "Alice")
+            .unwrap_err();
+        assert!(err.starts_with("invalid to"), "{err}");
     }
 }

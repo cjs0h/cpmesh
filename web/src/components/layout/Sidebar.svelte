@@ -1,11 +1,11 @@
 <script lang="ts">
-  import { link, location } from 'svelte-spa-router';
+  import { link, router } from 'svelte-spa-router';
   import { userState } from '../../lib/stores/user.svelte';
   import Icon from '../Icon.svelte';
 
   function isActive(path: string): boolean {
-    if (path === '/') return $location === '/';
-    return $location.startsWith(path);
+    if (path === '/') return router.location === '/';
+    return router.location.startsWith(path);
   }
 </script>
 

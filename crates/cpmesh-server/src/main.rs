@@ -1,40 +1,15 @@
-mod config;
-mod db;
-mod email;
-mod models;
-mod pii;
-mod routes;
-mod spa;
-mod ws;
-
 use argon2::PasswordHasher;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
-use crate::config::Config;
-use crate::db::Db;
-use crate::pii::PiiService;
-use crate::routes::auth::PkceCodeStore;
-use crate::ws::Hub;
-
-pub struct RateLimiters {
-    pub login: Arc<routes::middleware::IpRateLimiter>,
-    pub register: Arc<routes::middleware::IpRateLimiter>,
-    pub refresh: Arc<routes::middleware::IpRateLimiter>,
-}
-
-pub struct AppState {
-    pub db: Db,
-    pub config: Config,
-    pub hub: Hub,
-    pub pii: Option<PiiService>,
-    pub auth: routes::auth_service::AuthService,
-    pub email: email::EmailService,
-    pub pkce_store: PkceCodeStore,
-    pub rate_limiters: RateLimiters,
-}
+use cpmesh_server::config::Config;
+use cpmesh_server::db::Db;
+use cpmesh_server::pii::PiiService;
+use cpmesh_server::routes::auth::PkceCodeStore;
+use cpmesh_server::ws::Hub;
+use cpmesh_server::{AppState, RateLimiters, email, routes, ws};
 
 #[tokio::main]
 async fn main() {
@@ -127,8 +102,7 @@ async fn main() {
                 );
                 std::process::exit(1);
             }
-            let salt = argon2::password_hash::SaltString::generate(&mut rand::rngs::OsRng);
-            match argon2::Argon2::default().hash_password(admin_password.as_bytes(), &salt) {
+            match argon2::Argon2::default().hash_password(admin_password.as_bytes()) {
                 Ok(hash) => {
                     if let Err(e) = db
                         .seed_admin(
