@@ -9,6 +9,7 @@ import {
   fetchClipboard,
   loadNextPage,
   loadPrevPage,
+  prependEntry,
 } from './clipboard.svelte';
 import { devicesState, fetchDevices, updateDeviceStatus } from './devices.svelte';
 import {
@@ -184,6 +185,29 @@ describe('clipboard store', () => {
     fetchMock().mockResolvedValueOnce(jsonResponse(404, { error: 'not found' }));
     await expect(deleteEntry('e1')).rejects.toThrow('not found');
     expect(clipboardState.entries).toHaveLength(1);
+  });
+
+  it('prepends live entries on the first page only, without duplicates', () => {
+    clipboardState.entries = [entry('e1')];
+    prependEntry(entry('e0'));
+    expect(clipboardState.entries.map((e) => e.id)).toEqual(['e0', 'e1']);
+
+    prependEntry(entry('e0'));
+    expect(clipboardState.entries).toHaveLength(2);
+
+    clipboardState.offset = 20;
+    prependEntry(entry('e-late'));
+    expect(clipboardState.entries.map((e) => e.id)).toEqual(['e0', 'e1']);
+  });
+
+  it('trims the first page to its size and flags more pages when live entries overflow', () => {
+    clipboardState.entries = Array.from({ length: 20 }, (_, i) => entry(`e${i}`));
+    expect(clipboardState.hasMore).toBe(false);
+    prependEntry(entry('fresh'));
+    expect(clipboardState.entries).toHaveLength(20);
+    expect(clipboardState.entries[0].id).toBe('fresh');
+    expect(clipboardState.entries.at(-1)?.id).toBe('e18');
+    expect(clipboardState.hasMore).toBe(true);
   });
 });
 

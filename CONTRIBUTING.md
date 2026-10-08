@@ -89,6 +89,19 @@ cd desktop-tauri && npm run check && npm test
 Tests live next to the code they cover (`*.test.ts`). Modules that use Svelte runes must be
 tested from a `*.svelte.test.ts` file so the runes are compiled.
 
+#### Web dashboard UI conventions
+
+- Design tokens live in `web/src/app.css` (`@theme`): surfaces (`bg-bg`, `bg-surface`, `bg-surface-2`),
+  text (`text-fg`, `text-muted`, `text-dim`) and brand hues (`accent`, `cyan`, `mint`, `gold`, `rose`, `violet`).
+  Prefer these over raw hex values so the landing page, auth screens and app stay visually consistent.
+- Reusable primitives are in `web/src/components/ui/` (`Button`, `Card`, `Badge`, `Field`, `Select`, `Switch`,
+  `Dialog`, `ConfirmAction`, `EmptyState`, `Alert`, `StatCard`, `Toaster`, …). Reach for these before
+  hand-writing utility strings; page files should mostly be layout and data wiring.
+- Mount-time data loading belongs in `onMount`, not `$effect`, so store reads inside the fetch
+  (for example the clipboard `offset`) do not become reactive dependencies that re-trigger the load.
+- User feedback goes through the `toast` store (`lib/stores/toast.svelte.ts`); scroll-reveal animations
+  use the `reveal` action (`lib/actions/reveal.ts`) and respect `prefers-reduced-motion` globally.
+
 ## Submitting Changes
 
 1. Make sure your code compiles without warnings (`cargo check`, `cargo clippy`)

@@ -114,7 +114,7 @@ Open the desktop app, enter your server URL and the admin credentials from your 
 | Server | `crates/cpmesh-server/` | Rust, Axum, SQLx, PostgreSQL | REST API, WebSocket relay, and web dashboard host |
 | Shared Proto | `crates/cpmesh-proto/` | Rust | Shared WebSocket message types and API request/response types |
 | Desktop App | `desktop-tauri/` | Rust, Tauri v2, SvelteKit 3 | Desktop client with tray integration and local device state |
-| Web Dashboard | `web/` | Svelte 5, TypeScript, Vite 8 | Admin UI, device management, clipboard history, and marketing pages |
+| Web Dashboard | `web/` | Svelte 5, TypeScript, Vite 8, Tailwind CSS 4 | Landing page, sign-in, device management, live clipboard history, and admin console |
 
 ## Testing
 

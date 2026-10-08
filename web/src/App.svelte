@@ -2,8 +2,13 @@
   import Router from 'svelte-spa-router';
   import { isLoggedIn } from './lib/auth';
   import { fetchCurrentUser, userState } from './lib/stores/user.svelte';
-  import { connectWS, disconnectWS } from './lib/ws';
+  import { prependEntry } from './lib/stores/clipboard.svelte';
+  import { updateDeviceStatus } from './lib/stores/devices.svelte';
+  import { markActivity } from './lib/stores/connection.svelte';
+  import { connectWS, disconnectWS, onWSMessage } from './lib/ws';
   import Layout from './components/layout/Layout.svelte';
+  import Toaster from './components/ui/Toaster.svelte';
+  import Logo from './components/Logo.svelte';
   import Home from './pages/Home.svelte';
   import Login from './pages/Login.svelte';
   import Dashboard from './pages/Dashboard.svelte';
@@ -23,6 +28,8 @@
     '/': Home,
     '/login': Login,
     '/auth/callback': AuthCallback,
+    // Deep links into the app while signed out land on the sign-in screen.
+    '*': Login,
   };
 
   const appRoutes = {
@@ -42,22 +49,38 @@
   let loggedIn = $state(isLoggedIn());
 
   $effect(() => {
-    if (loggedIn) {
-      fetchCurrentUser();
-      connectWS();
-      return () => disconnectWS();
-    }
+    if (!loggedIn) return;
+    fetchCurrentUser();
+    connectWS();
+    // Keep the shared stores live so every page reflects pushes immediately.
+    const unsub = onWSMessage((msg) => {
+      markActivity();
+      if (msg.type === 'clipboard_new' && msg.payload?.entry) prependEntry(msg.payload.entry);
+      else if (msg.type === 'device_status' && msg.payload) updateDeviceStatus(msg.payload.device_id, msg.payload.online);
+    });
+    return () => {
+      unsub();
+      disconnectWS();
+    };
   });
 </script>
 
 {#if !loggedIn}
   <Router routes={publicRoutes} />
 {:else if !userState.loaded}
-  <div class="flex items-center justify-center h-screen">
-    <div class="w-8 h-8 border-3 border-border border-t-primary rounded-full animate-[spin_0.6s_linear_infinite]"></div>
+  <div class="flex h-dvh flex-col items-center justify-center gap-5 bg-bg">
+    <div class="animate-[float-y_3s_ease-in-out_infinite]">
+      <Logo size={48} />
+    </div>
+    <div class="flex items-center gap-2 text-[13px] text-muted">
+      <span class="inline-block h-4 w-4 rounded-full border-2 border-border-strong border-t-accent animate-[spin_0.7s_linear_infinite]"></span>
+      Unlocking your workspace…
+    </div>
   </div>
 {:else}
   <Layout>
     <Router routes={appRoutes} />
   </Layout>
 {/if}
+
+<Toaster />

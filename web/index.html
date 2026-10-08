@@ -2,8 +2,19 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#070d19" />
+    <meta name="description" content="cpmesh — copy on one device, paste on another. End-to-end encrypted clipboard sync. Open source and self-hostable." />
+    <meta property="og:title" content="cpmesh — Encrypted clipboard sync across all your devices" />
+    <meta property="og:description" content="Copy anywhere. Paste everywhere. AES-256-GCM encrypted before it leaves your device." />
+    <meta property="og:type" content="website" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>cpmesh</title>
+    <style>
+      /* Paint the dark background before the stylesheet loads to avoid a white flash. */
+      html { background: #070d19; }
+    </style>
   </head>
   <body>
     <div id="app"></div>

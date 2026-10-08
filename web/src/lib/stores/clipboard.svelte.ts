@@ -52,6 +52,21 @@ export async function loadPrevPage() {
   await fetchClipboard();
 }
 
+/**
+ * Inserts an entry pushed over the WebSocket at the top of the first page.
+ * Pages other than the first are left untouched so pagination stays stable.
+ */
+export function prependEntry(entry: ClipboardEntry) {
+  if (clipboardState.offset !== 0) return;
+  if (clipboardState.entries.some((e) => e.id === entry.id)) return;
+  const next = [entry, ...clipboardState.entries];
+  if (next.length > PAGE_SIZE) {
+    next.length = PAGE_SIZE;
+    clipboardState.hasMore = true;
+  }
+  clipboardState.entries = next;
+}
+
 export async function deleteEntry(id: string) {
   await api(`/api/clipboard/${id}`, { method: 'DELETE' });
   clipboardState.entries = clipboardState.entries.filter((e) => e.id !== id);

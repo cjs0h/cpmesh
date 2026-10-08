@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import { userState } from '../../lib/stores/user.svelte';
   import {
     adminState,
@@ -10,25 +11,44 @@
     adminUploadBinary,
     type DownloadLink,
   } from '../../lib/stores/admin.svelte';
+  import { toast } from '../../lib/stores/toast.svelte';
   import { push } from 'svelte-spa-router';
+  import { formatBytes, titleCase } from '../../lib/format';
+  import Icon from '../../components/Icon.svelte';
+  import Badge from '../../components/ui/Badge.svelte';
+  import Button from '../../components/ui/Button.svelte';
+  import Card from '../../components/ui/Card.svelte';
+  import ConfirmAction from '../../components/ui/ConfirmAction.svelte';
+  import Dialog from '../../components/ui/Dialog.svelte';
+  import Field from '../../components/ui/Field.svelte';
+  import Select from '../../components/ui/Select.svelte';
+  import Switch from '../../components/ui/Switch.svelte';
+  import EmptyState from '../../components/ui/EmptyState.svelte';
+  import Alert from '../../components/ui/Alert.svelte';
+  import IconTile from '../../components/ui/IconTile.svelte';
+  import CopyButton from '../../components/ui/CopyButton.svelte';
 
+  let dialogOpen = $state(false);
   let editing = $state<DownloadLink | null>(null);
-  let creating = $state(false);
   let error = $state('');
-  let deleteConfirm = $state<string | null>(null);
+  let saving = $state(false);
   let uploading = $state(false);
-  let uploadMsg = $state('');
+  let dragging = $state(false);
 
   let formName = $state('');
   let formUrl = $state('');
   let formPlatform = $state('windows');
   let formArch = $state('amd64');
   let formFormat = $state('exe');
-  let formSortOrder = $state(0);
+  let formSortOrder = $state<number | null>(0);
   let formIsActive = $state(true);
-  let formReleaseId = $state<string>('');
+  let formReleaseId = $state('');
 
-  $effect(() => {
+  const platformIcons: Record<string, string> = { windows: 'windows', macos: 'apple', linux: 'linux', android: 'android', ios: 'smartphone' };
+  const platformLabels: Record<string, string> = { windows: 'Windows', macos: 'macOS', linux: 'Linux', android: 'Android', ios: 'iOS' };
+  const ACCEPT = '.exe,.msi,.dmg,.pkg,.deb,.rpm,.appimage,.apk,.aab,.ipa,.tar.gz,.zip';
+
+  onMount(() => {
     if (!userState.isAdmin) {
       push('/');
       return;
@@ -37,7 +57,10 @@
     fetchAdminReleases();
   });
 
-  function resetForm() {
+  const sorted = $derived([...adminState.downloads].sort((a, b) => a.platform.localeCompare(b.platform) || a.sort_order - b.sort_order));
+
+  function startCreate() {
+    editing = null;
     formName = '';
     formUrl = '';
     formPlatform = 'windows';
@@ -47,15 +70,11 @@
     formIsActive = true;
     formReleaseId = '';
     error = '';
-  }
-
-  function startCreate() {
-    resetForm();
-    creating = true;
-    editing = null;
+    dialogOpen = true;
   }
 
   function startEdit(link: DownloadLink) {
+    editing = link;
     formName = link.name;
     formUrl = link.url;
     formPlatform = link.platform;
@@ -64,216 +83,203 @@
     formSortOrder = link.sort_order;
     formIsActive = link.is_active;
     formReleaseId = link.release_id || '';
-    editing = link;
-    creating = false;
     error = '';
+    dialogOpen = true;
   }
 
-  function cancelForm() {
-    creating = false;
-    editing = null;
+  async function handleSave(e: Event) {
+    e.preventDefault();
     error = '';
-  }
-
-  async function handleSave() {
-    error = '';
+    saving = true;
     const data = {
-      name: formName,
-      url: formUrl,
+      name: formName.trim(),
+      url: formUrl.trim(),
       platform: formPlatform,
       arch: formArch,
-      format: formFormat,
-      sort_order: formSortOrder,
+      format: formFormat.trim(),
+      sort_order: Number(formSortOrder ?? 0),
       is_active: formIsActive,
       release_id: formReleaseId || null,
     };
-
     try {
       if (editing) {
         await adminUpdateDownload(editing.id, data);
+        toast.success('Download link updated');
       } else {
         await adminCreateDownload(data);
+        toast.success('Download link created', 'It is now listed on the public site.');
       }
-      cancelForm();
-    } catch (err: any) {
-      error = err.message;
-    }
-  }
-
-  async function handleUpload(e: Event) {
-    const input = e.target as HTMLInputElement;
-    const file = input.files?.[0];
-    if (!file) return;
-
-    uploading = true;
-    uploadMsg = '';
-    error = '';
-    try {
-      const result = await adminUploadBinary(file);
-      uploadMsg = `Uploaded ${result.uploaded.map(f => f.filename).join(', ')}`;
-      await fetchAdminDownloads();
+      dialogOpen = false;
     } catch (err: any) {
       error = err.message;
     } finally {
-      uploading = false;
-      input.value = '';
+      saving = false;
     }
   }
 
-  async function handleDelete(id: string) {
+  async function uploadFiles(files: FileList | File[] | null | undefined) {
+    const file = files?.[0];
+    if (!file) return;
+    uploading = true;
     try {
-      await adminDeleteDownload(id);
-      deleteConfirm = null;
+      const result = await adminUploadBinary(file);
+      const names = result.uploaded.map((f) => `${f.filename} (${formatBytes(f.size)})`).join(', ');
+      toast.success('Upload complete', names);
+      await fetchAdminDownloads();
     } catch (err: any) {
-      error = err.message;
-      deleteConfirm = null;
+      toast.error('Upload failed', err.message);
+    } finally {
+      uploading = false;
     }
+  }
+
+  function onFileInput(e: Event) {
+    const input = e.target as HTMLInputElement;
+    uploadFiles(input.files).finally(() => (input.value = ''));
+  }
+
+  function onDrop(e: DragEvent) {
+    e.preventDefault();
+    dragging = false;
+    uploadFiles(e.dataTransfer?.files);
+  }
+
+  async function handleDelete(link: DownloadLink) {
+    try {
+      await adminDeleteDownload(link.id);
+      toast.success('Download link deleted', link.name);
+    } catch (err: any) {
+      toast.error('Could not delete link', err.message);
+    }
+  }
+
+  function releaseLabel(id: string | null): string | null {
+    if (!id) return null;
+    const rel = adminState.releases.find((r) => r.id === id);
+    return rel ? `v${rel.version}` : null;
   }
 </script>
 
-<div>
-  <div class="flex items-center justify-between mb-5">
-    <h2 class="text-xl font-semibold">Download Links</h2>
-    {#if !creating && !editing}
-      <div class="flex items-center gap-2">
-        <label class="inline-flex items-center gap-1.5 px-4 py-2 border border-border rounded text-[13px] font-medium transition-all duration-150 bg-transparent text-muted hover:bg-bg-hover hover:text-text hover:border-border-hover cursor-pointer">
-          {uploading ? 'Uploading...' : 'Upload Binary'}
-          <input type="file" class="hidden" onchange={handleUpload} disabled={uploading} accept=".exe,.msi,.dmg,.pkg,.deb,.rpm,.appimage,.apk,.aab,.ipa,.tar.gz,.zip" />
-        </label>
-        <button class="inline-flex items-center gap-1.5 px-4 py-2 border-none rounded text-[13px] font-medium transition-all duration-150 bg-primary text-white hover:bg-primary-hover hover:shadow-primary" onclick={startCreate}>+ New Link</button>
-      </div>
-    {/if}
+<div class="mb-5 grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_320px]">
+  <div class="flex flex-wrap items-center gap-2 self-end">
+    <Badge tone="neutral">{adminState.downloads.length} links</Badge>
+    <Badge tone="mint">{adminState.downloads.filter((d) => d.is_active).length} active</Badge>
+    <div class="ml-auto"><Button icon="plus" size="sm" onclick={startCreate}>New link</Button></div>
   </div>
 
-  {#if error}
-    <div class="flex items-center gap-2 bg-danger-glow border border-danger/30 text-danger px-3.5 py-2.5 rounded text-[13px] mb-4">{error}</div>
-  {/if}
-  {#if uploadMsg}
-    <div class="flex items-center gap-2 bg-success-glow border border-success/30 text-success px-3.5 py-2.5 rounded text-[13px] mb-4">{uploadMsg}</div>
-  {/if}
+  <!-- Upload dropzone -->
+  <label
+    class="group relative flex cursor-pointer items-center gap-3 rounded-xl border border-dashed px-4 py-3 transition-colors {dragging
+      ? 'border-accent bg-accent/10'
+      : 'border-border-strong bg-surface hover:border-accent/50 hover:bg-surface-2'}"
+    ondragover={(e) => { e.preventDefault(); dragging = true; }}
+    ondragleave={() => (dragging = false)}
+    ondrop={onDrop}
+  >
+    <IconTile icon={uploading ? 'loader' : 'upload'} tone="accent" size={36} class={uploading ? 'animate-[spin_0.8s_linear_infinite]' : ''} />
+    <div class="min-w-0 flex-1">
+      <p class="text-[13px] font-semibold text-fg">{uploading ? 'Uploading…' : 'Upload an installer'}</p>
+      <p class="truncate text-[12px] text-dim">Drop a file here or click to browse</p>
+    </div>
+    <input type="file" class="sr-only" accept={ACCEPT} disabled={uploading} onchange={onFileInput} />
+  </label>
+</div>
 
-  {#if creating || editing}
-    <div class="bg-bg-card border border-border rounded-xl p-6 mb-5">
-      <h3 class="text-base font-semibold mb-4">{editing ? 'Edit Download Link' : 'New Download Link'}</h3>
-      <form onsubmit={(e) => { e.preventDefault(); handleSave(); }}>
-        <div class="grid grid-cols-2 gap-x-5 gap-y-3.5">
-          <label class="flex flex-col gap-1.5">
-            <span class="text-[13px] text-muted font-medium">Name *</span>
-            <input type="text" bind:value={formName} required placeholder="Windows Installer" class="py-2.5 px-3.5 border border-border rounded bg-bg-input text-text text-sm outline-none transition-all duration-150 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)]" />
-          </label>
-          <label class="flex flex-col gap-1.5 col-span-full">
-            <span class="text-[13px] text-muted font-medium">URL *</span>
-            <input type="text" bind:value={formUrl} required placeholder="/api/downloads/filename or https://..." class="py-2.5 px-3.5 border border-border rounded bg-bg-input text-text text-sm outline-none transition-all duration-150 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)]" />
-          </label>
-          <label class="flex flex-col gap-1.5">
-            <span class="text-[13px] text-muted font-medium">Platform</span>
-            <select bind:value={formPlatform} class="py-2.5 px-3.5 border border-border rounded bg-bg-input text-text text-sm outline-none transition-all duration-150 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)]">
-              <option value="windows">Windows</option>
-              <option value="macos">macOS</option>
-              <option value="linux">Linux</option>
-              <option value="android">Android</option>
-              <option value="ios">iOS</option>
-            </select>
-          </label>
-          <label class="flex flex-col gap-1.5">
-            <span class="text-[13px] text-muted font-medium">Architecture</span>
-            <select bind:value={formArch} class="py-2.5 px-3.5 border border-border rounded bg-bg-input text-text text-sm outline-none transition-all duration-150 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)]">
-              <option value="amd64">amd64</option>
-              <option value="arm64">arm64</option>
-              <option value="386">386</option>
-              <option value="">N/A</option>
-            </select>
-          </label>
-          <label class="flex flex-col gap-1.5">
-            <span class="text-[13px] text-muted font-medium">Format</span>
-            <input type="text" bind:value={formFormat} placeholder="exe, dmg, apk..." class="py-2.5 px-3.5 border border-border rounded bg-bg-input text-text text-sm outline-none transition-all duration-150 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)]" />
-          </label>
-          <label class="flex flex-col gap-1.5">
-            <span class="text-[13px] text-muted font-medium">Sort Order</span>
-            <input type="number" bind:value={formSortOrder} class="py-2.5 px-3.5 border border-border rounded bg-bg-input text-text text-sm outline-none transition-all duration-150 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)]" />
-          </label>
-          <label class="flex flex-row items-center gap-2 pt-6">
-            <input type="checkbox" bind:checked={formIsActive} class="w-4 h-4 accent-primary" />
-            <span class="text-[13px] text-muted font-medium">Active</span>
-          </label>
-          <label class="flex flex-col gap-1.5 col-span-full">
-            <span class="text-[13px] text-muted font-medium">Release</span>
-            <select bind:value={formReleaseId} class="py-2.5 px-3.5 border border-border rounded bg-bg-input text-text text-sm outline-none transition-all duration-150 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)]">
-              <option value="">None (unlinked)</option>
-              {#each adminState.releases as release}
-                <option value={release.id}>v{release.version} — {release.platform}/{release.arch}{release.is_current ? ' (current)' : ''}</option>
-              {/each}
-            </select>
-          </label>
-        </div>
-        <div class="flex gap-2.5 mt-5">
-          <button type="submit" class="inline-flex items-center gap-1.5 px-4 py-2 border-none rounded text-[13px] font-medium transition-all duration-150 bg-primary text-white hover:bg-primary-hover hover:shadow-primary">Save</button>
-          <button type="button" class="inline-flex items-center gap-1.5 px-4 py-2 border border-border rounded text-[13px] font-medium transition-all duration-150 bg-transparent text-muted hover:bg-bg-hover hover:text-text hover:border-border-hover" onclick={cancelForm}>Cancel</button>
-        </div>
-      </form>
+<Card padded={false}>
+  {#if sorted.length === 0}
+    <div class="p-5">
+      <EmptyState icon="download" title="No download links" description="Upload an installer, then create a link so it shows up in the Downloads section of the public site." compact>
+        <Button icon="plus" size="sm" onclick={startCreate}>Create a link</Button>
+      </EmptyState>
+    </div>
+  {:else}
+    <div class="overflow-x-auto">
+      <table class="tbl min-w-[880px]">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Platform</th>
+            <th>Build</th>
+            <th>URL</th>
+            <th>Release</th>
+            <th>Status</th>
+            <th class="text-right"><span class="sr-only">Actions</span></th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each sorted as link (link.id)}
+            <tr class={link.is_active ? '' : 'opacity-60'}>
+              <td>
+                <div class="flex items-center gap-3">
+                  <IconTile icon={platformIcons[link.platform] ?? 'download'} tone="cyan" size={32} />
+                  <span class="font-medium text-fg">{link.name}</span>
+                </div>
+              </td>
+              <td class="text-muted">{platformLabels[link.platform] ?? titleCase(link.platform)}</td>
+              <td>
+                <span class="flex items-center gap-1.5">
+                  {#if link.format}<Badge tone="neutral" uppercase>{link.format}</Badge>{/if}
+                  {#if link.arch}<span class="font-mono text-[12px] text-dim">{link.arch}</span>{/if}
+                </span>
+              </td>
+              <td>
+                <span class="inline-flex max-w-[260px] items-center gap-1">
+                  <a href={link.url} target="_blank" rel="noopener" class="truncate font-mono text-[12px] text-accent hover:underline" title={link.url}>{link.url}</a>
+                  <CopyButton text={link.url} label="Copy URL" size={12} />
+                </span>
+              </td>
+              <td>
+                {#if releaseLabel(link.release_id)}<Badge tone="violet">{releaseLabel(link.release_id)}</Badge>{:else}<span class="text-dim">—</span>{/if}
+              </td>
+              <td>
+                {#if link.is_active}<Badge tone="mint" dot>Active</Badge>{:else}<Badge tone="neutral">Hidden</Badge>{/if}
+              </td>
+              <td class="text-right">
+                <span class="inline-flex items-center gap-1">
+                  <Button variant="ghost" size="icon-sm" icon="edit" aria-label="Edit link" onclick={() => startEdit(link)} />
+                  <ConfirmAction size="icon-sm" variant="ghost" label="Delete link" confirmLabel="Delete" prompt="Delete?" onconfirm={() => handleDelete(link)} />
+                </span>
+              </td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
     </div>
   {/if}
+</Card>
 
-  <div class="bg-bg-card border border-border rounded-xl overflow-hidden">
-    <table class="w-full border-collapse">
-      <thead>
-        <tr>
-          <th class="text-left px-[18px] py-[13px] text-[11px] uppercase tracking-[0.06em] text-dim border-b border-border font-semibold">Name</th>
-          <th class="text-left px-[18px] py-[13px] text-[11px] uppercase tracking-[0.06em] text-dim border-b border-border font-semibold">Platform</th>
-          <th class="text-left px-[18px] py-[13px] text-[11px] uppercase tracking-[0.06em] text-dim border-b border-border font-semibold">Arch</th>
-          <th class="text-left px-[18px] py-[13px] text-[11px] uppercase tracking-[0.06em] text-dim border-b border-border font-semibold">Format</th>
-          <th class="text-left px-[18px] py-[13px] text-[11px] uppercase tracking-[0.06em] text-dim border-b border-border font-semibold">URL</th>
-          <th class="text-left px-[18px] py-[13px] text-[11px] uppercase tracking-[0.06em] text-dim border-b border-border font-semibold">Release</th>
-          <th class="text-left px-[18px] py-[13px] text-[11px] uppercase tracking-[0.06em] text-dim border-b border-border font-semibold">Active</th>
-          <th class="text-left px-[18px] py-[13px] text-[11px] uppercase tracking-[0.06em] text-dim border-b border-border font-semibold"></th>
-        </tr>
-      </thead>
-      <tbody>
-        {#each adminState.downloads as link}
-          <tr class="transition-colors duration-150 hover:bg-bg-hover">
-            <td class="px-[18px] py-[13px] text-sm border-b border-border font-semibold">{link.name}</td>
-            <td class="px-[18px] py-[13px] text-sm border-b border-border">{link.platform}</td>
-            <td class="px-[18px] py-[13px] text-sm border-b border-border">{link.arch || '—'}</td>
-            <td class="px-[18px] py-[13px] text-sm border-b border-border">{link.format || '—'}</td>
-            <td class="px-[18px] py-[13px] text-[13px] border-b border-border"><a href={link.url} target="_blank" rel="noopener" class="text-primary no-underline hover:underline">{link.url.length > 50 ? link.url.slice(0, 50) + '...' : link.url}</a></td>
-            <td class="px-[18px] py-[13px] text-sm border-b border-border">
-              {#if link.release_id}
-                {@const rel = adminState.releases.find(r => r.id === link.release_id)}
-                {#if rel}
-                  <span class="text-[12px]">v{rel.version}</span>
-                {:else}
-                  <span class="text-muted text-[12px]">—</span>
-                {/if}
-              {:else}
-                <span class="text-muted text-[12px]">—</span>
-              {/if}
-            </td>
-            <td class="px-[18px] py-[13px] text-sm border-b border-border">
-              {#if link.is_active}
-                <span class="inline-block px-2.5 py-[3px] rounded-full bg-success-glow text-success text-[11px] font-semibold border border-success/20">Active</span>
-              {:else}
-                <span class="inline-block px-2.5 py-[3px] rounded-full bg-bg-input text-muted text-[11px] font-semibold border border-border">Inactive</span>
-              {/if}
-            </td>
-            <td class="px-[18px] py-[13px] text-sm border-b border-border">
-              <div class="flex items-center gap-2">
-                <button class="border border-border rounded text-[13px] font-medium py-1.5 px-3 transition-all duration-150 bg-transparent text-muted hover:bg-bg-hover hover:text-text hover:border-border-hover" onclick={() => startEdit(link)}>Edit</button>
-                {#if deleteConfirm === link.id}
-                  <div class="flex items-center gap-2">
-                    <span class="text-[13px] text-warning font-medium">Delete?</span>
-                    <button class="border-none rounded text-[13px] font-medium py-1.5 px-3 transition-all duration-150 bg-danger text-white hover:bg-danger-hover" onclick={() => handleDelete(link.id)}>Yes</button>
-                    <button class="border border-border rounded text-[13px] font-medium py-1.5 px-3 transition-all duration-150 bg-transparent text-muted hover:bg-bg-hover hover:text-text hover:border-border-hover" onclick={() => (deleteConfirm = null)}>No</button>
-                  </div>
-                {:else}
-                  <button class="border border-border rounded text-[13px] font-medium py-1.5 px-3 transition-all duration-150 bg-transparent text-muted hover:bg-bg-hover hover:text-text hover:border-border-hover" onclick={() => (deleteConfirm = link.id)}>Delete</button>
-                {/if}
-              </div>
-            </td>
-          </tr>
-        {:else}
-          <tr><td colspan="8" class="text-muted text-center p-6">No download links yet.</td></tr>
-        {/each}
-      </tbody>
-    </table>
-  </div>
-</div>
+<Dialog bind:open={dialogOpen} title={editing ? 'Edit download link' : 'New download link'} description="Links marked active appear in the public Downloads section." size="lg">
+  <form id="download-form" class="grid grid-cols-1 gap-4 sm:grid-cols-2" onsubmit={handleSave}>
+    {#if error}<div class="sm:col-span-2"><Alert tone="danger">{error}</Alert></div>{/if}
+    <Field label="Name" bind:value={formName} required placeholder="Windows installer" />
+    <Field label="Sort order" type="number" bind:value={formSortOrder} hint="Lower numbers show first within a platform" />
+    <Field label="URL" bind:value={formUrl} required placeholder="/api/downloads/cpmesh-setup.exe or https://…" icon="link" class="sm:col-span-2" />
+    <Select label="Platform" bind:value={formPlatform}>
+      <option value="windows">Windows</option>
+      <option value="macos">macOS</option>
+      <option value="linux">Linux</option>
+      <option value="android">Android</option>
+      <option value="ios">iOS</option>
+    </Select>
+    <Select label="Architecture" bind:value={formArch}>
+      <option value="amd64">amd64</option>
+      <option value="arm64">arm64</option>
+      <option value="386">386</option>
+      <option value="">Universal / N/A</option>
+    </Select>
+    <Field label="Format" bind:value={formFormat} placeholder="exe, dmg, apk…" />
+    <Select label="Linked release" bind:value={formReleaseId} hint="Optional — ties this link to an auto-update release">
+      <option value="">None</option>
+      {#each adminState.releases as release (release.id)}
+        <option value={release.id}>v{release.version} — {release.platform}/{release.arch || 'any'}{release.is_current ? ' (current)' : ''}</option>
+      {/each}
+    </Select>
+    <div class="sm:col-span-2">
+      <Switch bind:checked={formIsActive} label="Active" description="Show this link on the public downloads page." />
+    </div>
+  </form>
+  {#snippet footer()}
+    <Button variant="ghost" onclick={() => (dialogOpen = false)}>Cancel</Button>
+    <Button type="submit" form="download-form" loading={saving}>{editing ? 'Save changes' : 'Create link'}</Button>
+  {/snippet}
+</Dialog>

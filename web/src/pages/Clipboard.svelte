@@ -1,84 +1,167 @@
 <script lang="ts">
-  import {
-    clipboardState,
-    fetchClipboard,
-    loadNextPage,
-    loadPrevPage,
-    deleteEntry,
-    clearAll,
-  } from '../lib/stores/clipboard.svelte';
+  import { onMount } from 'svelte';
+  import { clipboardState, fetchClipboard, loadNextPage, loadPrevPage, deleteEntry, clearAll } from '../lib/stores/clipboard.svelte';
+  import { connectionState } from '../lib/stores/connection.svelte';
+  import { toast } from '../lib/stores/toast.svelte';
+  import { createClock } from '../lib/clock.svelte';
+  import { absoluteTime, base64Size, contentTypeMeta, formatBytes, relativeTime, truncateMiddle } from '../lib/format';
   import Icon from '../components/Icon.svelte';
+  import Badge from '../components/ui/Badge.svelte';
+  import Button from '../components/ui/Button.svelte';
+  import Card from '../components/ui/Card.svelte';
+  import ConfirmAction from '../components/ui/ConfirmAction.svelte';
+  import EmptyState from '../components/ui/EmptyState.svelte';
+  import IconTile from '../components/ui/IconTile.svelte';
+  import Skeleton from '../components/ui/Skeleton.svelte';
+  import CopyButton from '../components/ui/CopyButton.svelte';
 
-  let showClearConfirm = $state(false);
+  const clock = createClock();
+  let filter = $state<string>('all');
+  let query = $state('');
 
-  $effect(() => {
+  onMount(() => {
     fetchClipboard(true);
   });
 
+  const types = $derived.by(() => {
+    const counts = new Map<string, number>();
+    for (const e of clipboardState.entries) {
+      const key = contentTypeMeta(e.content_type).label;
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    return [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  });
+
+  const visible = $derived(
+    clipboardState.entries.filter((e) => {
+      if (filter !== 'all' && contentTypeMeta(e.content_type).label !== filter) return false;
+      if (query.trim()) {
+        const q = query.trim().toLowerCase();
+        return (e.device_name || '').toLowerCase().includes(q) || e.content_type.toLowerCase().includes(q) || e.id.toLowerCase().includes(q);
+      }
+      return true;
+    })
+  );
+
+  const page = $derived(Math.floor(clipboardState.offset / 20) + 1);
+  const totalBytes = $derived(clipboardState.entries.reduce((sum, e) => sum + base64Size(e.encrypted_data), 0));
+
   async function handleDelete(id: string) {
-    await deleteEntry(id);
+    try {
+      await deleteEntry(id);
+      toast.success('Entry deleted');
+    } catch (err: any) {
+      toast.error('Could not delete entry', err.message);
+    }
   }
 
   async function handleClearAll() {
-    await clearAll();
-    showClearConfirm = false;
+    try {
+      await clearAll();
+      toast.success('Clipboard history cleared');
+    } catch (err: any) {
+      toast.error('Could not clear history', err.message);
+    }
   }
 </script>
 
-<div>
-  <div class="flex items-center justify-between mb-5 flex-wrap gap-3">
-    <h2 class="text-xl font-semibold">Clipboard History</h2>
-    {#if clipboardState.entries.length > 0}
-      {#if showClearConfirm}
-        <div class="flex items-center gap-2">
-          <span class="text-[13px] text-warning font-medium">Clear all entries?</span>
-          <button class="inline-flex items-center gap-1.5 px-4 py-2 border border-danger rounded bg-danger text-white text-[13px] font-medium transition-all duration-150 hover:bg-danger-hover" onclick={handleClearAll}>Yes, clear</button>
-          <button class="inline-flex items-center gap-1.5 px-4 py-2 border border-border rounded bg-transparent text-muted text-[13px] font-medium transition-all duration-150 hover:bg-bg-hover hover:text-text hover:border-border-hover" onclick={() => (showClearConfirm = false)}>Cancel</button>
-        </div>
-      {:else}
-        <button class="inline-flex items-center gap-1.5 px-4 py-2 bg-transparent text-danger border border-danger/30 rounded text-[13px] font-medium transition-all duration-150 hover:bg-danger-glow hover:border-danger" onclick={() => (showClearConfirm = true)}>
-          <Icon name="trash" size={14} /> Clear All
-        </button>
-      {/if}
-    {/if}
+<!-- Toolbar -->
+<div class="mb-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+  <div class="flex flex-wrap items-center gap-2">
+    <button
+      type="button"
+      class="rounded-full border px-3 py-1.5 text-[12.5px] font-medium transition-colors {filter === 'all' ? 'border-accent/40 bg-accent/12 text-accent' : 'border-border text-muted hover:border-border-strong hover:text-fg'}"
+      onclick={() => (filter = 'all')}
+    >
+      All <span class="ml-1 text-dim">{clipboardState.entries.length}</span>
+    </button>
+    {#each types as [label, count] (label)}
+      <button
+        type="button"
+        class="rounded-full border px-3 py-1.5 text-[12.5px] font-medium transition-colors {filter === label ? 'border-accent/40 bg-accent/12 text-accent' : 'border-border text-muted hover:border-border-strong hover:text-fg'}"
+        onclick={() => (filter = filter === label ? 'all' : label)}
+      >
+        {label} <span class="ml-1 text-dim">{count}</span>
+      </button>
+    {/each}
   </div>
 
-  {#if clipboardState.loading}
-    <div class="flex items-center gap-2.5 p-6 text-muted text-sm">
-      <span class="inline-block w-4 h-4 border-2 border-border border-t-primary rounded-full animate-[spin_0.6s_linear_infinite]"></span>
-      <span>Loading...</span>
+  <div class="flex items-center gap-2">
+    <div class="relative">
+      <span class="pointer-events-none absolute inset-y-0 left-3 flex items-center text-dim"><Icon name="search" size={14} /></span>
+      <input
+        type="search"
+        bind:value={query}
+        placeholder="Filter by device…"
+        class="h-9 w-full rounded-md border border-border bg-surface-2 pl-9 pr-3 text-[13px] text-fg outline-none transition-[border-color,box-shadow] placeholder:text-dim hover:border-border-strong focus:border-accent focus:shadow-[0_0_0_3px_rgba(255,122,89,0.18)] sm:w-56"
+      />
+    </div>
+    {#if clipboardState.entries.length > 0}
+      <ConfirmAction label="Clear all" confirmLabel="Yes, clear everything" prompt="Delete all entries?" variant="danger-soft" onconfirm={handleClearAll} />
+    {/if}
+  </div>
+</div>
+
+<Card padded={false}>
+  {#if clipboardState.loading && clipboardState.entries.length === 0}
+    <div class="flex flex-col gap-3 p-5">
+      {#each Array(6) as _, i (i)}
+        <div class="flex items-center gap-3">
+          <Skeleton class="h-9 w-9" rounded="rounded-lg" />
+          <div class="flex-1"><Skeleton class="mb-2 h-3 w-1/4" /><Skeleton class="h-3 w-1/6" /></div>
+          <Skeleton class="h-3 w-16" />
+          <Skeleton class="h-3 w-12" />
+        </div>
+      {/each}
     </div>
   {:else if clipboardState.entries.length === 0}
-    <div class="text-center py-15 px-4 bg-bg-card border border-border rounded-xl">
-      <div class="text-dim mb-4"><Icon name="clipboard" size={32} /></div>
-      <p class="mb-1 font-medium">No clipboard entries yet.</p>
-      <p class="text-muted text-[13px]">Entries will appear here when you copy content on a connected device.</p>
+    <div class="p-5">
+      <EmptyState icon="clipboard" title="Your history is empty" description="Copy text, an image or a file on any paired device. It is encrypted on-device and appears here within a second.">
+        <Button variant="outline" size="sm" icon="monitor" href="#/devices">Pair a device</Button>
+      </EmptyState>
+    </div>
+  {:else if visible.length === 0}
+    <div class="p-5">
+      <EmptyState icon="filter" title="No matching entries" description="Try a different type filter or clear the device search." compact>
+        <Button variant="ghost" size="sm" onclick={() => { filter = 'all'; query = ''; }}>Reset filters</Button>
+      </EmptyState>
     </div>
   {:else}
-    <div class="bg-bg-card border border-border rounded-xl overflow-hidden">
-      <table class="w-full border-collapse">
+    <div class="overflow-x-auto">
+      <table class="tbl min-w-[720px]">
         <thead>
           <tr>
-            <th class="text-left px-[18px] py-[13px] text-[11px] uppercase tracking-[0.06em] text-dim border-b border-border font-semibold">Type</th>
-            <th class="text-left px-[18px] py-[13px] text-[11px] uppercase tracking-[0.06em] text-dim border-b border-border font-semibold">Device</th>
-            <th class="text-left px-[18px] py-[13px] text-[11px] uppercase tracking-[0.06em] text-dim border-b border-border font-semibold">Size</th>
-            <th class="text-left px-[18px] py-[13px] text-[11px] uppercase tracking-[0.06em] text-dim border-b border-border font-semibold">Time</th>
-            <th class="text-left px-[18px] py-[13px] text-[11px] uppercase tracking-[0.06em] text-dim border-b border-border font-semibold"></th>
+            <th>Type</th>
+            <th>Device</th>
+            <th>Size</th>
+            <th>Entry ID</th>
+            <th>When</th>
+            <th class="text-right"><span class="sr-only">Actions</span></th>
           </tr>
         </thead>
         <tbody>
-          {#each clipboardState.entries as entry}
-            <tr class="transition-colors duration-150 hover:bg-bg-hover">
-              <td class="px-[18px] py-[13px] text-sm border-b border-border last:border-b-0">
-                <span class="inline-block px-2.5 py-[3px] rounded-full bg-primary-glow text-[11px] font-semibold uppercase tracking-[0.04em] text-primary border border-primary/15">{entry.content_type}</span>
+          {#each visible as entry (entry.id)}
+            {@const meta = contentTypeMeta(entry.content_type)}
+            <tr class="animate-[fade-up_0.3s_var(--ease-out-expo)]">
+              <td>
+                <div class="flex items-center gap-3">
+                  <IconTile icon={meta.icon} tone={meta.tone} size={32} />
+                  <span class="font-medium text-fg">{meta.label}</span>
+                </div>
               </td>
-              <td class="px-[18px] py-[13px] text-sm border-b border-border font-medium">{entry.device_name || 'Unknown'}</td>
-              <td class="px-[18px] py-[13px] text-[13px] border-b border-border text-muted">{entry.encrypted_data ? Math.ceil(entry.encrypted_data.length * 0.75) + ' B' : '-'}</td>
-              <td class="px-[18px] py-[13px] text-[13px] border-b border-border text-muted">{new Date(entry.created_at).toLocaleString()}</td>
-              <td class="px-[18px] py-[13px] text-sm border-b border-border">
-                <button class="bg-transparent border-none text-dim p-1.5 rounded transition-all duration-150 flex items-center hover:text-danger hover:bg-danger-glow" title="Delete" onclick={() => handleDelete(entry.id)}>
-                  <Icon name="trash" size={14} />
-                </button>
+              <td class="text-muted">{entry.device_name || 'Unknown device'}</td>
+              <td class="font-mono text-[12.5px] text-muted">{formatBytes(base64Size(entry.encrypted_data))}</td>
+              <td>
+                <span class="inline-flex items-center gap-1">
+                  <span class="mono-chip">{truncateMiddle(entry.id, 5)}</span>
+                  <CopyButton text={entry.id} label="Copy entry ID" size={12} />
+                </span>
+              </td>
+              <td class="text-muted">
+                <time datetime={entry.created_at} title={absoluteTime(entry.created_at)}>{relativeTime(entry.created_at, clock.now)}</time>
+              </td>
+              <td class="text-right">
+                <ConfirmAction size="icon-sm" variant="ghost" label="Delete entry" confirmLabel="Delete" prompt="Delete?" onconfirm={() => handleDelete(entry.id)} />
               </td>
             </tr>
           {/each}
@@ -86,14 +169,21 @@
       </table>
     </div>
 
-    <div class="flex items-center justify-center gap-4 mt-4">
-      <button class="inline-flex items-center gap-1.5 px-4 py-2 border border-border rounded bg-transparent text-muted text-[13px] font-medium transition-all duration-150 hover:not-disabled:bg-bg-hover hover:not-disabled:text-text hover:not-disabled:border-border-hover disabled:opacity-35 disabled:cursor-default" disabled={clipboardState.offset === 0} onclick={loadPrevPage}>
-        <Icon name="arrow-left" size={14} /> Previous
-      </button>
-      <span class="text-[13px] text-muted font-medium">Page {Math.floor(clipboardState.offset / 20) + 1}</span>
-      <button class="inline-flex items-center gap-1.5 px-4 py-2 border border-border rounded bg-transparent text-muted text-[13px] font-medium transition-all duration-150 hover:not-disabled:bg-bg-hover hover:not-disabled:text-text hover:not-disabled:border-border-hover disabled:opacity-35 disabled:cursor-default" disabled={!clipboardState.hasMore} onclick={loadNextPage}>
-        Next <Icon name="chevron-right" size={14} />
-      </button>
+    <!-- Footer -->
+    <div class="flex flex-col gap-3 border-t border-border px-5 py-3 sm:flex-row sm:items-center sm:justify-between">
+      <div class="flex items-center gap-3 text-[12.5px] text-dim">
+        <span>{visible.length} of {clipboardState.entries.length} on this page</span>
+        <span aria-hidden="true">·</span>
+        <span class="font-mono">{formatBytes(totalBytes)} ciphertext</span>
+        {#if connectionState.status === 'online' && clipboardState.offset === 0}
+          <Badge tone="mint" dot live>Live</Badge>
+        {/if}
+      </div>
+      <div class="flex items-center gap-2">
+        <Button variant="outline" size="sm" icon="chevron-left" disabled={clipboardState.offset === 0 || clipboardState.loading} onclick={loadPrevPage}>Newer</Button>
+        <span class="px-1 font-mono text-[12px] text-muted">Page {page}</span>
+        <Button variant="outline" size="sm" iconRight="chevron-right" disabled={!clipboardState.hasMore || clipboardState.loading} onclick={loadNextPage}>Older</Button>
+      </div>
     </div>
   {/if}
-</div>
+</Card>

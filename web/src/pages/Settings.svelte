@@ -1,14 +1,18 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { userState } from '../lib/stores/user.svelte';
+  import { devicesState, fetchDevices } from '../lib/stores/devices.svelte';
+  import { toast } from '../lib/stores/toast.svelte';
   import { api } from '../lib/api';
+  import { titleCase, truncateMiddle } from '../lib/format';
   import Icon from '../components/Icon.svelte';
-
-  let currentPassword = $state('');
-  let newPassword = $state('');
-  let message = $state('');
-  let error = $state('');
-  let loading = $state(false);
+  import Avatar from '../components/ui/Avatar.svelte';
+  import Badge from '../components/ui/Badge.svelte';
+  import Button from '../components/ui/Button.svelte';
+  import Card from '../components/ui/Card.svelte';
+  import Field from '../components/ui/Field.svelte';
+  import CopyButton from '../components/ui/CopyButton.svelte';
+  import Alert from '../components/ui/Alert.svelte';
 
   interface SubscriptionInfo {
     plan_id: string | null;
@@ -22,31 +26,63 @@
     allowed_file_types: string[];
   }
 
-  let subscription: SubscriptionInfo | null = $state(null);
+  let currentPassword = $state('');
+  let newPassword = $state('');
+  let confirmPassword = $state('');
+  let error = $state('');
+  let loading = $state(false);
+  let subscription = $state<SubscriptionInfo | null>(null);
 
   onMount(async () => {
+    fetchDevices();
     try {
       subscription = await api<SubscriptionInfo>('/api/me/subscription');
-    } catch { /* ignore */ }
+    } catch {
+      /* subscription is optional */
+    }
   });
+
+  const displayName = $derived(userState.fullName || userState.username);
+  const isLocal = $derived(userState.authProvider === 'local');
+  const deviceUsage = $derived.by(() => {
+    const max = subscription?.max_devices ?? null;
+    const used = devicesState.list.length;
+    return { used, max, pct: max ? Math.min(100, Math.round((used / max) * 100)) : 0 };
+  });
+
+  const strength = $derived.by(() => {
+    const p = newPassword;
+    if (!p) return { score: 0, label: '', tone: 'bg-border-strong' };
+    let score = 0;
+    if (p.length >= 8) score++;
+    if (p.length >= 12) score++;
+    if (/[A-Z]/.test(p) && /[a-z]/.test(p)) score++;
+    if (/\d/.test(p)) score++;
+    if (/[^A-Za-z0-9]/.test(p)) score++;
+    const labels = ['Weak', 'Weak', 'Fair', 'Good', 'Strong', 'Excellent'];
+    const tones = ['bg-rose', 'bg-rose', 'bg-gold', 'bg-cyan', 'bg-mint', 'bg-mint'];
+    return { score, label: labels[score], tone: tones[score] };
+  });
+
+  const mismatch = $derived(confirmPassword.length > 0 && newPassword !== confirmPassword);
 
   async function handleChangePassword(e: Event) {
     e.preventDefault();
     error = '';
-    message = '';
+    if (newPassword !== confirmPassword) {
+      error = 'The new passwords do not match.';
+      return;
+    }
     loading = true;
-
     try {
       await api('/api/me/password', {
         method: 'PUT',
-        body: JSON.stringify({
-          current_password: currentPassword,
-          new_password: newPassword,
-        }),
+        body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
       });
-      message = 'Password changed successfully.';
+      toast.success('Password updated', 'Use your new password the next time you sign in.');
       currentPassword = '';
       newPassword = '';
+      confirmPassword = '';
     } catch (err: any) {
       error = err.message;
     } finally {
@@ -54,121 +90,141 @@
     }
   }
 
-  function formatBillingPeriod(period: string): string {
-    if (period === 'monthly') return 'Monthly';
-    if (period === 'yearly') return 'Yearly';
-    if (period === 'lifetime') return 'Lifetime';
-    return period;
+  function formatBilling(period: string | null): string {
+    if (!period) return '';
+    return period === 'lifetime' ? 'one-time' : `per ${period.replace('ly', '')}`;
   }
 </script>
 
-<div>
-  <div class="bg-bg-card border border-border rounded-xl p-6 mb-5 transition-colors duration-200 hover:border-border-hover">
-    <div class="flex items-center gap-3 mb-5 pb-4 border-b border-border">
-      <div class="w-9 h-9 rounded flex items-center justify-center shrink-0 bg-[var(--accent-glow)] border border-[color-mix(in_srgb,var(--accent)_20%,transparent)] text-[var(--accent)]" style="--accent: var(--color-primary); --accent-glow: var(--color-primary-glow);">
-        <Icon name="users" size={18} />
+<div class="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)]">
+  <div class="flex flex-col gap-6">
+    <!-- Profile -->
+    <Card title="Profile" description="How you appear across your devices" icon="user" accent="accent">
+      <div class="flex flex-col gap-5 sm:flex-row sm:items-center">
+        <Avatar name={displayName} src={userState.avatarUrl} size={72} />
+        <div class="min-w-0 flex-1">
+          <div class="flex flex-wrap items-center gap-2">
+            <h3 class="font-display text-xl font-semibold tracking-tight text-fg">{displayName}</h3>
+            {#if userState.isAdmin}<Badge tone="cyan" uppercase>admin</Badge>{/if}
+            {#if userState.emailVerified}
+              <Badge tone="mint" icon="check">Verified</Badge>
+            {:else if userState.email}
+              <Badge tone="gold" icon="alert-circle">Email unverified</Badge>
+            {/if}
+          </div>
+          <p class="mt-1 text-sm text-muted">@{userState.username}{userState.email ? ` · ${userState.email}` : ''}</p>
+          <p class="mt-2 inline-flex items-center gap-1.5 text-[12px] text-dim">
+            <Icon name={isLocal ? 'key' : 'globe'} size={12} />
+            Signs in with {isLocal ? 'a password' : titleCase(userState.authProvider)}
+          </p>
+        </div>
       </div>
-      <h3 class="text-base font-semibold tracking-[-0.01em]">Account</h3>
-    </div>
-    <div class="flex items-center justify-between py-[11px] border-b border-border text-sm last-of-type:border-b-0">
-      <span class="text-muted font-medium text-[13px]">Username</span>
-      <span class="font-medium">{userState.username}</span>
-    </div>
-    <div class="flex items-center justify-between py-[11px] border-b border-border text-sm last-of-type:border-b-0">
-      <span class="text-muted font-medium text-[13px]">User ID</span>
-      <span class="font-mono text-[11px] text-dim px-2 py-[3px] bg-bg-input rounded-sm border border-border">{userState.id}</span>
-    </div>
-    <div class="flex items-center justify-between py-[11px] border-b border-border text-sm last-of-type:border-b-0">
-      <span class="text-muted font-medium text-[13px]">Role</span>
-      <span class="font-medium">
-        {#if userState.isAdmin}
-          <span class="text-xs px-2.5 py-[3px] rounded-full bg-primary-glow text-primary font-semibold border border-primary/20">Admin</span>
-        {:else}
-          <span class="text-xs px-2.5 py-[3px] rounded-full bg-bg-input text-muted font-semibold border border-border">User</span>
-        {/if}
-      </span>
-    </div>
+
+      <dl class="mt-6 grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <div class="rounded-lg border border-border bg-surface-2/60 px-4 py-3">
+          <dt class="text-[11px] uppercase tracking-[0.1em] text-dim">User ID</dt>
+          <dd class="mt-1 flex items-center justify-between gap-2">
+            <code class="truncate font-mono text-[12.5px] text-muted" title={userState.id}>{truncateMiddle(userState.id, 10)}</code>
+            <CopyButton text={userState.id} label="Copy user ID" />
+          </dd>
+        </div>
+        <div class="rounded-lg border border-border bg-surface-2/60 px-4 py-3">
+          <dt class="text-[11px] uppercase tracking-[0.1em] text-dim">Role</dt>
+          <dd class="mt-1 text-sm font-medium text-fg">{userState.isAdmin ? 'Administrator' : 'Member'}</dd>
+        </div>
+      </dl>
+    </Card>
+
+    <!-- Security -->
+    <Card title="Password" description={isLocal ? 'Choose something long and unique' : 'Managed by your identity provider'} icon="lock" accent="mint">
+      {#if !isLocal}
+        <Alert tone="info">
+          Your account signs in through <strong class="text-fg">{titleCase(userState.authProvider)}</strong>. Change your password there — it is not stored on this relay.
+        </Alert>
+      {:else}
+        <form onsubmit={handleChangePassword} class="flex max-w-md flex-col gap-4">
+          {#if error}
+            <Alert tone="danger" dismissible ondismiss={() => (error = '')}>{error}</Alert>
+          {/if}
+          <Field label="Current password" type="password" icon="lock" bind:value={currentPassword} required autocomplete="current-password" />
+          <div class="flex flex-col gap-2">
+            <Field label="New password" type="password" icon="key" bind:value={newPassword} required minlength={8} maxlength={128} autocomplete="new-password" />
+            {#if newPassword}
+              <div class="flex items-center gap-3 px-0.5">
+                <div class="flex flex-1 gap-1" aria-hidden="true">
+                  {#each Array(5) as _, i (i)}
+                    <span class="h-1.5 flex-1 rounded-full transition-colors duration-300 {i < strength.score ? strength.tone : 'bg-border'}"></span>
+                  {/each}
+                </div>
+                <span class="w-16 text-right text-[11.5px] font-medium text-muted">{strength.label}</span>
+              </div>
+            {/if}
+          </div>
+          <Field label="Confirm new password" type="password" icon="check" bind:value={confirmPassword} required autocomplete="new-password" error={mismatch ? 'Passwords do not match' : undefined} />
+          <div>
+            <Button type="submit" variant="mint" {loading} disabled={mismatch || !currentPassword || !newPassword}>Update password</Button>
+          </div>
+        </form>
+      {/if}
+    </Card>
   </div>
 
-  {#if subscription}
-    <div class="bg-bg-card border border-border rounded-xl p-6 mb-5 transition-colors duration-200 hover:border-border-hover">
-      <div class="flex items-center gap-3 mb-5 pb-4 border-b border-border">
-        <div class="w-9 h-9 rounded flex items-center justify-center shrink-0 bg-[var(--accent-glow)] border border-[color-mix(in_srgb,var(--accent)_20%,transparent)] text-[var(--accent)]" style="--accent: var(--color-warning); --accent-glow: var(--color-warning-glow);">
-          <Icon name="star" size={18} />
-        </div>
-        <h3 class="text-base font-semibold tracking-[-0.01em]">Subscription</h3>
-      </div>
-      {#if subscription.plan_name}
-        <div class="flex items-center justify-between py-[11px] border-b border-border text-sm last-of-type:border-b-0">
-          <span class="text-muted font-medium text-[13px]">Plan</span>
-          <span class="px-3 py-[3px] rounded-full bg-primary-glow text-primary text-xs font-semibold border border-primary/20">{subscription.plan_name}</span>
-        </div>
-        {#if subscription.plan_description}
-          <div class="flex items-center justify-between py-[11px] border-b border-border text-sm last-of-type:border-b-0">
-            <span class="text-muted font-medium text-[13px]">Description</span>
-            <span class="font-medium">{subscription.plan_description}</span>
+  <div class="flex flex-col gap-6">
+    <!-- Plan -->
+    <Card title="Plan" description={subscription?.plan_name ? 'Your current subscription' : 'No plan assigned'} icon="star" accent="gold">
+      {#if subscription?.plan_name}
+        <div class="flex items-start justify-between gap-3">
+          <div>
+            <p class="font-display text-xl font-semibold tracking-tight text-fg">{subscription.plan_name}</p>
+            {#if subscription.plan_description}<p class="mt-0.5 text-[13px] text-muted">{subscription.plan_description}</p>{/if}
           </div>
-        {/if}
-        <div class="flex items-center justify-between py-[11px] border-b border-border text-sm last-of-type:border-b-0">
-          <span class="text-muted font-medium text-[13px]">Price</span>
-          <span class="font-medium">
-            {subscription.price === 0 ? 'Free' : `${subscription.currency} ${subscription.price?.toFixed(2)}`}
-            {#if subscription.price && subscription.price > 0}
-              <span class="text-muted text-[13px]">/ {subscription.billing_period ? formatBillingPeriod(subscription.billing_period) : ''}</span>
-            {/if}
-          </span>
+          <div class="text-right">
+            <p class="font-display text-xl font-semibold text-fg">
+              {subscription.price === 0 || subscription.price == null ? 'Free' : `${subscription.currency ?? ''} ${subscription.price.toFixed(2)}`}
+            </p>
+            {#if subscription.price && subscription.price > 0}<p class="text-[11.5px] text-dim">{formatBilling(subscription.billing_period)}</p>{/if}
+          </div>
         </div>
-        <div class="flex items-center justify-between py-[11px] border-b border-border text-sm last-of-type:border-b-0">
-          <span class="text-muted font-medium text-[13px]">Max Devices</span>
-          <span class="font-medium">{subscription.max_devices ?? '—'}</span>
-        </div>
-        <div class="flex items-center justify-between py-[11px] border-b border-border text-sm last-of-type:border-b-0">
-          <span class="text-muted font-medium text-[13px]">Clipboard History Limit</span>
-          <span class="font-medium">{subscription.max_clipboard_history ?? '—'}</span>
-        </div>
-        <div class="flex items-center justify-between py-[11px] border-b border-border text-sm last-of-type:border-b-0">
-          <span class="text-muted font-medium text-[13px]">Allowed File Types</span>
-          <span class="font-medium">{subscription.allowed_file_types.length > 0 ? subscription.allowed_file_types.join(', ') : 'All'}</span>
+
+        <div class="mt-5 flex flex-col gap-4">
+          <div>
+            <div class="mb-1.5 flex items-center justify-between text-[12.5px]">
+              <span class="text-muted">Devices</span>
+              <span class="font-mono text-fg">{deviceUsage.used}<span class="text-dim"> / {deviceUsage.max ?? '∞'}</span></span>
+            </div>
+            <div class="h-2 overflow-hidden rounded-full bg-surface-3">
+              <div class="h-full rounded-full bg-[linear-gradient(90deg,#49c6e5,#2ad6a0)] transition-[width] duration-700 ease-[var(--ease-out-expo)]" style="width: {deviceUsage.max ? deviceUsage.pct : 12}%;"></div>
+            </div>
+          </div>
+          <dl class="grid grid-cols-2 gap-3 text-[13px]">
+            <div class="rounded-lg border border-border bg-surface-2/60 px-3 py-2.5">
+              <dt class="text-[11px] uppercase tracking-[0.1em] text-dim">History limit</dt>
+              <dd class="mt-0.5 font-medium text-fg">{subscription.max_clipboard_history ?? 'Unlimited'}</dd>
+            </div>
+            <div class="rounded-lg border border-border bg-surface-2/60 px-3 py-2.5">
+              <dt class="text-[11px] uppercase tracking-[0.1em] text-dim">File types</dt>
+              <dd class="mt-0.5 truncate font-medium text-fg" title={subscription.allowed_file_types.join(', ')}>
+                {subscription.allowed_file_types.length > 0 ? subscription.allowed_file_types.join(', ') : 'All'}
+              </dd>
+            </div>
+          </dl>
         </div>
       {:else}
-        <p class="py-3 text-sm text-muted">No subscription plan assigned. Contact the administrator for access.</p>
+        <p class="text-sm leading-relaxed text-muted">No subscription plan is assigned to your account yet. Ask the relay administrator to assign one if you hit device or history limits.</p>
       {/if}
-    </div>
-  {/if}
+    </Card>
 
-  <div class="bg-bg-card border border-border rounded-xl p-6 mb-5 transition-colors duration-200 hover:border-border-hover">
-    <div class="flex items-center gap-3 mb-5 pb-4 border-b border-border">
-      <div class="w-9 h-9 rounded flex items-center justify-center shrink-0 bg-[var(--accent-glow)] border border-[color-mix(in_srgb,var(--accent)_20%,transparent)] text-[var(--accent)]" style="--accent: var(--color-success); --accent-glow: var(--color-success-glow);">
-        <Icon name="key" size={18} />
+    <!-- Encryption facts -->
+    <div class="ring-card rounded-xl p-5" style="--ring-from: rgba(255,122,89,0.5); --ring-to: rgba(73,198,229,0.3);">
+      <div class="flex items-start gap-3">
+        <span class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-accent/25 bg-accent/12 text-accent"><Icon name="shield-check" size={17} /></span>
+        <div>
+          <p class="text-[15px] font-semibold tracking-tight text-fg">Your keys never leave your devices</p>
+          <p class="mt-1 text-[13px] leading-relaxed text-muted">
+            Passwords only protect this dashboard. Clipboard content is sealed on-device with AES-256-GCM and pairing keys exchanged over ECDH — resetting a password never exposes a clip.
+          </p>
+        </div>
       </div>
-      <h3 class="text-base font-semibold tracking-[-0.01em]">Change Password</h3>
     </div>
-
-    {#if message}
-      <div class="flex items-center gap-2 bg-success-glow border border-success/30 text-success px-3.5 py-2.5 rounded text-[13px] mb-4"><Icon name="check" size={14} /> {message}</div>
-    {/if}
-    {#if error}
-      <div class="flex items-center gap-2 bg-danger-glow border border-danger/30 text-danger px-3.5 py-2.5 rounded text-[13px] mb-4"><Icon name="x" size={14} /> {error}</div>
-    {/if}
-
-    <form onsubmit={handleChangePassword}>
-      <label class="flex flex-col gap-1.5 mb-4">
-        <span class="text-[13px] text-muted font-medium">Current Password</span>
-        <input type="password" bind:value={currentPassword} required autocomplete="current-password"
-          class="py-[11px] px-3.5 border border-border rounded bg-bg-input text-text text-sm outline-none max-w-[360px] transition-all duration-150 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)]" />
-      </label>
-      <label class="flex flex-col gap-1.5 mb-4">
-        <span class="text-[13px] text-muted font-medium">New Password</span>
-        <input type="password" bind:value={newPassword} required minlength="8" autocomplete="new-password"
-          class="py-[11px] px-3.5 border border-border rounded bg-bg-input text-text text-sm outline-none max-w-[360px] transition-all duration-150 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)]" />
-      </label>
-      <button type="submit" class="inline-flex items-center gap-2 py-2.5 px-5 border-none rounded bg-primary text-white text-sm font-semibold transition-all duration-200 hover:not-disabled:bg-primary-hover hover:not-disabled:shadow-primary disabled:opacity-60" disabled={loading}>
-        {#if loading}
-          <span class="inline-block w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-[spin_0.6s_linear_infinite]"></span>
-        {:else}
-          Change Password
-        {/if}
-      </button>
-    </form>
   </div>
 </div>

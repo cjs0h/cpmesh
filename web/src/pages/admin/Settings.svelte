@@ -1,43 +1,42 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import { userState } from '../../lib/stores/user.svelte';
-  import {
-    adminTestSmtp,
-    adminTestOidc,
-  } from '../../lib/stores/admin.svelte';
+  import { adminTestSmtp, adminTestOidc } from '../../lib/stores/admin.svelte';
+  import { toast } from '../../lib/stores/toast.svelte';
   import { push } from 'svelte-spa-router';
+  import Icon from '../../components/Icon.svelte';
+  import Button from '../../components/ui/Button.svelte';
+  import Card from '../../components/ui/Card.svelte';
+  import Field from '../../components/ui/Field.svelte';
+  import Badge from '../../components/ui/Badge.svelte';
+
+  type Result = { ok: boolean; message: string; at: number } | null;
 
   let testing = $state<string | null>(null);
-  let message = $state('');
-  let messageType = $state<'success' | 'error'>('success');
   let smtpTestEmail = $state('');
+  let smtpResult = $state<Result>(null);
+  let oidcResult = $state<Result>(null);
 
-  $effect(() => {
-    if (!userState.isAdmin) {
-      push('/');
-    }
+  onMount(() => {
+    if (!userState.isAdmin) push('/');
   });
 
-  function showMessage(msg: string, type: 'success' | 'error' = 'success') {
-    message = msg;
-    messageType = type;
-    setTimeout(() => (message = ''), 4000);
-  }
-
-  async function testSmtp() {
-    if (!smtpTestEmail) {
-      showMessage('Enter a recipient email address to send a test email.', 'error');
-      return;
-    }
+  async function testSmtp(e: Event) {
+    e.preventDefault();
+    if (!smtpTestEmail) return;
     testing = 'smtp';
     try {
       const result = await adminTestSmtp(smtpTestEmail);
       if (result.error) {
-        showMessage(`SMTP test failed: ${result.error}`, 'error');
+        smtpResult = { ok: false, message: result.error, at: Date.now() };
+        toast.error('SMTP test failed', result.error);
       } else {
-        showMessage(result.message || 'Test email sent successfully.');
+        smtpResult = { ok: true, message: result.message || `Test email sent to ${smtpTestEmail}.`, at: Date.now() };
+        toast.success('SMTP works', smtpResult.message);
       }
-    } catch (e: any) {
-      showMessage(`SMTP test failed: ${e.message}`, 'error');
+    } catch (err: any) {
+      smtpResult = { ok: false, message: err.message, at: Date.now() };
+      toast.error('SMTP test failed', err.message);
     } finally {
       testing = null;
     }
@@ -48,46 +47,69 @@
     try {
       const result = await adminTestOidc();
       if (result.error) {
-        showMessage(`OIDC test failed: ${result.error}`, 'error');
+        oidcResult = { ok: false, message: result.error, at: Date.now() };
+        toast.error('OIDC test failed', result.error);
       } else {
-        showMessage(`OIDC OK: issuer=${result.issuer}`);
+        oidcResult = { ok: true, message: `Discovery OK · issuer ${result.issuer}`, at: Date.now() };
+        toast.success('OIDC works', `Issuer ${result.issuer}`);
       }
-    } catch (e: any) {
-      showMessage(`OIDC test failed: ${e.message}`, 'error');
+    } catch (err: any) {
+      oidcResult = { ok: false, message: err.message, at: Date.now() };
+      toast.error('OIDC test failed', err.message);
     } finally {
       testing = null;
     }
   }
+
+  const envGroups = [
+    { title: 'SMTP / Email', icon: 'mail', vars: ['SMTP_HOST', 'SMTP_PORT', 'SMTP_USERNAME', 'SMTP_PASSWORD', 'SMTP_FROM', 'SMTP_TLS'] },
+    { title: 'Social login (OIDC)', icon: 'globe', vars: ['OIDC_ISSUER_URL', 'OIDC_CLIENT_ID', 'OIDC_CLIENT_SECRET', 'OIDC_CALLBACK_URL'] },
+    { title: 'Core', icon: 'server', vars: ['DATABASE_URL', 'BASE_URL', 'ALLOWED_ORIGINS', 'TRUST_PROXY_HEADERS', 'DOWNLOADS_DIR'] },
+  ];
 </script>
 
-<div>
-  <h2 class="text-xl font-semibold mb-6">Settings</h2>
-
-  {#if message}
-    <div class="flex items-center gap-2 {messageType === 'success' ? 'bg-success-glow border-success/30 text-success' : 'bg-danger-glow border-danger/30 text-danger'} border px-3.5 py-2.5 rounded text-[13px] mb-4">{message}</div>
+{#snippet resultLine(r: Result)}
+  {#if r}
+    <p class="mt-3 flex items-start gap-2 text-[12.5px] {r.ok ? 'text-mint' : 'text-rose'}">
+      <Icon name={r.ok ? 'check-circle' : 'alert-circle'} size={14} class="mt-0.5 shrink-0" />
+      <span class="break-all">{r.message}</span>
+    </p>
   {/if}
+{/snippet}
 
-  <div class="bg-bg-card border border-border rounded-xl p-6 mb-5 transition-colors duration-200 hover:border-border-hover">
-    <h3 class="text-base font-semibold mb-4">SMTP / Email</h3>
-    <p class="text-[13px] text-muted mb-4">SMTP is configured via environment variables (<code>SMTP_HOST</code>, <code>SMTP_PORT</code>, <code>SMTP_USERNAME</code>, <code>SMTP_PASSWORD</code>, <code>SMTP_FROM</code>, <code>SMTP_TLS</code>). Use the test below to verify the configuration.</p>
-    <div class="flex items-center gap-2 flex-wrap">
-      <input type="email" bind:value={smtpTestEmail} placeholder="test@example.com" class="py-2 px-3 border border-border rounded bg-bg-input text-text text-sm outline-none transition-all duration-150 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)] w-56" />
-      <button class="border border-border rounded text-sm font-medium py-2 px-4 transition-all duration-150 bg-bg-elevated text-text hover:border-primary hover:text-primary disabled:opacity-60" disabled={testing === 'smtp'} onclick={testSmtp}>
-        {testing === 'smtp' ? 'Sending...' : 'Test SMTP'}
-      </button>
+<div class="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)]">
+  <div class="flex flex-col gap-6">
+    <Card title="Email delivery" description="Send a real message through the configured SMTP server" icon="mail" accent="accent">
+      <form class="flex flex-col gap-3 sm:flex-row sm:items-end" onsubmit={testSmtp}>
+        <Field label="Recipient" type="email" icon="at-sign" bind:value={smtpTestEmail} placeholder="you@example.com" required class="flex-1" />
+        <Button type="submit" variant="secondary" icon="send" loading={testing === 'smtp'} disabled={!smtpTestEmail}>Send test email</Button>
+      </form>
+      {@render resultLine(smtpResult)}
+    </Card>
+
+    <Card title="Social login" description="Fetch the OIDC discovery document for the configured issuer" icon="globe" accent="cyan">
+      <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <p class="text-[13px] text-muted">Confirms <code class="rounded bg-surface-2 px-1 py-0.5 text-[12px] text-fg">OIDC_ISSUER_URL</code> is reachable and advertises an authorization endpoint.</p>
+        <Button variant="secondary" icon="shield-check" loading={testing === 'oidc'} onclick={testOidc}>Test discovery</Button>
+      </div>
+      {@render resultLine(oidcResult)}
+    </Card>
+  </div>
+
+  <Card title="Configuration" description="Everything is set through environment variables" icon="sliders" accent="gold" padded={false}>
+    <div class="divide-y divide-border">
+      {#each envGroups as group (group.title)}
+        <div class="px-5 py-4">
+          <p class="mb-2 flex items-center gap-2 text-[12px] font-semibold uppercase tracking-[0.1em] text-dim"><Icon name={group.icon} size={12} /> {group.title}</p>
+          <div class="flex flex-wrap gap-1.5">
+            {#each group.vars as v (v)}<code class="mono-chip">{v}</code>{/each}
+          </div>
+        </div>
+      {/each}
+      <div class="flex items-start gap-2 px-5 py-4 text-[12.5px] text-muted">
+        <Icon name="info" size={14} class="mt-0.5 shrink-0 text-cyan" />
+        <span>Edit <code class="text-fg">.env</code> or <code class="text-fg">docker-compose.yml</code>, then restart the server. <Badge tone="neutral" class="ml-1 align-middle">restart required</Badge></span>
+      </div>
     </div>
-  </div>
-
-  <div class="bg-bg-card border border-border rounded-xl p-6 mb-5 transition-colors duration-200 hover:border-border-hover">
-    <h3 class="text-base font-semibold mb-4">Social Login (OIDC)</h3>
-    <p class="text-[13px] text-muted mb-4">OIDC is configured via environment variables (<code>OIDC_ISSUER_URL</code>, <code>OIDC_CLIENT_ID</code>, <code>OIDC_CLIENT_SECRET</code>, <code>OIDC_CALLBACK_URL</code>). Use the test below to verify the discovery endpoint.</p>
-    <button class="border border-border rounded text-sm font-medium py-2 px-4 transition-all duration-150 bg-bg-elevated text-text hover:border-primary hover:text-primary disabled:opacity-60" disabled={testing === 'oidc'} onclick={testOidc}>
-      {testing === 'oidc' ? 'Testing...' : 'Test OIDC'}
-    </button>
-  </div>
-
-  <div class="bg-bg-card border border-border rounded-xl p-6 mb-5 transition-colors duration-200 hover:border-border-hover">
-    <h3 class="text-base font-semibold mb-4">Other Settings</h3>
-    <p class="text-[13px] text-muted">All settings are managed via environment variables. See the <code>.env</code> file or <code>docker-compose.yml</code> for the full list. A server restart is required after changes.</p>
-  </div>
+  </Card>
 </div>

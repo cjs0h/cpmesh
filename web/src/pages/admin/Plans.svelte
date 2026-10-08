@@ -1,33 +1,39 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import { userState } from '../../lib/stores/user.svelte';
-  import {
-    adminState,
-    fetchAdminPlans,
-    adminCreatePlan,
-    adminUpdatePlan,
-    adminDeletePlan,
-    type SubscriptionPlan,
-  } from '../../lib/stores/admin.svelte';
+  import { adminState, fetchAdminPlans, adminCreatePlan, adminUpdatePlan, adminDeletePlan, type SubscriptionPlan } from '../../lib/stores/admin.svelte';
+  import { toast } from '../../lib/stores/toast.svelte';
   import { push } from 'svelte-spa-router';
+  import { titleCase } from '../../lib/format';
+  import Icon from '../../components/Icon.svelte';
+  import Badge from '../../components/ui/Badge.svelte';
+  import Button from '../../components/ui/Button.svelte';
+  import Card from '../../components/ui/Card.svelte';
+  import ConfirmAction from '../../components/ui/ConfirmAction.svelte';
+  import Dialog from '../../components/ui/Dialog.svelte';
+  import Field from '../../components/ui/Field.svelte';
+  import Select from '../../components/ui/Select.svelte';
+  import Switch from '../../components/ui/Switch.svelte';
+  import EmptyState from '../../components/ui/EmptyState.svelte';
+  import Alert from '../../components/ui/Alert.svelte';
 
+  let dialogOpen = $state(false);
   let editing = $state<SubscriptionPlan | null>(null);
-  let creating = $state(false);
   let error = $state('');
-  let deleteConfirm = $state<string | null>(null);
+  let saving = $state(false);
 
-  // Form fields
   let formName = $state('');
   let formDescription = $state('');
-  let formPrice = $state(0);
+  let formPrice = $state<number | null>(0);
   let formCurrency = $state('USD');
   let formBillingPeriod = $state('monthly');
-  let formMaxDevices = $state(5);
-  let formMaxHistory = $state(100);
+  let formMaxDevices = $state<number | null>(5);
+  let formMaxHistory = $state<number | null>(100);
   let formFileTypes = $state('');
   let formIsActive = $state(true);
-  let formSortOrder = $state(0);
+  let formSortOrder = $state<number | null>(0);
 
-  $effect(() => {
+  onMount(() => {
     if (!userState.isAdmin) {
       push('/');
       return;
@@ -35,7 +41,10 @@
     fetchAdminPlans();
   });
 
-  function resetForm() {
+  const sorted = $derived([...adminState.plans].sort((a, b) => a.sort_order - b.sort_order || a.name.localeCompare(b.name)));
+
+  function startCreate() {
+    editing = null;
     formName = '';
     formDescription = '';
     formPrice = 0;
@@ -45,17 +54,13 @@
     formMaxHistory = 100;
     formFileTypes = '';
     formIsActive = true;
-    formSortOrder = 0;
+    formSortOrder = adminState.plans.length;
     error = '';
-  }
-
-  function startCreate() {
-    resetForm();
-    creating = true;
-    editing = null;
+    dialogOpen = true;
   }
 
   function startEdit(plan: SubscriptionPlan) {
+    editing = plan;
     formName = plan.name;
     formDescription = plan.description;
     formPrice = plan.price;
@@ -66,183 +71,153 @@
     formFileTypes = plan.allowed_file_types.join(', ');
     formIsActive = plan.is_active;
     formSortOrder = plan.sort_order;
-    editing = plan;
-    creating = false;
     error = '';
-  }
-
-  function cancelForm() {
-    creating = false;
-    editing = null;
-    error = '';
+    dialogOpen = true;
   }
 
   function parseFileTypes(str: string): string[] {
-    if (!str.trim()) return [];
     return str.split(',').map((s) => s.trim()).filter(Boolean);
   }
 
-  async function handleSave() {
+  async function handleSave(e: Event) {
+    e.preventDefault();
     error = '';
+    saving = true;
     const data = {
-      name: formName,
-      description: formDescription,
-      price: formPrice,
+      name: formName.trim(),
+      description: formDescription.trim(),
+      price: Number(formPrice ?? 0),
       currency: formCurrency,
       billing_period: formBillingPeriod,
-      max_devices: formMaxDevices,
-      max_clipboard_history: formMaxHistory,
+      max_devices: Number(formMaxDevices ?? 1),
+      max_clipboard_history: Number(formMaxHistory ?? 1),
       allowed_file_types: parseFileTypes(formFileTypes),
       is_active: formIsActive,
-      sort_order: formSortOrder,
+      sort_order: Number(formSortOrder ?? 0),
     };
-
     try {
       if (editing) {
         await adminUpdatePlan(editing.id, data);
+        toast.success('Plan updated', `${data.name} was saved.`);
       } else {
         await adminCreatePlan(data);
+        toast.success('Plan created', `${data.name} is ready to assign.`);
       }
-      cancelForm();
+      dialogOpen = false;
     } catch (err: any) {
       error = err.message;
+    } finally {
+      saving = false;
     }
   }
 
-  async function handleDelete(id: string) {
+  async function handleDelete(plan: SubscriptionPlan) {
     try {
-      await adminDeletePlan(id);
-      deleteConfirm = null;
+      await adminDeletePlan(plan.id);
+      toast.success('Plan deleted', `${plan.name} was removed.`);
     } catch (err: any) {
-      error = err.message;
-      deleteConfirm = null;
+      toast.error('Could not delete plan', err.message);
     }
+  }
+
+  function price(plan: SubscriptionPlan): string {
+    if (plan.price === 0) return 'Free';
+    return `${plan.currency} ${plan.price.toFixed(2)}`;
   }
 </script>
 
-<div>
-  <div class="flex items-center justify-between mb-5">
-    <h2 class="text-xl font-semibold">Subscription Plans</h2>
-    {#if !creating && !editing}
-      <button class="inline-flex items-center gap-1.5 px-4 py-2 border-none rounded text-[13px] font-medium transition-all duration-150 bg-primary text-white hover:bg-primary-hover hover:shadow-primary" onclick={startCreate}>+ New Plan</button>
-    {/if}
+<div class="mb-4 flex flex-wrap items-center justify-between gap-3">
+  <div class="flex items-center gap-2">
+    <Badge tone="neutral">{adminState.plans.length} plans</Badge>
+    <Badge tone="mint">{adminState.plans.filter((p) => p.is_active).length} active</Badge>
   </div>
-
-  {#if error}
-    <div class="flex items-center gap-2 bg-danger-glow border border-danger/30 text-danger px-3.5 py-2.5 rounded text-[13px] mb-4">{error}</div>
-  {/if}
-
-  {#if creating || editing}
-    <div class="bg-bg-card border border-border rounded-xl p-6 mb-5">
-      <h3 class="text-base font-semibold mb-4">{editing ? 'Edit Plan' : 'New Plan'}</h3>
-      <form onsubmit={(e) => { e.preventDefault(); handleSave(); }}>
-        <div class="grid grid-cols-2 gap-x-5 gap-y-3.5">
-          <label class="flex flex-col gap-1.5">
-            <span class="text-[13px] text-muted font-medium">Name *</span>
-            <input type="text" bind:value={formName} required class="py-2.5 px-3.5 border border-border rounded bg-bg-input text-text text-sm outline-none transition-all duration-150 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)]" />
-          </label>
-          <label class="flex flex-col gap-1.5">
-            <span class="text-[13px] text-muted font-medium">Price</span>
-            <input type="number" bind:value={formPrice} step="0.01" min="0" class="py-2.5 px-3.5 border border-border rounded bg-bg-input text-text text-sm outline-none transition-all duration-150 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)]" />
-          </label>
-          <label class="flex flex-col gap-1.5">
-            <span class="text-[13px] text-muted font-medium">Currency</span>
-            <select bind:value={formCurrency} class="py-2.5 px-3.5 border border-border rounded bg-bg-input text-text text-sm outline-none transition-all duration-150 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)]">
-              <option value="USD">USD</option>
-              <option value="EUR">EUR</option>
-              <option value="GBP">GBP</option>
-            </select>
-          </label>
-          <label class="flex flex-col gap-1.5">
-            <span class="text-[13px] text-muted font-medium">Billing Period</span>
-            <select bind:value={formBillingPeriod} class="py-2.5 px-3.5 border border-border rounded bg-bg-input text-text text-sm outline-none transition-all duration-150 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)]">
-              <option value="monthly">Monthly</option>
-              <option value="yearly">Yearly</option>
-              <option value="lifetime">Lifetime</option>
-            </select>
-          </label>
-          <label class="flex flex-col gap-1.5">
-            <span class="text-[13px] text-muted font-medium">Max Devices</span>
-            <input type="number" bind:value={formMaxDevices} min="1" class="py-2.5 px-3.5 border border-border rounded bg-bg-input text-text text-sm outline-none transition-all duration-150 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)]" />
-          </label>
-          <label class="flex flex-col gap-1.5">
-            <span class="text-[13px] text-muted font-medium">Max Clipboard History</span>
-            <input type="number" bind:value={formMaxHistory} min="1" class="py-2.5 px-3.5 border border-border rounded bg-bg-input text-text text-sm outline-none transition-all duration-150 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)]" />
-          </label>
-          <label class="flex flex-col gap-1.5 col-span-full">
-            <span class="text-[13px] text-muted font-medium">Description</span>
-            <input type="text" bind:value={formDescription} class="py-2.5 px-3.5 border border-border rounded bg-bg-input text-text text-sm outline-none transition-all duration-150 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)]" />
-          </label>
-          <label class="flex flex-col gap-1.5 col-span-full">
-            <span class="text-[13px] text-muted font-medium">Allowed File Types (comma-separated, empty = all)</span>
-            <input type="text" bind:value={formFileTypes} placeholder="text, image, file" class="py-2.5 px-3.5 border border-border rounded bg-bg-input text-text text-sm outline-none transition-all duration-150 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)]" />
-          </label>
-          <label class="flex flex-col gap-1.5">
-            <span class="text-[13px] text-muted font-medium">Sort Order</span>
-            <input type="number" bind:value={formSortOrder} class="py-2.5 px-3.5 border border-border rounded bg-bg-input text-text text-sm outline-none transition-all duration-150 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)]" />
-          </label>
-          <label class="flex flex-row items-center gap-2 pt-6">
-            <input type="checkbox" bind:checked={formIsActive} class="w-4 h-4 accent-primary" />
-            <span class="text-[13px] text-muted font-medium">Active</span>
-          </label>
-        </div>
-        <div class="flex gap-2.5 mt-5">
-          <button type="submit" class="inline-flex items-center gap-1.5 px-4 py-2 border-none rounded text-[13px] font-medium transition-all duration-150 bg-primary text-white hover:bg-primary-hover hover:shadow-primary">Save</button>
-          <button type="button" class="inline-flex items-center gap-1.5 px-4 py-2 border border-border rounded text-[13px] font-medium transition-all duration-150 bg-transparent text-muted hover:bg-bg-hover hover:text-text hover:border-border-hover" onclick={cancelForm}>Cancel</button>
-        </div>
-      </form>
-    </div>
-  {/if}
-
-  <div class="bg-bg-card border border-border rounded-xl overflow-hidden">
-    <table class="w-full border-collapse">
-      <thead>
-        <tr>
-          <th class="text-left px-[18px] py-[13px] text-[11px] uppercase tracking-[0.06em] text-dim border-b border-border font-semibold">Name</th>
-          <th class="text-left px-[18px] py-[13px] text-[11px] uppercase tracking-[0.06em] text-dim border-b border-border font-semibold">Price</th>
-          <th class="text-left px-[18px] py-[13px] text-[11px] uppercase tracking-[0.06em] text-dim border-b border-border font-semibold">Billing</th>
-          <th class="text-left px-[18px] py-[13px] text-[11px] uppercase tracking-[0.06em] text-dim border-b border-border font-semibold">Devices</th>
-          <th class="text-left px-[18px] py-[13px] text-[11px] uppercase tracking-[0.06em] text-dim border-b border-border font-semibold">History</th>
-          <th class="text-left px-[18px] py-[13px] text-[11px] uppercase tracking-[0.06em] text-dim border-b border-border font-semibold">File Types</th>
-          <th class="text-left px-[18px] py-[13px] text-[11px] uppercase tracking-[0.06em] text-dim border-b border-border font-semibold">Active</th>
-          <th class="text-left px-[18px] py-[13px] text-[11px] uppercase tracking-[0.06em] text-dim border-b border-border font-semibold"></th>
-        </tr>
-      </thead>
-      <tbody>
-        {#each adminState.plans as plan}
-          <tr class="transition-colors duration-150 hover:bg-bg-hover">
-            <td class="px-[18px] py-[13px] text-sm border-b border-border font-semibold">{plan.name}</td>
-            <td class="px-[18px] py-[13px] text-sm border-b border-border">{plan.price} {plan.currency}</td>
-            <td class="px-[18px] py-[13px] text-sm border-b border-border">{plan.billing_period}</td>
-            <td class="px-[18px] py-[13px] text-sm border-b border-border">{plan.max_devices}</td>
-            <td class="px-[18px] py-[13px] text-sm border-b border-border">{plan.max_clipboard_history}</td>
-            <td class="px-[18px] py-[13px] text-[13px] border-b border-border text-muted">{plan.allowed_file_types.length > 0 ? plan.allowed_file_types.join(', ') : 'All'}</td>
-            <td class="px-[18px] py-[13px] text-sm border-b border-border">
-              {#if plan.is_active}
-                <span class="inline-block px-2.5 py-[3px] rounded-full bg-success-glow text-success text-[11px] font-semibold border border-success/20">Active</span>
-              {:else}
-                <span class="inline-block px-2.5 py-[3px] rounded-full bg-bg-input text-muted text-[11px] font-semibold border border-border">Inactive</span>
-              {/if}
-            </td>
-            <td class="px-[18px] py-[13px] text-sm border-b border-border">
-              <div class="flex items-center gap-2">
-                <button class="border border-border rounded text-[13px] font-medium py-1.5 px-3 transition-all duration-150 bg-transparent text-muted hover:bg-bg-hover hover:text-text hover:border-border-hover" onclick={() => startEdit(plan)}>Edit</button>
-                {#if deleteConfirm === plan.id}
-                  <div class="flex items-center gap-2">
-                    <span class="text-[13px] text-warning font-medium">Delete?</span>
-                    <button class="border-none rounded text-[13px] font-medium py-1.5 px-3 transition-all duration-150 bg-danger text-white hover:bg-danger-hover" onclick={() => handleDelete(plan.id)}>Yes</button>
-                    <button class="border border-border rounded text-[13px] font-medium py-1.5 px-3 transition-all duration-150 bg-transparent text-muted hover:bg-bg-hover hover:text-text hover:border-border-hover" onclick={() => (deleteConfirm = null)}>No</button>
-                  </div>
-                {:else}
-                  <button class="border border-border rounded text-[13px] font-medium py-1.5 px-3 transition-all duration-150 bg-transparent text-muted hover:bg-bg-hover hover:text-text hover:border-border-hover" onclick={() => (deleteConfirm = plan.id)}>Delete</button>
-                {/if}
-              </div>
-            </td>
-          </tr>
-        {:else}
-          <tr><td colspan="8" class="text-muted text-center p-6">No plans created yet.</td></tr>
-        {/each}
-      </tbody>
-    </table>
-  </div>
+  <Button icon="plus" size="sm" onclick={startCreate}>New plan</Button>
 </div>
+
+{#if sorted.length === 0}
+  <EmptyState icon="star" title="No plans yet" description="Plans define how many devices and clipboard entries a user can have. Create one, then assign it from the Users page.">
+    <Button icon="plus" size="sm" onclick={startCreate}>Create the first plan</Button>
+  </EmptyState>
+{:else}
+  <div class="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+    {#each sorted as plan, i (plan.id)}
+      <article
+        class="group relative flex flex-col overflow-hidden rounded-xl border bg-surface p-5 shadow-card transition-[border-color,box-shadow,transform] duration-300 hover:-translate-y-0.5 hover:shadow-pop animate-[fade-up_0.4s_var(--ease-out-expo)_both] {plan.is_active
+          ? 'border-border hover:border-border-strong'
+          : 'border-border opacity-70'}"
+        style="animation-delay: {i * 50}ms;"
+      >
+        <div class="flex items-start justify-between gap-3">
+          <div class="min-w-0">
+            <div class="flex items-center gap-2">
+              <h3 class="truncate font-display text-lg font-semibold tracking-tight text-fg">{plan.name}</h3>
+              {#if !plan.is_active}<Badge tone="neutral">Inactive</Badge>{/if}
+            </div>
+            {#if plan.description}<p class="mt-0.5 line-clamp-2 text-[13px] text-muted">{plan.description}</p>{/if}
+          </div>
+          <span class="font-mono text-[11px] text-dim">#{plan.sort_order}</span>
+        </div>
+
+        <div class="mt-4 flex items-baseline gap-1.5">
+          <span class="font-display text-3xl font-semibold tracking-tight text-fg">{price(plan)}</span>
+          {#if plan.price > 0}<span class="text-[12.5px] text-dim">/ {plan.billing_period === 'lifetime' ? 'once' : plan.billing_period.replace('ly', '')}</span>{/if}
+        </div>
+
+        <dl class="mt-5 grid grid-cols-2 gap-2 text-[13px]">
+          <div class="rounded-lg border border-border bg-surface-2/60 px-3 py-2">
+            <dt class="flex items-center gap-1 text-[11px] uppercase tracking-[0.08em] text-dim"><Icon name="monitor" size={11} /> Devices</dt>
+            <dd class="mt-0.5 font-medium text-fg">{plan.max_devices}</dd>
+          </div>
+          <div class="rounded-lg border border-border bg-surface-2/60 px-3 py-2">
+            <dt class="flex items-center gap-1 text-[11px] uppercase tracking-[0.08em] text-dim"><Icon name="history" size={11} /> History</dt>
+            <dd class="mt-0.5 font-medium text-fg">{plan.max_clipboard_history.toLocaleString()}</dd>
+          </div>
+        </dl>
+
+        <div class="mt-3 flex flex-wrap gap-1.5">
+          {#if plan.allowed_file_types.length === 0}
+            <Badge tone="cyan" icon="check">All content types</Badge>
+          {:else}
+            {#each plan.allowed_file_types as t (t)}<Badge tone="neutral">{titleCase(t)}</Badge>{/each}
+          {/if}
+        </div>
+
+        <div class="mt-auto flex items-center justify-between pt-5">
+          <Button variant="outline" size="xs" icon="edit" onclick={() => startEdit(plan)}>Edit</Button>
+          <ConfirmAction size="xs" label="Delete" confirmLabel="Delete" prompt="Delete plan?" onconfirm={() => handleDelete(plan)} />
+        </div>
+      </article>
+    {/each}
+  </div>
+{/if}
+
+<Dialog bind:open={dialogOpen} title={editing ? `Edit ${editing.name}` : 'New plan'} description="Limits apply immediately to every user on this plan." size="lg">
+  <form id="plan-form" class="grid grid-cols-1 gap-4 sm:grid-cols-2" onsubmit={handleSave}>
+    {#if error}<div class="sm:col-span-2"><Alert tone="danger">{error}</Alert></div>{/if}
+    <Field label="Name" bind:value={formName} required placeholder="Pro" />
+    <Field label="Sort order" type="number" bind:value={formSortOrder} hint="Lower numbers show first" />
+    <Field label="Description" bind:value={formDescription} placeholder="For power users with many devices" class="sm:col-span-2" />
+    <Field label="Price" type="number" bind:value={formPrice} step="0.01" min="0" />
+    <Select label="Currency" bind:value={formCurrency}>
+      <option value="USD">USD</option>
+      <option value="EUR">EUR</option>
+      <option value="GBP">GBP</option>
+    </Select>
+    <Select label="Billing period" bind:value={formBillingPeriod}>
+      <option value="monthly">Monthly</option>
+      <option value="yearly">Yearly</option>
+      <option value="lifetime">Lifetime</option>
+    </Select>
+    <div></div>
+    <Field label="Max devices" type="number" bind:value={formMaxDevices} min="1" required />
+    <Field label="Max clipboard history" type="number" bind:value={formMaxHistory} min="1" required />
+    <Field label="Allowed file types" bind:value={formFileTypes} placeholder="text, image, file" hint="Comma-separated; leave empty to allow everything" class="sm:col-span-2" />
+    <div class="sm:col-span-2">
+      <Switch bind:checked={formIsActive} label="Active" description="Inactive plans stay assigned but can't be chosen for new users." />
+    </div>
+  </form>
+  {#snippet footer()}
+    <Button variant="ghost" onclick={() => (dialogOpen = false)}>Cancel</Button>
+    <Button type="submit" form="plan-form" loading={saving}>{editing ? 'Save changes' : 'Create plan'}</Button>
+  {/snippet}
+</Dialog>

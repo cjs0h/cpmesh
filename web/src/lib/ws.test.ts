@@ -173,4 +173,47 @@ describe('WebSocket client', () => {
     await vi.advanceTimersByTimeAsync(60_000);
     expect(FakeWebSocket.instances).toHaveLength(1);
   });
+
+  it('reports connection status transitions to subscribers', async () => {
+    setTokens('jwt', 'r');
+    mockTicket();
+    const seen: string[] = [];
+    const unsub = ws.onWSStatus((s) => seen.push(s));
+    expect(ws.getWSStatus()).toBe('offline');
+
+    await ws.connectWS();
+    expect(seen).toEqual(['connecting']);
+
+    FakeWebSocket.latest().open();
+    expect(ws.getWSStatus()).toBe('online');
+
+    FakeWebSocket.latest().serverClose();
+    expect(ws.getWSStatus()).toBe('reconnecting');
+
+    // While a reconnect is pending the status stays "reconnecting" through the next attempt
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(ws.getWSStatus()).toBe('reconnecting');
+    FakeWebSocket.latest().open();
+    expect(ws.getWSStatus()).toBe('online');
+
+    ws.disconnectWS();
+    expect(ws.getWSStatus()).toBe('offline');
+    expect(seen).toEqual(['connecting', 'online', 'reconnecting', 'online', 'offline']);
+
+    unsub();
+    await ws.connectWS();
+    expect(seen).toHaveLength(5);
+  });
+
+  it('does not emit duplicate status events', async () => {
+    setTokens('jwt', 'r');
+    fetchMock().mockResolvedValue(jsonResponse(500, { error: 'boom' }));
+    const seen: string[] = [];
+    ws.onWSStatus((s) => seen.push(s));
+
+    await ws.connectWS(); // connecting -> reconnecting
+    await vi.advanceTimersByTimeAsync(1000); // still reconnecting
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(seen).toEqual(['connecting', 'reconnecting']);
+  });
 });
