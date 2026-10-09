@@ -21,7 +21,7 @@
 
 <button
   type="button"
-  class="inline-flex items-center justify-center rounded p-1 transition-colors {copied ? 'text-mint' : 'text-dim hover:text-fg'} {className}"
+  class="inline-flex items-center justify-center rounded p-1 transition-colors {copied ? 'text-success' : 'text-dim hover:text-fg'} {className}"
   aria-label={copied ? 'Copied' : label}
   title={copied ? 'Copied' : label}
   onclick={copy}

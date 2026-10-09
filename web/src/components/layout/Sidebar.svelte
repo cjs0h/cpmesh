@@ -29,85 +29,71 @@
   }
 </script>
 
-{#snippet navItem(route: (typeof appRoutes)[number], fill: string)}
+{#snippet navItem(route: (typeof appRoutes)[number])}
   {@const active = isRouteActive(route.path, router.location)}
   <li>
     <a
       href="#{route.path}"
       aria-current={active ? 'page' : undefined}
-      class="group flex items-center gap-3 rounded-md border-2 px-3 py-2 font-head text-[12.5px] uppercase tracking-[0.04em] transition-[transform,box-shadow,background-color,border-color] duration-150 {active
-        ? `border-ink ${fill} text-ink shadow-sm`
-        : 'border-transparent text-muted hover:-translate-x-px hover:-translate-y-px hover:border-ink hover:bg-surface hover:text-ink hover:shadow-sm'}"
+      class="flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-[13px] transition-colors duration-150 {active ? 'bg-surface-2 font-medium text-fg' : 'text-muted hover:bg-surface-2 hover:text-fg'}"
     >
-      <span class="flex h-7 w-7 items-center justify-center rounded border-2 transition-colors {active ? 'border-ink bg-cream' : 'border-transparent group-hover:border-ink'}">
-        <Icon name={route.icon} size={15} strokeWidth={2.4} />
-      </span>
+      <span class={active ? 'text-fg' : 'text-dim'}><Icon name={route.icon} size={15} strokeWidth={1.75} /></span>
       {route.label}
     </a>
   </li>
 {/snippet}
 
 {#if uiState.sidebarOpen}
-  <button type="button" class="fixed inset-0 z-40 bg-ink/50 lg:hidden animate-[fade-in_0.2s_ease-out]" aria-label="Close navigation" onclick={closeSidebar}></button>
+  <button type="button" class="fixed inset-0 z-40 bg-black/20 lg:hidden animate-[fade-in_0.15s_ease-out]" aria-label="Close navigation" onclick={closeSidebar}></button>
 {/if}
 
 <aside
-  class="fixed inset-y-0 left-0 z-50 flex w-[272px] shrink-0 flex-col border-r-2 border-ink bg-surface transition-transform duration-300 ease-[var(--ease-out-expo)] lg:static lg:translate-x-0 {uiState.sidebarOpen
-    ? 'translate-x-0 shadow-pop'
-    : '-translate-x-full'}"
+  class="fixed inset-y-0 left-0 z-50 flex w-[240px] shrink-0 flex-col border-r border-border bg-surface transition-transform duration-200 ease-out lg:static lg:translate-x-0 {uiState.sidebarOpen ? 'translate-x-0 shadow-lg' : '-translate-x-full'}"
   aria-label="Main navigation"
 >
-  <div class="flex items-center justify-between border-b-2 border-ink px-5 py-4">
-    <a href="#/" class="inline-flex items-center gap-2.5">
-      <Logo size={36} withText textClass="text-[18px]" />
+  <div class="flex h-14 items-center justify-between px-4">
+    <a href="#/" class="inline-flex items-center gap-2">
+      <Logo size={24} withText textClass="text-[15px]" />
     </a>
-    <button type="button" class="flex h-8 w-8 items-center justify-center rounded border-2 border-ink bg-cream text-ink shadow-xs lg:hidden" aria-label="Close navigation" onclick={closeSidebar}>
-      <Icon name="x" size={16} strokeWidth={2.5} />
+    <button type="button" class="flex h-7 w-7 items-center justify-center rounded-md text-dim hover:bg-surface-2 hover:text-fg lg:hidden" aria-label="Close navigation" onclick={closeSidebar}>
+      <Icon name="x" size={16} />
     </button>
   </div>
 
-  <nav class="flex-1 overflow-y-auto px-3 py-4">
-    <ul class="flex flex-col gap-1">
+  <nav class="flex-1 overflow-y-auto px-2.5 pb-4 pt-1">
+    <ul class="flex flex-col gap-0.5">
       {#each primary as route (route.path)}
-        {@render navItem(route, 'bg-yellow')}
+        {@render navItem(route)}
       {/each}
     </ul>
 
     {#if userState.isAdmin}
-      <p class="mb-2 mt-6 px-3 font-head text-[10px] uppercase tracking-[0.16em] text-dim">Administration</p>
-      <ul class="flex flex-col gap-1">
+      <p class="mb-1.5 mt-6 px-2.5 text-[11px] font-medium text-dim">Administration</p>
+      <ul class="flex flex-col gap-0.5">
         {#each admin as route (route.path)}
-          {@render navItem(route, 'bg-cyan')}
+          {@render navItem(route)}
         {/each}
       </ul>
     {/if}
   </nav>
 
-  <div class="border-t-2 border-ink p-3">
-    <!-- Connection status -->
-    <div class="mb-3 flex items-center justify-between rounded-md border-2 border-ink px-3 py-2 font-mono text-[11.5px] shadow-xs {status === 'online' ? 'bg-mint' : status === 'offline' ? 'bg-surface-2' : 'bg-yellow'}">
-      <span class="flex items-center gap-2 font-semibold text-ink">
-        <span class="status-dot text-ink" data-live={status === 'online'}></span>
-        {#if status === 'online'}LIVE SYNC{:else if status === 'connecting'}CONNECTING…{:else if status === 'reconnecting'}RECONNECTING…{:else}OFFLINE{/if}
+  <div class="border-t border-border p-3">
+    <div class="mb-2 flex items-center justify-between rounded-md px-2.5 py-1.5 text-[12px] text-muted">
+      <span class="flex items-center gap-2">
+        <span class="status-dot {status === 'online' ? 'text-accent' : status === 'offline' ? 'text-border-strong' : 'text-amber-500'}" data-live={status === 'online'}></span>
+        {#if status === 'online'}Live sync{:else if status === 'connecting'}Connecting…{:else if status === 'reconnecting'}Reconnecting…{:else}Offline{/if}
       </span>
-      <span class="text-[10px] uppercase tracking-wider text-ink/60">wss</span>
+      <span class="font-mono text-[10px] uppercase text-dim">wss</span>
     </div>
 
-    <!-- User card -->
-    <div class="flex items-center gap-3 rounded-md px-1 py-1">
-      <Avatar name={displayName} src={userState.avatarUrl} size={36} />
+    <div class="flex items-center gap-2.5 rounded-md px-2 py-1.5">
+      <Avatar name={displayName} src={userState.avatarUrl} size={28} />
       <div class="min-w-0 flex-1">
-        <p class="truncate font-head text-[12.5px] text-ink">{displayName}</p>
-        <p class="truncate text-[11.5px] text-dim">{userState.isAdmin ? 'Administrator' : userState.email || `@${userState.username}`}</p>
+        <p class="truncate text-[13px] font-medium text-fg">{displayName}</p>
+        <p class="truncate text-[11px] text-dim">{userState.isAdmin ? 'Administrator' : userState.email || `@${userState.username}`}</p>
       </div>
-      <button
-        type="button"
-        class="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border-2 border-ink bg-surface text-ink shadow-xs transition-[transform,box-shadow,background-color] hover:-translate-x-px hover:-translate-y-px hover:bg-rose hover:shadow-sm active:translate-x-px active:translate-y-px active:shadow-none"
-        title="Sign out"
-        aria-label="Sign out"
-        onclick={logout}
-      >
-        <Icon name="log-out" size={16} strokeWidth={2.4} />
+      <button type="button" class="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-dim transition-colors hover:bg-surface-2 hover:text-fg" title="Sign out" aria-label="Sign out" onclick={logout}>
+        <Icon name="log-out" size={14} />
       </button>
     </div>
   </div>

@@ -2,11 +2,9 @@
   import { setTokens } from '../lib/auth';
   import Icon from '../components/Icon.svelte';
   import Logo from '../components/Logo.svelte';
-  import SyncDemo from '../components/landing/SyncDemo.svelte';
   import Button from '../components/ui/Button.svelte';
   import Field from '../components/ui/Field.svelte';
   import Alert from '../components/ui/Alert.svelte';
-  import RetroGrid from '../components/magic/RetroGrid.svelte';
 
   let mode: 'login' | 'register' = $state('login');
   let error = $state('');
@@ -99,7 +97,7 @@
     if (/\d/.test(p)) score++;
     if (/[^A-Za-z0-9]/.test(p)) score++;
     const labels = ['Weak', 'Weak', 'Fair', 'Good', 'Strong', 'Excellent'];
-    const tones = ['bg-rose', 'bg-rose', 'bg-yellow', 'bg-cyan', 'bg-mint', 'bg-mint'];
+    const tones = ['bg-danger', 'bg-danger', 'bg-warning', 'bg-fg', 'bg-success', 'bg-success'];
     return { score, label: labels[score], tone: tones[score] };
   });
 
@@ -186,67 +184,33 @@
     }
   }
 
-  const bullets = [
-    { icon: 'lock', title: 'Encrypted before it leaves', desc: 'AES-256-GCM on-device. The relay only ever stores ciphertext.' },
-    { icon: 'zap', title: 'Sub-second delivery', desc: 'WebSocket push to every paired device the instant you copy.' },
-    { icon: 'shield-check', title: 'Open source, self-hostable', desc: 'MIT / Apache-2.0. Run your own relay with one Docker command.' },
-  ];
 </script>
 
 <svelte:head>
   <title>{mode === 'login' ? 'Sign in' : 'Create account'} — cpmesh</title>
 </svelte:head>
 
-<div class="relative grid min-h-dvh grid-cols-1 bg-bg lg:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)]">
-  <!-- Brand panel -->
-  <aside class="grid-paper relative hidden overflow-hidden border-r-2 border-ink bg-bg-deep lg:flex lg:flex-col lg:justify-between lg:p-12 2xl:p-16">
-    <RetroGrid class="top-auto! h-[45%]" opacity={0.5} fadeTo="var(--color-bg-deep)" />
-
-    <a href="#/" class="relative inline-flex w-fit items-center gap-2.5">
-      <Logo size={38} withText textClass="text-lg" />
+<div class="flex min-h-dvh flex-col bg-bg-deep">
+  <header class="flex h-14 items-center justify-between px-5 sm:px-8">
+    <a href="#/" class="inline-flex items-center gap-2" aria-label="cpmesh home">
+      <Logo size={24} withText textClass="text-[15px]" />
     </a>
+    <a href="#/" class="inline-flex items-center gap-1.5 text-[13px] text-muted transition-colors hover:text-fg">
+      <Icon name="arrow-left" size={14} /> Back to site
+    </a>
+  </header>
 
-    <div class="relative my-10 max-w-2xl">
-      <h1 class="font-head text-[clamp(2rem,3.2vw,3.4rem)] leading-[1.05] text-ink">
-        Copy on one device.<br />
-        <span class="text-gradient">Paste on all of them.</span>
-      </h1>
-      <p class="mt-4 max-w-md text-[15px] leading-relaxed text-muted">Your clipboard, synced across every machine you own — sealed with keys that never leave your hardware.</p>
-
-      <div class="mt-8 max-w-[460px]">
-        <SyncDemo compact />
+  <main class="flex flex-1 items-center justify-center px-5 pb-16 pt-6 sm:px-8">
+    <div class="w-full max-w-[400px]">
+      <div class="mb-6 text-center">
+        <h1 class="text-2xl font-semibold tracking-[-0.02em] text-fg">{mode === 'login' ? 'Sign in to cpmesh' : 'Create your account'}</h1>
+        <p class="mt-1.5 text-sm text-muted">{mode === 'login' ? 'Your clipboard, on every device you own.' : 'Free, open source, end-to-end encrypted.'}</p>
       </div>
 
-      <ul class="mt-9 grid gap-3">
-        {#each bullets as b, i (b.title)}
-          <li class="panel flex items-start gap-3 px-4 py-3" style="--panel-shadow: {['var(--color-accent)', 'var(--color-cyan)', 'var(--color-mint)'][i]};">
-            <span class="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded border-2 border-ink text-ink {['bg-accent', 'bg-cyan', 'bg-mint'][i]}"><Icon name={b.icon} size={15} strokeWidth={2.5} /></span>
-            <div>
-              <p class="font-head text-[13px] text-ink">{b.title}</p>
-              <p class="text-[13px] text-muted">{b.desc}</p>
-            </div>
-          </li>
-        {/each}
-      </ul>
-    </div>
-
-    <p class="relative font-head text-[11px] uppercase tracking-[0.12em] text-dim">© {new Date().getFullYear()} cpmesh · MIT / Apache-2.0</p>
-  </aside>
-
-  <!-- Form panel -->
-  <main class="dot-grid relative flex items-center justify-center px-5 py-10 sm:px-8">
-    <div class="relative w-full max-w-[440px] animate-[fade-up_0.5s_var(--ease-out-expo)]">
-      <div class="mb-8 flex flex-col items-center text-center lg:hidden">
-        <a href="#/" class="inline-flex"><Logo size={48} /></a>
-        <h1 class="mt-5 font-head text-2xl text-ink">Welcome to cpmesh</h1>
-        <p class="mt-1 text-sm text-muted">Encrypted clipboard sync for every device</p>
-      </div>
-
-      <div class="panel panel-lg rounded-lg p-6 sm:p-8" style="--panel-shadow: var(--color-yellow);">
-        <!-- Segmented control -->
-        <div class="mb-6 grid grid-cols-2 gap-1 rounded-md border-2 border-ink bg-surface-2 p-1 shadow-xs" role="tablist" aria-label="Authentication mode">
-          <button type="button" role="tab" aria-selected={mode === 'login'} class="h-10 whitespace-nowrap rounded border-2 px-1 font-head text-[10.5px] uppercase tracking-[0.03em] transition-[background-color,box-shadow,transform] sm:text-[12px] sm:tracking-[0.06em] {mode === 'login' ? 'border-ink bg-yellow text-ink shadow-sm' : 'border-transparent text-muted hover:text-ink'}" onclick={() => switchMode('login')}>Sign in</button>
-          <button type="button" role="tab" aria-selected={mode === 'register'} class="h-10 whitespace-nowrap rounded border-2 px-1 font-head text-[10.5px] uppercase tracking-[0.03em] transition-[background-color,box-shadow,transform] sm:text-[12px] sm:tracking-[0.06em] {mode === 'register' ? 'border-ink bg-yellow text-ink shadow-sm' : 'border-transparent text-muted hover:text-ink'}" onclick={() => switchMode('register')}>Create account</button>
+      <div class="rounded-lg border border-border bg-surface p-6 shadow-sm sm:p-7">
+        <div class="mb-6 flex border-b border-border" role="tablist" aria-label="Authentication mode">
+          <button type="button" role="tab" aria-selected={mode === 'login'} class="-mb-px flex-1 border-b-2 pb-2.5 text-sm font-medium transition-colors {mode === 'login' ? 'border-ink text-fg' : 'border-transparent text-muted hover:text-fg'}" onclick={() => switchMode('login')}>Sign in</button>
+          <button type="button" role="tab" aria-selected={mode === 'register'} class="-mb-px flex-1 border-b-2 pb-2.5 text-sm font-medium transition-colors {mode === 'register' ? 'border-ink text-fg' : 'border-transparent text-muted hover:text-fg'}" onclick={() => switchMode('register')}>Create account</button>
         </div>
 
         <div class="flex flex-col gap-3">
@@ -256,43 +220,43 @@
 
         {#if mode === 'login'}
           <form onsubmit={handleLogin} class="mt-4 flex flex-col gap-4">
-            <Field label="Username or email" icon="user" bind:value={loginIdentifier} required autocomplete="username" placeholder="you@example.com" />
-            <Field label="Password" type="password" icon="lock" bind:value={loginPassword} required minlength={8} autocomplete="current-password" placeholder="••••••••" />
-            <Button type="submit" size="lg" {loading} shine class="mt-1 w-full">Sign in</Button>
+            <Field label="Username or email" bind:value={loginIdentifier} required autocomplete="username" placeholder="you@example.com" />
+            <Field label="Password" type="password" bind:value={loginPassword} required minlength={8} autocomplete="current-password" placeholder="••••••••" />
+            <Button type="submit" size="lg" {loading} class="mt-1 w-full">Sign in</Button>
           </form>
         {:else}
           <form onsubmit={handleRegister} class="mt-4 flex flex-col gap-4" novalidate>
-            <Field label="Full name" icon="user" bind:value={regFullName} required autocomplete="name" error={regErrors.fullName} />
-            <Field label="Email" type="email" icon="at-sign" bind:value={regEmail} required autocomplete="email" error={regErrors.email} />
-            <Field label="Username" icon="hash" bind:value={regUsername} required autocomplete="username" error={regErrors.username} hint="3–50 characters, shown to your other devices" />
-            <div class="grid grid-cols-2 gap-3">
-              <Field label="Country" icon="map-pin" bind:value={regCountry} optional autocomplete="country-name" />
-              <Field label="Mobile" type="tel" icon="phone" bind:value={regMobile} optional autocomplete="tel" error={regErrors.mobile} />
+            <Field label="Full name" bind:value={regFullName} required autocomplete="name" error={regErrors.fullName} />
+            <Field label="Email" type="email" bind:value={regEmail} required autocomplete="email" error={regErrors.email} />
+            <Field label="Username" bind:value={regUsername} required autocomplete="username" error={regErrors.username} hint="3–50 characters, shown to your other devices" />
+            <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <Field label="Country" bind:value={regCountry} optional autocomplete="country-name" />
+              <Field label="Mobile" type="tel" bind:value={regMobile} optional autocomplete="tel" error={regErrors.mobile} />
             </div>
             <div class="flex flex-col gap-2">
-              <Field label="Password" type="password" icon="lock" bind:value={regPassword} required minlength={8} maxlength={128} autocomplete="new-password" error={regErrors.password} />
+              <Field label="Password" type="password" bind:value={regPassword} required minlength={8} maxlength={128} autocomplete="new-password" error={regErrors.password} />
               {#if regPassword}
                 <div class="flex items-center gap-3 px-0.5">
                   <div class="flex flex-1 gap-1" aria-hidden="true">
                     {#each Array(5) as _, i (i)}
-                      <span class="h-2 flex-1 rounded-sm border-2 border-ink transition-colors duration-300 {i < strength.score ? strength.tone : 'bg-surface-2'}"></span>
+                      <span class="h-1 flex-1 rounded-full transition-colors duration-200 {i < strength.score ? strength.tone : 'bg-surface-3'}"></span>
                     {/each}
                   </div>
-                  <span class="w-16 text-right font-head text-[10.5px] uppercase tracking-wide text-muted">{strength.label}</span>
+                  <span class="w-16 text-right text-xs text-muted">{strength.label}</span>
                 </div>
               {/if}
             </div>
-            <Field label="Confirm password" type="password" icon="check" bind:value={regPasswordConfirm} required autocomplete="new-password" error={regErrors.passwordConfirm} />
-            <Button type="submit" size="lg" {loading} shine class="mt-1 w-full">Create account</Button>
-            <p class="text-center text-[11.5px] leading-relaxed text-dim">We only use your email to verify the account and for security notices.</p>
+            <Field label="Confirm password" type="password" bind:value={regPasswordConfirm} required autocomplete="new-password" error={regErrors.passwordConfirm} />
+            <Button type="submit" size="lg" {loading} class="mt-1 w-full">Create account</Button>
+            <p class="text-center text-xs leading-relaxed text-dim">We only use your email to verify the account and for security notices.</p>
           </form>
         {/if}
 
         {#if socialEnabled}
           <div class="my-5 flex items-center gap-3">
-            <div class="h-0.5 flex-1 bg-ink/15"></div>
-            <span class="font-head text-[10px] uppercase tracking-[0.16em] text-dim">or</span>
-            <div class="h-0.5 flex-1 bg-ink/15"></div>
+            <div class="h-px flex-1 bg-border"></div>
+            <span class="text-xs text-dim">or</span>
+            <div class="h-px flex-1 bg-border"></div>
           </div>
           <Button href="/api/auth/social/login" variant="secondary" size="lg" icon="globe" class="w-full">
             Continue with {socialProvider ? socialProvider.charAt(0).toUpperCase() + socialProvider.slice(1) : 'SSO'}
@@ -300,25 +264,23 @@
         {/if}
 
         {#if mode === 'login'}
-          <div class="mt-6 border-t-2 border-ink/15 pt-4">
-            <button type="button" class="flex w-full items-center justify-between text-[12.5px] font-semibold text-muted transition-colors hover:text-ink" aria-expanded={resendOpen} onclick={() => (resendOpen = !resendOpen)}>
+          <div class="mt-6 border-t border-border pt-4">
+            <button type="button" class="flex w-full items-center justify-between text-[13px] text-muted transition-colors hover:text-fg" aria-expanded={resendOpen} onclick={() => (resendOpen = !resendOpen)}>
               Didn't receive the verification email?
-              <Icon name="chevron-down" size={14} strokeWidth={2.5} class="transition-transform duration-300 {resendOpen ? 'rotate-180' : ''}" />
+              <Icon name="chevron-down" size={14} class="transition-transform duration-200 {resendOpen ? 'rotate-180' : ''}" />
             </button>
             {#if resendOpen}
-              <form onsubmit={handleResend} class="mt-3 flex gap-2 animate-[fade-up_0.3s_var(--ease-out-expo)]">
-                <Field type="email" icon="mail" bind:value={resendEmail} placeholder="Your email address" class="flex-1" required />
-                <Button type="submit" variant="outline" loading={resendLoading} disabled={!resendEmail}>Resend</Button>
+              <form onsubmit={handleResend} class="mt-3 flex gap-2">
+                <Field type="email" bind:value={resendEmail} placeholder="Your email address" class="flex-1" required />
+                <Button type="submit" variant="secondary" loading={resendLoading} disabled={!resendEmail}>Resend</Button>
               </form>
             {/if}
           </div>
         {/if}
       </div>
 
-      <p class="mt-7 text-center">
-        <a href="#/" class="inline-flex items-center gap-1.5 font-head text-[11px] uppercase tracking-[0.1em] text-muted underline decoration-2 decoration-yellow underline-offset-4 transition-colors hover:text-ink">
-          <Icon name="arrow-left" size={14} strokeWidth={2.5} /> Back to cpmesh.com
-        </a>
+      <p class="mt-6 text-center text-xs text-dim">
+        End-to-end encrypted · Open source · <a href="https://github.com/cjs0h/cpmesh" target="_blank" rel="noopener" class="underline underline-offset-4 hover:text-fg">Self-host it</a>
       </p>
     </div>
   </main>

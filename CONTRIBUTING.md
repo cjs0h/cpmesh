@@ -91,27 +91,30 @@ tested from a `*.svelte.test.ts` file so the runes are compiled.
 
 #### Web dashboard UI conventions
 
-- The visual language is **neo-brutalist** (RetroUI): cream paper background, `#111` 2px borders
-  (`border-2 border-ink`), hard offset shadows (`shadow-sm/md/lg` are 2/4/6px solid offsets, no blur),
-  Archivo Black headings (`font-head`) with Space Grotesk body text, and flat fills — `bg-yellow`
-  (primary), `bg-accent` (coral), `bg-cyan`, `bg-mint`, `bg-violet`, `bg-rose`.
+- The visual language is **minimal monochrome**: white surfaces, 1px `#e5e5e5` hairlines
+  (`border border-border`), near-black text, Geist for UI text and Geist Mono for identifiers/code.
+  Primary actions are solid black (`Button` default); the single coral accent (`text-accent`,
+  `bg-accent`) is reserved for live indicators and small points of emphasis — never for large fills.
+  Semantic states use the muted `success` / `warning` / `danger` tokens.
 - Design tokens live in `web/src/app.css` (`@theme`): surfaces (`bg-bg`, `bg-bg-deep`, `bg-surface`,
-  `bg-surface-2`), text (`text-ink`, `text-muted`, `text-dim`) and the fills above. Prefer these over raw
-  hex values so the landing page, auth screens and app stay visually consistent. The `.panel` /
-  `.panel-ink` classes give a bordered card with a hard shadow whose colour is set via `--panel-shadow`.
+  `bg-surface-2`, `bg-surface-3`), borders (`border-border`, `border-border-strong`), text (`text-fg`,
+  `text-ink`, `text-muted`, `text-dim`) and the accent/semantic colours. Prefer these over raw hex values.
+  Shadows are faint (`shadow-xs/sm/md/lg`) and used sparingly; there are no gradients or glows.
 - Reusable primitives are in `web/src/components/ui/` (`Button`, `Card`, `Badge`, `Field`, `Select`, `Switch`,
   `Dialog`, `ConfirmAction`, `EmptyState`, `Alert`, `StatCard`, `Toaster`, …). Reach for these before
-  hand-writing utility strings; page files should mostly be layout and data wiring.
-- Animated building blocks ported from MagicUI live in `web/src/components/magic/` (`RetroGrid`,
-  `BorderBeam`, `Marquee`, `NumberTicker`, `WordRotate`, `Meteors`, `OrbitingCircles`, `AnimatedList`,
-  `ScrollProgress`). They are CSS-driven, dependency-free, and respect `prefers-reduced-motion`.
-- Layout is fluid: the landing page uses the `.wrap` container (up to 1680px, 1880px on 2xl+) and the app
-  shell grows to 1700px, so large monitors are filled instead of showing a narrow centred column. Give
-  every responsive grid an explicit `grid-cols-1` so single-column tracks cannot exceed the viewport.
+  hand-writing utility strings; page files should mostly be layout and data wiring. Use `.cell-grid`
+  for feature/stat grids that should only show hairlines *between* cells, and `.tbl` for data tables.
+- Motion is intentional and minimal: the only sustained animation is the `SyncDemo` product demo on the
+  landing page (transform/opacity only, static frame under `prefers-reduced-motion`). Everything else is
+  limited to ~150ms colour/border hover transitions. Do not add scroll-reveal, parallax, blur or
+  background-plane animations; content must be visible immediately on load.
+- Layout: the landing page uses the `.wrap` container (1200px, growing to 1360px/1520px on large
+  monitors) with full-bleed hairline section dividers, and the app shell grows to 1600px, so wide screens
+  do not feel boxed. Give every responsive grid an explicit `grid-cols-1` so single-column tracks cannot
+  exceed the viewport.
 - Mount-time data loading belongs in `onMount`, not `$effect`, so store reads inside the fetch
   (for example the clipboard `offset`) do not become reactive dependencies that re-trigger the load.
-- User feedback goes through the `toast` store (`lib/stores/toast.svelte.ts`); scroll-reveal animations
-  use the `reveal` action (`lib/actions/reveal.ts`, with an optional MagicUI-style `blur` fade).
+- User feedback goes through the `toast` store (`lib/stores/toast.svelte.ts`).
 
 ## Submitting Changes
 

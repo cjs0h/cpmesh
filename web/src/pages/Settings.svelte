@@ -60,7 +60,7 @@
     if (/\d/.test(p)) score++;
     if (/[^A-Za-z0-9]/.test(p)) score++;
     const labels = ['Weak', 'Weak', 'Fair', 'Good', 'Strong', 'Excellent'];
-    const tones = ['bg-rose', 'bg-rose', 'bg-yellow', 'bg-cyan', 'bg-mint', 'bg-mint'];
+    const tones = ['bg-danger', 'bg-danger', 'bg-warning', 'bg-fg', 'bg-success', 'bg-success'];
     return { score, label: labels[score], tone: tones[score] };
   });
 
@@ -104,7 +104,7 @@
         <Avatar name={displayName} src={userState.avatarUrl} size={72} />
         <div class="min-w-0 flex-1">
           <div class="flex flex-wrap items-center gap-2">
-            <h3 class="font-head text-xl text-ink">{displayName}</h3>
+            <h3 class="text-lg font-semibold tracking-tight text-fg">{displayName}</h3>
             {#if userState.isAdmin}<Badge tone="cyan" uppercase>admin</Badge>{/if}
             {#if userState.emailVerified}
               <Badge tone="mint" icon="check">Verified</Badge>
@@ -121,15 +121,15 @@
       </div>
 
       <dl class="mt-6 grid grid-cols-1 gap-3 sm:grid-cols-2">
-        <div class="rounded-md border-2 border-ink bg-surface-2 px-4 py-3 shadow-xs">
-          <dt class="font-head text-[10px] uppercase tracking-[0.1em] text-muted">User ID</dt>
+        <div class="rounded-md border border-border bg-bg-deep px-4 py-3">
+          <dt class="text-xs text-muted">User ID</dt>
           <dd class="mt-1 flex items-center justify-between gap-2">
             <code class="truncate font-mono text-[12.5px] text-muted" title={userState.id}>{truncateMiddle(userState.id, 10)}</code>
             <CopyButton text={userState.id} label="Copy user ID" />
           </dd>
         </div>
-        <div class="rounded-md border-2 border-ink bg-surface-2 px-4 py-3 shadow-xs">
-          <dt class="font-head text-[10px] uppercase tracking-[0.1em] text-muted">Role</dt>
+        <div class="rounded-md border border-border bg-bg-deep px-4 py-3">
+          <dt class="text-xs text-muted">Role</dt>
           <dd class="mt-1 text-sm font-medium text-fg">{userState.isAdmin ? 'Administrator' : 'Member'}</dd>
         </div>
       </dl>
@@ -153,7 +153,7 @@
               <div class="flex items-center gap-3 px-0.5">
                 <div class="flex flex-1 gap-1" aria-hidden="true">
                   {#each Array(5) as _, i (i)}
-                    <span class="h-2 flex-1 rounded-sm border-2 border-ink transition-colors duration-300 {i < strength.score ? strength.tone : 'bg-surface-2'}"></span>
+                    <span class="h-1 flex-1 rounded-full transition-colors duration-200 {i < strength.score ? strength.tone : 'bg-surface-3'}"></span>
                   {/each}
                 </div>
                 <span class="w-16 text-right text-[11.5px] font-medium text-muted">{strength.label}</span>
@@ -162,7 +162,7 @@
           </div>
           <Field label="Confirm new password" type="password" icon="check" bind:value={confirmPassword} required autocomplete="new-password" error={mismatch ? 'Passwords do not match' : undefined} />
           <div>
-            <Button type="submit" variant="mint" {loading} disabled={mismatch || !currentPassword || !newPassword}>Update password</Button>
+            <Button type="submit" {loading} disabled={mismatch || !currentPassword || !newPassword}>Update password</Button>
           </div>
         </form>
       {/if}
@@ -175,11 +175,11 @@
       {#if subscription?.plan_name}
         <div class="flex items-start justify-between gap-3">
           <div>
-            <p class="font-head text-xl text-ink">{subscription.plan_name}</p>
+            <p class="text-lg font-semibold tracking-tight text-fg">{subscription.plan_name}</p>
             {#if subscription.plan_description}<p class="mt-0.5 text-[13px] text-muted">{subscription.plan_description}</p>{/if}
           </div>
           <div class="text-right">
-            <p class="font-head text-xl text-ink">
+            <p class="text-lg font-semibold tracking-tight text-fg">
               {subscription.price === 0 || subscription.price == null ? 'Free' : `${subscription.currency ?? ''} ${subscription.price.toFixed(2)}`}
             </p>
             {#if subscription.price && subscription.price > 0}<p class="text-[11.5px] text-dim">{formatBilling(subscription.billing_period)}</p>{/if}
@@ -192,17 +192,17 @@
               <span class="text-muted">Devices</span>
               <span class="font-mono text-fg">{deviceUsage.used}<span class="text-dim"> / {deviceUsage.max ?? '∞'}</span></span>
             </div>
-            <div class="h-3 overflow-hidden rounded-sm border-2 border-ink bg-surface-2">
-              <div class="h-full bg-mint transition-[width] duration-700 ease-[var(--ease-out-expo)]" style="width: {deviceUsage.max ? deviceUsage.pct : 12}%;"></div>
+            <div class="h-1.5 overflow-hidden rounded-full bg-surface-3">
+              <div class="h-full rounded-full bg-ink transition-[width] duration-500 ease-[var(--ease-out-expo)]" style="width: {deviceUsage.max ? deviceUsage.pct : 12}%;"></div>
             </div>
           </div>
           <dl class="grid grid-cols-2 gap-3 text-[13px]">
-            <div class="rounded-md border-2 border-ink bg-surface-2 px-3 py-2.5 shadow-xs">
-              <dt class="font-head text-[10px] uppercase tracking-[0.1em] text-muted">History limit</dt>
+            <div class="rounded-md border border-border bg-bg-deep px-3 py-2.5">
+              <dt class="text-xs text-muted">History limit</dt>
               <dd class="mt-0.5 font-medium text-fg">{subscription.max_clipboard_history ?? 'Unlimited'}</dd>
             </div>
-            <div class="rounded-md border-2 border-ink bg-surface-2 px-3 py-2.5 shadow-xs">
-              <dt class="font-head text-[10px] uppercase tracking-[0.1em] text-muted">File types</dt>
+            <div class="rounded-md border border-border bg-bg-deep px-3 py-2.5">
+              <dt class="text-xs text-muted">File types</dt>
               <dd class="mt-0.5 truncate font-medium text-fg" title={subscription.allowed_file_types.join(', ')}>
                 {subscription.allowed_file_types.length > 0 ? subscription.allowed_file_types.join(', ') : 'All'}
               </dd>
@@ -215,11 +215,11 @@
     </Card>
 
     <!-- Encryption facts -->
-    <div class="panel p-5" style="--panel-shadow: var(--color-accent);">
+    <div class="rounded-lg border border-border bg-surface p-5">
       <div class="flex items-start gap-3">
-        <span class="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border-2 border-ink bg-accent text-ink shadow-xs"><Icon name="shield-check" size={17} strokeWidth={2.4} /></span>
+        <span class="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-border bg-surface-2 text-fg"><Icon name="shield-check" size={17} /></span>
         <div>
-          <p class="font-head text-[15px] text-ink">Your keys never leave your devices</p>
+          <p class="text-sm font-medium text-fg">Your keys never leave your devices</p>
           <p class="mt-1 text-[13px] leading-relaxed text-muted">
             Passwords only protect this dashboard. Clipboard content is sealed on-device with AES-256-GCM and pairing keys exchanged over ECDH — resetting a password never exposes a clip.
           </p>

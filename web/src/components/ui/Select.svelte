@@ -21,9 +21,9 @@
 
 <div class="flex flex-col gap-1.5 {className}">
   {#if label}
-    <label for={selectId} class="flex items-center gap-1 font-head text-[12px] uppercase tracking-[0.06em] text-ink">
+    <label for={selectId} class="flex items-center gap-1 text-[13px] font-medium text-fg">
       {label}
-      {#if required}<span class="text-accent" aria-hidden="true">*</span>{/if}
+      {#if required}<span class="text-dim" aria-hidden="true">*</span>{/if}
     </label>
   {/if}
   <div class="relative">
@@ -31,14 +31,14 @@
       id={selectId}
       bind:value
       {required}
-      class="h-11 w-full cursor-pointer appearance-none rounded-md border-2 border-ink bg-surface pl-3.5 pr-10 text-sm text-ink shadow-xs outline-none transition-[box-shadow,transform,background-color] duration-150 focus:-translate-x-px focus:-translate-y-px focus:bg-cream focus:shadow-md disabled:cursor-not-allowed disabled:opacity-60 {selectClass}"
+      class="h-10 w-full cursor-pointer appearance-none rounded-md border border-border bg-surface pl-3 pr-9 text-sm text-fg shadow-xs outline-none transition-[border-color,box-shadow] duration-150 hover:border-border-strong focus:border-ink focus:shadow-[0_0_0_3px_rgba(10,10,10,0.08)] disabled:cursor-not-allowed disabled:opacity-60 {selectClass}"
       {...rest}
     >
       {@render children()}
     </select>
-    <span class="pointer-events-none absolute inset-y-0 right-0 flex w-10 items-center justify-center border-l-2 border-ink bg-yellow text-ink">
-      <Icon name="chevrons-up-down" size={14} strokeWidth={2.5} />
+    <span class="pointer-events-none absolute inset-y-0 right-3 flex items-center text-dim">
+      <Icon name="chevrons-up-down" size={14} />
     </span>
   </div>
-  {#if hint}<p class="text-[12px] text-dim">{hint}</p>{/if}
+  {#if hint}<p class="text-xs text-dim">{hint}</p>{/if}
 </div>

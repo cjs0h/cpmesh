@@ -9,20 +9,19 @@
   const route = $derived(routeFor(router.location));
 </script>
 
-<div class="flex h-dvh overflow-hidden bg-bg">
+<div class="flex h-dvh overflow-hidden bg-bg-deep">
   <Sidebar />
 
-  <div class="relative flex min-w-0 flex-1 flex-col">
-    <div class="dot-grid pointer-events-none absolute inset-0 opacity-40 [mask-image:linear-gradient(180deg,black,transparent_70%)]"></div>
+  <div class="flex min-w-0 flex-1 flex-col">
     <Header />
-    <main class="relative flex-1 overflow-y-auto">
-      <!-- Fluid container: comfortable on laptops, fills 4K monitors without ballooning -->
-      <div class="mx-auto w-full max-w-[1200px] px-4 py-6 sm:px-6 lg:px-8 lg:py-8 2xl:max-w-[1500px] 2xl:px-12 3xl:max-w-[1700px]">
+    <main class="flex-1 overflow-y-auto">
+      <!-- Fluid container so large monitors are used without stretching line lengths -->
+      <div class="mx-auto w-full max-w-[1200px] px-4 py-6 sm:px-6 lg:px-8 lg:py-8 2xl:max-w-[1440px] 3xl:max-w-[1600px]">
         {#key router.location}
-          <div class="animate-[fade-up_0.35s_var(--ease-out-expo)]">
+          <div>
             {#if route && !route.hideTitle}
               <div class="mb-6">
-                <h1 class="font-head text-2xl text-ink sm:text-[30px]">{route.label}</h1>
+                <h1 class="text-xl font-semibold tracking-tight text-fg">{route.label}</h1>
                 <p class="mt-1 text-sm text-muted">{route.description}</p>
               </div>
             {/if}

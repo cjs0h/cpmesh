@@ -70,7 +70,7 @@
   <div class="flex flex-wrap items-center gap-2">
     <button
       type="button"
-      class="rounded-md border-2 border-ink px-3 py-1.5 font-head text-[11px] uppercase tracking-[0.06em] shadow-xs transition-[background-color,transform,box-shadow] hover:-translate-x-px hover:-translate-y-px hover:shadow-sm {filter === 'all' ? 'bg-yellow text-ink' : 'bg-surface text-muted hover:text-ink'}"
+      class="h-8 rounded-md border px-3 text-[13px] font-medium transition-colors duration-150 {filter === 'all' ? 'border-ink bg-ink text-white' : 'border-border bg-surface text-muted hover:border-border-strong hover:text-fg'}"
       onclick={() => (filter = 'all')}
     >
       All <span class="ml-1 opacity-60">{clipboardState.entries.length}</span>
@@ -78,7 +78,7 @@
     {#each types as [label, count] (label)}
       <button
         type="button"
-        class="rounded-md border-2 border-ink px-3 py-1.5 font-head text-[11px] uppercase tracking-[0.06em] shadow-xs transition-[background-color,transform,box-shadow] hover:-translate-x-px hover:-translate-y-px hover:shadow-sm {filter === label ? 'bg-yellow text-ink' : 'bg-surface text-muted hover:text-ink'}"
+        class="h-8 rounded-md border px-3 text-[13px] font-medium transition-colors duration-150 {filter === label ? 'border-ink bg-ink text-white' : 'border-border bg-surface text-muted hover:border-border-strong hover:text-fg'}"
         onclick={() => (filter = filter === label ? 'all' : label)}
       >
         {label} <span class="ml-1 opacity-60">{count}</span>
@@ -88,12 +88,12 @@
 
   <div class="flex items-center gap-2">
     <div class="relative">
-      <span class="pointer-events-none absolute inset-y-0 left-3 flex items-center text-ink/60"><Icon name="search" size={14} strokeWidth={2.5} /></span>
+      <span class="pointer-events-none absolute inset-y-0 left-3 flex items-center text-dim"><Icon name="search" size={14} /></span>
       <input
         type="search"
         bind:value={query}
         placeholder="Filter by device…"
-        class="h-10 w-full rounded-md border-2 border-ink bg-surface pl-9 pr-3 text-[13px] text-ink shadow-xs outline-none transition-[box-shadow,transform] placeholder:text-dim focus:-translate-x-px focus:-translate-y-px focus:shadow-md sm:w-56"
+        class="h-9 w-full rounded-md border border-border bg-surface pl-9 pr-3 text-[13px] text-fg shadow-xs outline-none transition-[border-color,box-shadow] duration-150 placeholder:text-dim hover:border-border-strong focus:border-ink focus:shadow-[0_0_0_3px_rgba(10,10,10,0.08)] sm:w-56"
       />
     </div>
     {#if clipboardState.entries.length > 0}
@@ -142,7 +142,7 @@
         <tbody>
           {#each visible as entry (entry.id)}
             {@const meta = contentTypeMeta(entry.content_type)}
-            <tr class="animate-[fade-up_0.3s_var(--ease-out-expo)]">
+            <tr>
               <td>
                 <div class="flex items-center gap-3">
                   <IconTile icon={meta.icon} tone={meta.tone} size={32} />
@@ -170,7 +170,7 @@
     </div>
 
     <!-- Footer -->
-    <div class="flex flex-col gap-3 border-t-2 border-ink bg-surface-2/60 px-5 py-3 sm:flex-row sm:items-center sm:justify-between">
+    <div class="flex flex-col gap-3 border-t border-border bg-bg-deep px-5 py-3 sm:flex-row sm:items-center sm:justify-between">
       <div class="flex items-center gap-3 text-[12.5px] text-dim">
         <span>{visible.length} of {clipboardState.entries.length} on this page</span>
         <span aria-hidden="true">·</span>

@@ -100,12 +100,12 @@
     <Badge tone="cyan" icon="shield">{adminCount} admin{adminCount === 1 ? '' : 's'}</Badge>
   </div>
   <div class="relative">
-    <span class="pointer-events-none absolute inset-y-0 left-3 flex items-center text-ink/60"><Icon name="search" size={14} strokeWidth={2.5} /></span>
+    <span class="pointer-events-none absolute inset-y-0 left-3 flex items-center text-dim"><Icon name="search" size={14} /></span>
     <input
       type="search"
       bind:value={query}
       placeholder="Search name, email, plan…"
-      class="h-10 w-full rounded-md border-2 border-ink bg-surface pl-9 pr-3 text-[13px] text-ink shadow-xs outline-none transition-[box-shadow,transform] placeholder:text-dim focus:-translate-x-px focus:-translate-y-px focus:shadow-md sm:w-72"
+      class="h-9 w-full rounded-md border border-border bg-surface pl-9 pr-3 text-[13px] text-fg shadow-xs outline-none transition-[border-color,box-shadow] duration-150 placeholder:text-dim hover:border-border-strong focus:border-ink focus:shadow-[0_0_0_3px_rgba(10,10,10,0.08)] sm:w-72"
     />
   </div>
 </div>
@@ -156,7 +156,7 @@
                       <Badge tone="mint" icon="check" title="Email verified">Verified</Badge>
                     {:else}
                       <button type="button" class="inline-flex" title="Click to verify manually" onclick={() => handleVerifyEmail(user)}>
-                        <Badge tone="gold" icon="alert-circle" class="cursor-pointer transition-colors hover:bg-gold/20">Unverified</Badge>
+                        <Badge tone="gold" icon="alert-circle" class="cursor-pointer transition-colors hover:bg-amber-100">Unverified</Badge>
                       </button>
                     {/if}
                   {/if}
@@ -169,12 +169,12 @@
               <td>
                 <button
                   type="button"
-                  class="group inline-flex items-center gap-1.5 rounded-md border-2 border-ink bg-surface py-1 pl-2.5 pr-2 text-[12.5px] font-semibold text-ink shadow-xs transition-[background-color,transform,box-shadow] hover:-translate-x-px hover:-translate-y-px hover:bg-yellow hover:shadow-sm"
+                  class="group inline-flex items-center gap-1.5 rounded-md border border-border bg-surface py-1 pl-2.5 pr-2 text-[12.5px] font-medium text-fg transition-colors duration-150 hover:border-border-strong hover:bg-bg-deep"
                   onclick={() => openPlanDialog(user)}
                   title="Change plan"
                 >
                   {user.subscription_plan_name ?? 'No plan'}
-                  <Icon name="edit" size={11} class="text-ink/60 transition-colors group-hover:text-ink" strokeWidth={2.5} />
+                  <Icon name="edit" size={11} class="text-dim transition-colors group-hover:text-fg" />
                 </button>
               </td>
               <td class="text-right font-mono text-muted">{user.device_count}</td>

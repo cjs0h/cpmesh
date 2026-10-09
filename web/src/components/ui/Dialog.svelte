@@ -2,10 +2,7 @@
   import type { Snippet } from 'svelte';
   import Icon from '../Icon.svelte';
 
-  /**
-   * Modal dialog built on the native <dialog> element: focus trapping, Escape
-   * handling and the top layer all come for free.
-   */
+  /** Modal dialog on the native <dialog> element (focus trap, Escape, top layer for free). */
   interface Props {
     open?: boolean;
     title: string;
@@ -34,7 +31,6 @@
   }
 
   function onBackdropClick(e: MouseEvent) {
-    // Clicks on the <dialog> itself (not its children) land on the backdrop.
     if (e.target === dialog) handleClose();
   }
 
@@ -43,26 +39,21 @@
 
 <dialog
   bind:this={dialog}
-  class="m-auto w-[calc(100%-2rem)] {widths[size]} rounded-lg border-2 border-ink bg-surface p-0 text-ink shadow-xl backdrop:bg-[rgba(17,17,17,0.55)] open:animate-[scale-in_0.25s_var(--ease-out-expo)]"
+  class="m-auto w-[calc(100%-2rem)] {widths[size]} rounded-xl border border-border bg-surface p-0 text-fg shadow-pop backdrop:bg-black/30 backdrop:backdrop-blur-[2px] open:animate-[fade-in_0.15s_ease-out]"
   aria-labelledby="dialog-title-{uid}"
   aria-describedby={description ? `dialog-desc-${uid}` : undefined}
   onclose={handleClose}
   onclick={onBackdropClick}
 >
-  <div class="flex items-start justify-between gap-4 border-b-2 border-ink bg-yellow px-6 py-4">
+  <div class="flex items-start justify-between gap-4 border-b border-border px-6 py-4">
     <div class="min-w-0">
-      <h2 id="dialog-title-{uid}" class="font-head text-lg text-ink">{title}</h2>
+      <h2 id="dialog-title-{uid}" class="text-base font-semibold text-fg">{title}</h2>
       {#if description}
-        <p id="dialog-desc-{uid}" class="mt-0.5 text-[13px] text-ink/75">{description}</p>
+        <p id="dialog-desc-{uid}" class="mt-0.5 text-[13px] text-muted">{description}</p>
       {/if}
     </div>
-    <button
-      type="button"
-      class="-mr-2 flex h-9 w-9 shrink-0 items-center justify-center rounded-md border-2 border-ink bg-surface text-ink shadow-xs transition-[transform,box-shadow] hover:-translate-x-px hover:-translate-y-px hover:shadow-sm active:translate-x-px active:translate-y-px active:shadow-none"
-      aria-label="Close dialog"
-      onclick={handleClose}
-    >
-      <Icon name="x" size={16} strokeWidth={2.5} />
+    <button type="button" class="-mr-2 -mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-dim transition-colors hover:bg-surface-2 hover:text-fg" aria-label="Close dialog" onclick={handleClose}>
+      <Icon name="x" size={16} />
     </button>
   </div>
 
@@ -71,7 +62,7 @@
   </div>
 
   {#if footer}
-    <div class="flex flex-wrap items-center justify-end gap-2 border-t-2 border-ink bg-surface-2 px-6 py-4">
+    <div class="flex flex-wrap items-center justify-end gap-2 border-t border-border bg-bg-deep px-6 py-4">
       {@render footer()}
     </div>
   {/if}

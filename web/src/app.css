@@ -1,102 +1,67 @@
-@import '@fontsource/archivo-black/400.css';
-@import '@fontsource/space-grotesk/400.css';
-@import '@fontsource/space-grotesk/500.css';
-@import '@fontsource/space-grotesk/600.css';
-@import '@fontsource/space-grotesk/700.css';
-@import '@fontsource/jetbrains-mono/400.css';
-@import '@fontsource/jetbrains-mono/500.css';
+@import '@fontsource-variable/geist';
+@import '@fontsource-variable/geist-mono';
 @import 'tailwindcss';
 
 /*
- * cpmesh design tokens — RetroUI / neo-brutalist edition.
+ * cpmesh design tokens — minimal monochrome.
  *
- * Cream paper background, ink-black 2px borders, hard offset shadows and a
- * handful of flat, saturated fills (yellow primary, coral brand accent, mint,
- * cyan, violet, rose). Shadow tokens follow RetroUI's scale so `shadow-sm`,
- * `shadow-md`, `shadow-lg` are hard offsets rather than blurs.
+ * White surfaces, hairline neutral borders, near-black type set in Geist, and
+ * one accent used sparingly for live indicators and emphasis. Semantic status
+ * colours are muted tints so they never compete with the content.
  */
 @theme {
-  /* Paper */
-  --color-bg: #f6efe0;
-  --color-bg-deep: #ede3cc;
-  --color-surface: #fffaf0;
-  --color-surface-2: #f3eadb;
-  --color-surface-3: #e8dcc4;
+  /* Surfaces */
+  --color-bg: #ffffff;
+  --color-bg-deep: #fafafa;
+  --color-surface: #ffffff;
+  --color-surface-2: #f5f5f5;
+  --color-surface-3: #ebebeb;
 
-  /* Ink */
-  --color-ink: #111111;
-  --color-border: #111111;
-  --color-border-strong: #111111;
-  --color-fg: #111111;
-  --color-muted: #4b463a;
-  --color-dim: #7a7461;
+  /* Lines */
+  --color-border: #e5e5e5;
+  --color-border-strong: #d4d4d4;
 
-  /* Fills */
-  --color-yellow: #ffd93d;
-  --color-yellow-hover: #ffcc00;
-  --color-accent: #ff7a59;
-  --color-accent-hover: #ff6440;
-  --color-accent-deep: #d95a3a;
-  --color-cyan: #5ad1f0;
-  --color-mint: #3ddc97;
-  --color-gold: #ffd93d;
-  --color-rose: #ff5c5c;
-  --color-violet: #b39dff;
-  --color-cream: #fffaf0;
+  /* Type */
+  --color-ink: #0a0a0a;
+  --color-fg: #171717;
+  --color-muted: #666666;
+  --color-dim: #8f8f8f;
+
+  /* Accent (single) */
+  --color-accent: #ff5c38;
+  --color-accent-hover: #e94a27;
+
+  /* Semantic (muted) */
+  --color-success: #16a34a;
+  --color-warning: #d97706;
+  --color-danger: #dc2626;
 
   /* Fonts */
-  --font-sans: 'Space Grotesk', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
-  --font-head: 'Archivo Black', 'Space Grotesk', ui-sans-serif, system-ui, sans-serif;
-  --font-display: 'Archivo Black', 'Space Grotesk', ui-sans-serif, system-ui, sans-serif;
-  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --font-sans: 'Geist Variable', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'Geist Mono Variable', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 
-  /* Hard shadows (RetroUI scale) */
-  --shadow-xs: 1px 1px 0 0 var(--color-ink);
-  --shadow-sm: 2px 2px 0 0 var(--color-ink);
-  --shadow: 3px 3px 0 0 var(--color-ink);
-  --shadow-md: 4px 4px 0 0 var(--color-ink);
-  --shadow-lg: 6px 6px 0 0 var(--color-ink);
-  --shadow-xl: 10px 10px 0 1px var(--color-ink);
-  --shadow-2xl: 16px 16px 0 1px var(--color-ink);
-  --shadow-card: 4px 4px 0 0 var(--color-ink);
-  --shadow-pop: 8px 8px 0 0 var(--color-ink);
-  --shadow-glow: 4px 4px 0 0 var(--color-ink);
-  --shadow-glow-cyan: 4px 4px 0 0 var(--color-cyan);
-  --shadow-glow-mint: 4px 4px 0 0 var(--color-mint);
-  --shadow-accent: 4px 4px 0 0 var(--color-accent);
-  --shadow-yellow: 4px 4px 0 0 var(--color-yellow);
-  --shadow-none: 0 0 #0000;
+  /* Elevation — hairlines carry the hierarchy; shadows stay faint */
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.06), 0 1px 2px rgba(0, 0, 0, 0.04);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.06), 0 1px 3px rgba(0, 0, 0, 0.04);
+  --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.08), 0 2px 6px rgba(0, 0, 0, 0.04);
+  --shadow-pop: 0 24px 48px -12px rgba(0, 0, 0, 0.18), 0 0 0 1px rgba(0, 0, 0, 0.04);
 
-  /* Radii — brutalism keeps corners tight */
+  /* Radii */
   --radius-sm: 4px;
   --radius-md: 6px;
   --radius-lg: 8px;
   --radius-xl: 12px;
   --radius-2xl: 16px;
 
-  /* Motion */
   --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
-  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
-
   --breakpoint-3xl: 1920px;
-
-  /* MagicUI animation utilities */
-  --animate-marquee: marquee var(--duration, 40s) linear infinite;
-  --animate-marquee-vertical: marquee-vertical var(--duration, 40s) linear infinite;
-  --animate-orbit: orbit calc(var(--duration, 20) * 1s) linear infinite;
-  --animate-meteor: meteor var(--meteor-duration, 5s) linear infinite;
-  --animate-shiny-text: shiny-text 8s infinite;
-  --animate-retro-grid: retro-grid 15s linear infinite;
-  --animate-border-beam: border-beam var(--beam-duration, 6s) linear infinite;
-  --animate-blur-in: blur-in 0.7s var(--ease-out-expo) both;
-  --animate-wiggle: wiggle 2.4s ease-in-out infinite;
 }
 
 /* ───────────────────────── Base ───────────────────────── */
 
 @layer base {
   html {
-    scroll-behavior: smooth;
     color-scheme: light;
     scrollbar-gutter: stable;
   }
@@ -109,24 +74,12 @@
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     text-rendering: optimizeLegibility;
-    overflow-x: hidden;
+    font-feature-settings: 'cv11', 'ss01';
   }
 
   ::selection {
-    background: var(--color-yellow);
-    color: var(--color-ink);
-  }
-
-  ::-webkit-scrollbar {
-    width: 10px;
-    height: 10px;
-  }
-  ::-webkit-scrollbar-track {
-    background: var(--color-bg-deep);
-  }
-  ::-webkit-scrollbar-thumb {
-    background: var(--color-ink);
-    border: 2px solid var(--color-bg-deep);
+    background: #171717;
+    color: #ffffff;
   }
 
   a {
@@ -150,7 +103,7 @@
   }
 
   :focus-visible {
-    outline: 3px solid var(--color-ink);
+    outline: 2px solid var(--color-ink);
     outline-offset: 2px;
   }
 
@@ -158,86 +111,22 @@
   kbd,
   pre {
     font-family: var(--font-mono);
+    font-feature-settings: normal;
   }
 
   h1,
   h2,
   h3,
   h4 {
-    font-family: var(--font-head);
-    font-weight: 400;
-    letter-spacing: -0.01em;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    text-wrap: balance;
   }
 }
 
 /* ───────────────────────── Components ───────────────────────── */
 
 @layer components {
-  /* Scroll-reveal (pairs with the `reveal` action). `data-reveal-blur` adds a MagicUI BlurFade. */
-  [data-reveal] {
-    opacity: 0;
-    transform: translate3d(0, 18px, 0);
-    transition:
-      opacity 0.7s var(--ease-out-expo),
-      transform 0.7s var(--ease-out-expo),
-      filter 0.7s var(--ease-out-expo);
-    transition-delay: var(--reveal-delay, 0ms);
-    will-change: opacity, transform;
-  }
-  [data-reveal][data-reveal-blur] {
-    filter: blur(8px);
-  }
-  [data-reveal='in'],
-  [data-reveal='in'][data-reveal-blur] {
-    opacity: 1;
-    transform: none;
-    filter: none;
-  }
-
-  /* Neo-brutalist panel: ink border + hard shadow (colour via --panel-shadow) */
-  .panel {
-    background: var(--color-surface);
-    border: 2px solid var(--color-ink);
-    border-radius: var(--radius-md);
-    box-shadow: 4px 4px 0 0 var(--panel-shadow, var(--color-ink));
-  }
-  .panel-lg {
-    box-shadow: 8px 8px 0 0 var(--panel-shadow, var(--color-ink));
-  }
-  .panel-hover {
-    transition:
-      transform 0.2s ease,
-      box-shadow 0.2s ease;
-  }
-  .panel-hover:hover {
-    transform: translate(-2px, -2px);
-    box-shadow: 6px 6px 0 0 var(--panel-shadow, var(--color-ink));
-  }
-
-  /* Ink panel (black card with cream text) */
-  .panel-ink {
-    background: var(--color-ink);
-    color: var(--color-cream);
-    border: 2px solid var(--color-ink);
-    border-radius: var(--radius-md);
-    box-shadow: 4px 4px 0 0 var(--panel-shadow, var(--color-yellow));
-  }
-
-  /* Backdrops */
-  .dot-grid {
-    background-image: radial-gradient(rgba(17, 17, 17, 0.22) 1.2px, transparent 1.2px);
-    background-size: 22px 22px;
-  }
-  .grid-paper {
-    background-image:
-      linear-gradient(rgba(17, 17, 17, 0.08) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(17, 17, 17, 0.08) 1px, transparent 1px);
-    background-size: 40px 40px;
-  }
-  .stripes {
-    background-image: repeating-linear-gradient(135deg, rgba(17, 17, 17, 0.08) 0 2px, transparent 2px 10px);
-  }
-
   /* Data tables */
   .tbl {
     width: 100%;
@@ -246,119 +135,69 @@
   }
   .tbl th {
     text-align: left;
-    padding: 0.7rem 1rem;
-    font-family: var(--font-head);
-    font-size: 0.6875rem;
-    font-weight: 400;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--color-ink);
-    background: var(--color-surface-2);
-    border-bottom: 2px solid var(--color-ink);
+    padding: 0.625rem 1rem;
+    font-size: 0.75rem;
+    font-weight: 500;
+    color: var(--color-muted);
+    border-bottom: 1px solid var(--color-border);
+    background: var(--color-bg-deep);
     white-space: nowrap;
   }
   .tbl td {
-    padding: 0.8rem 1rem;
-    border-bottom: 2px solid rgba(17, 17, 17, 0.12);
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid var(--color-border);
     vertical-align: middle;
   }
   .tbl tbody tr:last-child td {
     border-bottom: 0;
   }
-  .tbl tbody tr {
-    transition: background-color 0.15s ease;
-  }
   .tbl tbody tr:hover {
-    background: var(--color-surface-2);
+    background: var(--color-bg-deep);
   }
 
   /* Monospace chip for ids / hashes */
   .mono-chip {
     font-family: var(--font-mono);
-    font-size: 0.6875rem;
+    font-size: 0.75rem;
     color: var(--color-muted);
     background: var(--color-surface-2);
-    border: 1.5px solid var(--color-ink);
+    border: 1px solid var(--color-border);
     border-radius: var(--radius-sm);
-    padding: 0.15rem 0.45rem;
+    padding: 0.125rem 0.4rem;
   }
 
-  /* Headline treatments */
-  .text-gradient {
-    color: var(--color-accent);
-    text-shadow: 3px 3px 0 var(--color-ink);
-  }
-  .text-gradient-mint {
-    color: var(--color-mint);
-    text-shadow: 3px 3px 0 var(--color-ink);
-  }
-  .text-outline {
-    color: transparent;
-    -webkit-text-stroke: 2px var(--color-ink);
-  }
-
-  /* Primary CTA fill (kept for backwards compatibility with earlier markup) */
-  .btn-sunset {
-    background: var(--color-yellow);
-    color: var(--color-ink);
-  }
-
-  /* Status dot with halo */
+  /* Status dot; `data-live` adds a soft pulse */
   .status-dot {
     position: relative;
     display: inline-block;
-    width: 9px;
-    height: 9px;
+    width: 7px;
+    height: 7px;
     border-radius: 999px;
     background: currentColor;
-    box-shadow: 0 0 0 1.5px var(--color-ink);
   }
   .status-dot[data-live='true']::after {
     content: '';
     position: absolute;
-    inset: -4px;
+    inset: -3px;
     border-radius: inherit;
-    border: 2px solid currentColor;
-    opacity: 0.7;
-    animation: ping-ring 1.8s var(--ease-out-expo) infinite;
+    border: 1.5px solid currentColor;
+    opacity: 0.5;
+    animation: ping-ring 2s var(--ease-out-expo) infinite;
   }
 
-  /* MagicUI Animated Shiny Text */
-  .shiny-text {
-    --shiny-width: 100px;
-    background-image: linear-gradient(90deg, transparent, rgba(17, 17, 17, 0.9) 50%, transparent);
-    background-size: var(--shiny-width) 100%;
-    background-position: 0 0;
-    background-repeat: no-repeat;
-    -webkit-background-clip: text;
-    background-clip: text;
-    animation: shiny-text 8s infinite;
+  /* Hairline grid used for feature/stat cells: borders only between cells */
+  .cell-grid {
+    display: grid;
+    border-top: 1px solid var(--color-border);
+    border-left: 1px solid var(--color-border);
   }
-
-  /* Sheen sweep used by Button `shine` */
-  .btn-shine::after {
-    content: '';
-    position: absolute;
-    inset: 0;
-    background: linear-gradient(115deg, transparent 30%, rgba(255, 255, 255, 0.55) 50%, transparent 70%);
-    background-size: 250% 100%;
-    animation: shine-sweep 3.2s ease-in-out infinite;
-    pointer-events: none;
-    mix-blend-mode: soft-light;
-  }
-
-  /* Marker highlight behind a word (MagicUI Highlighter spirit, CSS only) */
-  .marker {
-    background-image: linear-gradient(transparent 55%, var(--marker-color, var(--color-yellow)) 55%, var(--marker-color, var(--color-yellow)) 92%, transparent 92%);
-    background-repeat: no-repeat;
-    background-size: 0% 100%;
-    animation: marker-draw 0.9s var(--ease-out-expo) 0.6s forwards;
-    padding: 0 0.1em;
-    margin: 0 -0.1em;
+  .cell-grid > * {
+    border-right: 1px solid var(--color-border);
+    border-bottom: 1px solid var(--color-border);
   }
 }
 
-/* ───────────────────────── Keyframes ───────────────────────── */
+/* ───────────────────────── Keyframes (kept to a minimum) ───────────────────────── */
 
 @keyframes spin {
   to {
@@ -368,53 +207,12 @@
 
 @keyframes ping-ring {
   0% {
-    transform: scale(0.6);
-    opacity: 0.8;
+    transform: scale(0.7);
+    opacity: 0.6;
   }
   100% {
-    transform: scale(1.8);
+    transform: scale(1.9);
     opacity: 0;
-  }
-}
-
-@keyframes drift {
-  0%,
-  100% {
-    transform: translate3d(0, 0, 0);
-  }
-  50% {
-    transform: translate3d(0, -1.25rem, 0);
-  }
-}
-
-@keyframes float-y {
-  0%,
-  100% {
-    transform: translateY(0);
-  }
-  50% {
-    transform: translateY(-10px);
-  }
-}
-
-@keyframes wiggle {
-  0%,
-  100% {
-    transform: rotate(-2deg);
-  }
-  50% {
-    transform: rotate(2deg);
-  }
-}
-
-@keyframes fade-up {
-  from {
-    opacity: 0;
-    transform: translate3d(0, 14px, 0);
-  }
-  to {
-    opacity: 1;
-    transform: none;
   }
 }
 
@@ -427,16 +225,20 @@
   }
 }
 
-@keyframes blur-in {
+@keyframes toast-in {
   from {
     opacity: 0;
-    filter: blur(10px);
-    transform: translate3d(0, 12px, 0);
+    transform: translateY(8px);
   }
   to {
     opacity: 1;
-    filter: blur(0);
     transform: none;
+  }
+}
+
+@keyframes dash-flow {
+  to {
+    stroke-dashoffset: -16;
   }
 }
 
@@ -449,150 +251,6 @@
   }
 }
 
-@keyframes blink {
-  0%,
-  100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0;
-  }
-}
-
-@keyframes marquee {
-  from {
-    transform: translateX(0);
-  }
-  to {
-    transform: translateX(calc(-100% - var(--gap, 1rem)));
-  }
-}
-
-@keyframes marquee-vertical {
-  from {
-    transform: translateY(0);
-  }
-  to {
-    transform: translateY(calc(-100% - var(--gap, 1rem)));
-  }
-}
-
-@keyframes orbit {
-  0% {
-    transform: rotate(calc(var(--angle) * 1deg)) translateY(calc(var(--radius) * 1px)) rotate(calc(var(--angle) * -1deg));
-  }
-  100% {
-    transform: rotate(calc(var(--angle) * 1deg + 360deg)) translateY(calc(var(--radius) * 1px)) rotate(calc((var(--angle) * -1deg) - 360deg));
-  }
-}
-
-@keyframes meteor {
-  0% {
-    transform: rotate(var(--angle)) translateX(0);
-    opacity: 1;
-  }
-  70% {
-    opacity: 1;
-  }
-  100% {
-    transform: rotate(var(--angle)) translateX(-500px);
-    opacity: 0;
-  }
-}
-
-@keyframes shiny-text {
-  0%,
-  90%,
-  100% {
-    background-position: calc(-100% - var(--shiny-width)) 0;
-  }
-  30%,
-  60% {
-    background-position: calc(100% + var(--shiny-width)) 0;
-  }
-}
-
-@keyframes retro-grid {
-  from {
-    transform: translateY(-50%);
-  }
-  to {
-    transform: translateY(0);
-  }
-}
-
-@keyframes border-beam {
-  to {
-    offset-distance: 100%;
-  }
-}
-
-@keyframes shine-sweep {
-  0% {
-    background-position: 200% 0;
-  }
-  60%,
-  100% {
-    background-position: -50% 0;
-  }
-}
-
-@keyframes marker-draw {
-  to {
-    background-size: 100% 100%;
-  }
-}
-
-@keyframes toast-in {
-  from {
-    opacity: 0;
-    transform: translate3d(0, 12px, 0) scale(0.98);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
-}
-
-@keyframes scale-in {
-  from {
-    opacity: 0;
-    transform: scale(0.96) translateY(6px);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
-}
-
-@keyframes dash-flow {
-  to {
-    stroke-dashoffset: -24;
-  }
-}
-
-@keyframes word-in {
-  from {
-    opacity: 0;
-    transform: translateY(60%) rotateX(-40deg);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
-}
-
-@keyframes word-out {
-  from {
-    opacity: 1;
-    transform: none;
-  }
-  to {
-    opacity: 0;
-    transform: translateY(-60%) rotateX(40deg);
-  }
-}
-
 /* ───────────────────────── Accessibility ───────────────────────── */
 
 @media (prefers-reduced-motion: reduce) {
@@ -602,14 +260,5 @@
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
-    scroll-behavior: auto !important;
-  }
-  [data-reveal] {
-    opacity: 1;
-    transform: none;
-    filter: none;
-  }
-  .marker {
-    background-size: 100% 100%;
   }
 }

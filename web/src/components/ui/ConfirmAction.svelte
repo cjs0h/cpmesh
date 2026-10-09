@@ -49,7 +49,7 @@
 
 {#if open}
   <span class="inline-flex items-center gap-2 animate-[fade-in_0.2s_ease-out] {className}">
-    <span class="text-[12px] font-medium text-gold">{prompt}</span>
+    <span class="text-[12px] font-medium text-warning">{prompt}</span>
     <Button variant="danger" size={size === 'icon-sm' ? 'xs' : size} loading={busy || loading} onclick={confirm}>{confirmLabel}</Button>
     <Button variant="ghost" size={size === 'icon-sm' ? 'xs' : size} disabled={busy} onclick={() => (open = false)}>Cancel</Button>
   </span>
@@ -60,7 +60,7 @@
     {icon}
     {disabled}
     {title}
-    class="{variant !== 'danger-soft' ? 'hover:border-rose/40 hover:text-rose' : ''} {className}"
+    class="{variant !== 'danger-soft' ? 'hover:border-red-200 hover:text-danger' : ''} {className}"
     aria-label={size === 'icon-sm' ? label : undefined}
     onclick={() => (open = true)}
   >

@@ -120,7 +120,7 @@
 {#if current.length > 0}
   <div class="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
     {#each current as rel (rel.id)}
-      <div class="panel flex items-center gap-3 px-3.5 py-3" style="--panel-shadow: var(--color-mint);">
+      <div class="flex items-center gap-3 rounded-lg border border-border bg-surface px-3.5 py-3">
         <IconTile icon={platformIcons[rel.platform] ?? 'package'} tone="mint" size={34} />
         <div class="min-w-0">
           <p class="truncate text-[12px] text-muted">{platformLabels[rel.platform] ?? titleCase(rel.platform)} · {rel.arch || 'any'}</p>
@@ -206,13 +206,13 @@
     </div>
     <Field label="Download URL" bind:value={formDownloadUrl} required icon="link" placeholder="/api/downloads/cpmesh-0.2.0-darwin-arm64.dmg" class="sm:col-span-2" />
     <div class="flex flex-col gap-1.5 sm:col-span-2">
-      <label for="release-notes" class="font-head text-[12px] uppercase tracking-[0.06em] text-ink">Release notes</label>
+      <label for="release-notes" class="text-[13px] font-medium text-fg">Release notes</label>
       <textarea
         id="release-notes"
         bind:value={formReleaseNotes}
         rows="4"
         placeholder="What's new in this version…"
-        class="w-full resize-y rounded-md border-2 border-ink bg-surface px-3.5 py-2.5 text-sm text-ink shadow-xs outline-none transition-[box-shadow,transform] placeholder:text-dim focus:-translate-x-px focus:-translate-y-px focus:bg-cream focus:shadow-md"
+        class="w-full resize-y rounded-md border border-border bg-surface px-3 py-2.5 text-sm text-fg shadow-xs outline-none transition-[border-color,box-shadow] duration-150 placeholder:text-dim hover:border-border-strong focus:border-ink focus:shadow-[0_0_0_3px_rgba(10,10,10,0.08)]"
       ></textarea>
     </div>
     <div class="sm:col-span-2">

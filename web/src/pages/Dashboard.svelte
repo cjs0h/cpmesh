@@ -47,8 +47,8 @@
 <!-- Greeting -->
 <div class="mb-6 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
   <div>
-    <p class="inline-block rounded-sm border-2 border-ink bg-yellow px-2 py-0.5 font-head text-[10.5px] uppercase tracking-[0.14em] text-ink shadow-xs">Overview</p>
-    <h1 class="mt-3 font-head text-2xl text-ink sm:text-[30px]">
+    <p class="text-xs font-medium text-muted">Overview</p>
+    <h1 class="mt-1 text-2xl font-semibold tracking-[-0.02em] text-fg">
       {greeting()}{firstName ? `, ${firstName}` : ''}
     </h1>
     <p class="mt-1 text-sm text-muted">
@@ -97,10 +97,10 @@
         <EmptyState icon="clipboard" title="Nothing copied yet" description="Copy something on any paired device and it will show up here within a second — encrypted end to end." compact />
       </div>
     {:else}
-      <ul class="divide-y-2 divide-ink/10">
+      <ul class="divide-y divide-border">
         {#each recent as entry (entry.id)}
           {@const meta = contentTypeMeta(entry.content_type)}
-          <li class="flex items-center gap-3.5 px-5 py-3 transition-colors hover:bg-surface-2 animate-[fade-up_0.35s_var(--ease-out-expo)]">
+          <li class="flex items-center gap-3.5 px-5 py-3 transition-colors hover:bg-bg-deep">
             <IconTile icon={meta.icon} tone={meta.tone} title={meta.label} />
             <div class="min-w-0 flex-1">
               <p class="truncate text-sm font-medium text-fg">{meta.label} from {entry.device_name || 'unknown device'}</p>
@@ -116,8 +116,8 @@
           </li>
         {/each}
       </ul>
-      <div class="border-t-2 border-ink/10 bg-surface-2/60 px-5 py-3 text-right">
-        <a href="#/clipboard" class="inline-flex items-center gap-1 font-head text-[11px] uppercase tracking-[0.08em] text-ink underline decoration-2 decoration-yellow underline-offset-4 hover:decoration-ink">
+      <div class="border-t border-border bg-bg-deep px-5 py-2.5 text-right">
+        <a href="#/clipboard" class="inline-flex items-center gap-1 text-[13px] font-medium text-muted transition-colors hover:text-fg">
           View full history <Icon name="arrow-right" size={13} />
         </a>
       </div>
@@ -138,10 +138,10 @@
           </EmptyState>
         </div>
       {:else}
-        <ul class="divide-y-2 divide-ink/10">
+        <ul class="divide-y divide-border">
           {#each devicesState.list.slice(0, 6) as device (device.id)}
             <li class="flex items-center gap-3 px-5 py-3">
-              <span class="flex h-8 w-8 items-center justify-center rounded border-2 border-ink text-ink shadow-xs {device.online ? 'bg-mint' : 'bg-surface-2'}"><Icon name="monitor" size={15} strokeWidth={2.4} /></span>
+              <span class="flex h-8 w-8 items-center justify-center rounded-md border border-border bg-surface-2 {device.online ? 'text-fg' : 'text-dim'}"><Icon name="monitor" size={15} /></span>
               <div class="min-w-0 flex-1">
                 <p class="truncate text-sm font-medium text-fg">{device.name}</p>
                 <p class="text-[12px] text-dim">
@@ -151,7 +151,7 @@
               {#if device.status === 'pending'}
                 <Badge tone="gold">Pending</Badge>
               {:else}
-                <span class="status-dot {device.online ? 'text-mint' : 'text-dim'}" data-live={device.online}></span>
+                <span class="status-dot {device.online ? 'text-green-600' : 'text-dim'}" data-live={device.online}></span>
               {/if}
             </li>
           {/each}
@@ -160,11 +160,11 @@
     </Card>
 
     <!-- Security note -->
-    <div class="panel p-5" style="--panel-shadow: var(--color-mint);">
+    <div class="rounded-lg border border-border bg-surface p-5">
       <div class="flex items-start gap-3">
-        <span class="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border-2 border-ink bg-mint text-ink shadow-xs"><Icon name="shield-check" size={17} strokeWidth={2.4} /></span>
+        <span class="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-border bg-surface-2 text-fg"><Icon name="shield-check" size={17} /></span>
         <div>
-          <p class="font-head text-[15px] text-ink">Zero-knowledge relay</p>
+          <p class="text-sm font-medium text-fg">Zero-knowledge relay</p>
           <p class="mt-1 text-[13px] leading-relaxed text-muted">
             This dashboard lists <em>what</em> was synced — never the contents. Clips are sealed with AES-256-GCM on your device, and only your paired devices hold the keys.
           </p>
@@ -176,9 +176,9 @@
           ['Key exchange', 'ECDH P-256'],
           ['Relay sees', 'Ciphertext'],
         ] as [k, v] (k)}
-          <div class="rounded-md border-2 border-ink bg-surface-2 px-2 py-2 shadow-xs">
-            <dt class="font-head text-[9.5px] uppercase tracking-[0.1em] text-muted">{k}</dt>
-            <dd class="mt-0.5 font-mono text-[11.5px] font-semibold text-ink">{v}</dd>
+          <div class="rounded-md border border-border bg-bg-deep px-2 py-2">
+            <dt class="text-[11px] text-muted">{k}</dt>
+            <dd class="mt-0.5 font-mono text-[11.5px] font-medium text-fg">{v}</dd>
           </div>
         {/each}
       </dl>

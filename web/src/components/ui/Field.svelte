@@ -6,13 +6,10 @@
     label?: string;
     hint?: string;
     error?: string;
-    /** Leading icon name. */
     icon?: string;
     type?: 'text' | 'email' | 'password' | 'tel' | 'url' | 'search' | 'number';
     value?: string | number | null;
-    /** Marks the label with an asterisk. */
     required?: boolean;
-    /** Appends "Optional" to the label. */
     optional?: boolean;
     class?: string;
     inputClass?: string;
@@ -42,21 +39,20 @@
 
 <div class="flex flex-col gap-1.5 {className}">
   {#if label}
-    <label for={inputId} class="flex items-center gap-1 font-head text-[12px] uppercase tracking-[0.06em] text-ink">
+    <label for={inputId} class="flex items-center gap-1 text-[13px] font-medium text-fg">
       {label}
-      {#if required}<span class="text-accent" aria-hidden="true">*</span>{/if}
-      {#if optional}<span class="ml-auto font-sans text-[11px] font-medium normal-case tracking-normal text-dim">Optional</span>{/if}
+      {#if required}<span class="text-dim" aria-hidden="true">*</span>{/if}
+      {#if optional}<span class="ml-auto text-xs font-normal text-dim">Optional</span>{/if}
     </label>
   {/if}
 
   <div class="relative">
     {#if icon}
-      <span class="pointer-events-none absolute inset-y-0 left-3 flex items-center text-ink/70">
-        <Icon name={icon} size={15} strokeWidth={2.4} />
+      <span class="pointer-events-none absolute inset-y-0 left-3 flex items-center text-dim">
+        <Icon name={icon} size={15} />
       </span>
     {/if}
 
-    <!-- RetroUI input: ink border, hard shadow that grows on focus -->
     <input
       id={inputId}
       type={effectiveType}
@@ -64,11 +60,11 @@
       {required}
       aria-invalid={error ? 'true' : undefined}
       aria-describedby={describedBy}
-      class="h-11 w-full rounded-md border-2 bg-surface text-sm text-ink shadow-xs outline-none transition-[box-shadow,transform,border-color,background-color] duration-150 placeholder:text-dim
-        focus:-translate-x-px focus:-translate-y-px focus:bg-cream focus:shadow-md
-        disabled:cursor-not-allowed disabled:opacity-60
-        {icon ? 'pl-9' : 'pl-3.5'} {type === 'password' ? 'pr-10' : 'pr-3.5'}
-        {error ? 'border-rose' : 'border-ink'}
+      class="h-10 w-full rounded-md border bg-surface text-sm text-fg shadow-xs outline-none transition-[border-color,box-shadow] duration-150 placeholder:text-dim
+        focus:border-ink focus:shadow-[0_0_0_3px_rgba(10,10,10,0.08)]
+        disabled:cursor-not-allowed disabled:bg-surface-2 disabled:opacity-70
+        {icon ? 'pl-9' : 'pl-3'} {type === 'password' ? 'pr-10' : 'pr-3'}
+        {error ? 'border-danger focus:border-danger focus:shadow-[0_0_0_3px_rgba(220,38,38,0.12)]' : 'border-border hover:border-border-strong'}
         {inputClass}"
       {...rest}
     />
@@ -76,23 +72,20 @@
     {#if type === 'password'}
       <button
         type="button"
-        class="absolute inset-y-0 right-0 flex w-10 items-center justify-center text-ink/60 transition-colors hover:text-ink"
+        class="absolute inset-y-0 right-0 flex w-10 items-center justify-center text-dim transition-colors hover:text-fg"
         aria-label={revealed ? 'Hide password' : 'Show password'}
         aria-pressed={revealed}
         tabindex="-1"
         onclick={() => (revealed = !revealed)}
       >
-        <Icon name={revealed ? 'eye-off' : 'eye'} size={16} strokeWidth={2.4} />
+        <Icon name={revealed ? 'eye-off' : 'eye'} size={15} />
       </button>
     {/if}
   </div>
 
   {#if error}
-    <p id="{inputId}-error" class="flex items-center gap-1 text-[12px] font-semibold text-[#c62828]" role="alert">
-      <Icon name="alert-circle" size={12} strokeWidth={2.5} />
-      {error}
-    </p>
+    <p id="{inputId}-error" class="text-xs text-danger" role="alert">{error}</p>
   {:else if hint}
-    <p id="{inputId}-hint" class="text-[12px] text-dim">{hint}</p>
+    <p id="{inputId}-hint" class="text-xs text-dim">{hint}</p>
   {/if}
 </div>

@@ -70,7 +70,7 @@
 
 {#snippet resultLine(r: Result)}
   {#if r}
-    <p class="mt-3 flex items-start gap-2 text-[12.5px] {r.ok ? 'text-mint' : 'text-rose'}">
+    <p class="mt-3 flex items-start gap-2 text-[12.5px] {r.ok ? 'text-success' : 'text-danger'}">
       <Icon name={r.ok ? 'check-circle' : 'alert-circle'} size={14} class="mt-0.5 shrink-0" />
       <span class="break-all">{r.message}</span>
     </p>
@@ -97,17 +97,17 @@
   </div>
 
   <Card title="Configuration" description="Everything is set through environment variables" icon="sliders" accent="gold" padded={false}>
-    <div class="divide-y-2 divide-ink/10">
+    <div class="divide-y divide-border">
       {#each envGroups as group (group.title)}
         <div class="px-5 py-4">
-          <p class="mb-2 flex items-center gap-2 text-[12px] font-semibold uppercase tracking-[0.1em] text-dim"><Icon name={group.icon} size={12} /> {group.title}</p>
+          <p class="mb-2 flex items-center gap-2 text-xs font-medium text-muted"><Icon name={group.icon} size={12} /> {group.title}</p>
           <div class="flex flex-wrap gap-1.5">
             {#each group.vars as v (v)}<code class="mono-chip">{v}</code>{/each}
           </div>
         </div>
       {/each}
       <div class="flex items-start gap-2 px-5 py-4 text-[12.5px] text-muted">
-        <Icon name="info" size={14} class="mt-0.5 shrink-0 text-cyan" />
+        <Icon name="info" size={14} class="mt-0.5 shrink-0 text-dim" />
         <span>Edit <code class="text-fg">.env</code> or <code class="text-fg">docker-compose.yml</code>, then restart the server. <Badge tone="neutral" class="ml-1 align-middle">restart required</Badge></span>
       </div>
     </div>

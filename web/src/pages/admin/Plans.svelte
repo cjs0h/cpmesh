@@ -140,17 +140,12 @@
   </EmptyState>
 {:else}
   <div class="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-    {#each sorted as plan, i (plan.id)}
-      <article
-        class="panel panel-hover group relative flex flex-col overflow-hidden p-5 animate-[fade-up_0.4s_var(--ease-out-expo)_both] {plan.is_active
-          ? ''
-          : 'opacity-70'}"
-        style="animation-delay: {i * 50}ms;"
-      >
+    {#each sorted as plan (plan.id)}
+      <article class="group relative flex flex-col rounded-lg border border-border bg-surface p-5 transition-[border-color,box-shadow] duration-150 hover:border-border-strong hover:shadow-sm {plan.is_active ? '' : 'opacity-70'}">
         <div class="flex items-start justify-between gap-3">
           <div class="min-w-0">
             <div class="flex items-center gap-2">
-              <h3 class="truncate font-head text-lg text-ink">{plan.name}</h3>
+              <h3 class="truncate text-base font-semibold tracking-tight text-fg">{plan.name}</h3>
               {#if !plan.is_active}<Badge tone="neutral">Inactive</Badge>{/if}
             </div>
             {#if plan.description}<p class="mt-0.5 line-clamp-2 text-[13px] text-muted">{plan.description}</p>{/if}
@@ -159,17 +154,17 @@
         </div>
 
         <div class="mt-4 flex items-baseline gap-1.5">
-          <span class="font-head text-3xl text-ink">{price(plan)}</span>
+          <span class="text-3xl font-semibold tracking-tight text-fg">{price(plan)}</span>
           {#if plan.price > 0}<span class="text-[12.5px] text-dim">/ {plan.billing_period === 'lifetime' ? 'once' : plan.billing_period.replace('ly', '')}</span>{/if}
         </div>
 
         <dl class="mt-5 grid grid-cols-2 gap-2 text-[13px]">
-          <div class="rounded-md border-2 border-ink bg-surface-2 px-3 py-2 shadow-xs">
-            <dt class="flex items-center gap-1 font-head text-[10px] uppercase tracking-[0.08em] text-muted"><Icon name="monitor" size={11} /> Devices</dt>
+          <div class="rounded-md border border-border bg-bg-deep px-3 py-2">
+            <dt class="flex items-center gap-1 text-xs text-muted"><Icon name="monitor" size={11} /> Devices</dt>
             <dd class="mt-0.5 font-medium text-fg">{plan.max_devices}</dd>
           </div>
-          <div class="rounded-md border-2 border-ink bg-surface-2 px-3 py-2 shadow-xs">
-            <dt class="flex items-center gap-1 font-head text-[10px] uppercase tracking-[0.08em] text-muted"><Icon name="history" size={11} /> History</dt>
+          <div class="rounded-md border border-border bg-bg-deep px-3 py-2">
+            <dt class="flex items-center gap-1 text-xs text-muted"><Icon name="history" size={11} /> History</dt>
             <dd class="mt-0.5 font-medium text-fg">{plan.max_clipboard_history.toLocaleString()}</dd>
           </div>
         </dl>

@@ -9,66 +9,28 @@
     title?: string;
     description?: string;
     icon?: string;
+    /** Kept for call-site compatibility; the monochrome theme renders all headers the same. */
     accent?: Accent;
-    /** Adds inner padding to the body. */
     padded?: boolean;
-    /** Lift on hover. */
     hover?: boolean;
-    /** Colour of the hard shadow. */
-    shadow?: 'ink' | Accent;
+    shadow?: string;
     class?: string;
     bodyClass?: string;
     actions?: Snippet;
     children: Snippet;
   }
 
-  let {
-    title,
-    description,
-    icon,
-    accent = 'accent',
-    padded = true,
-    hover = false,
-    shadow = 'ink',
-    class: className = '',
-    bodyClass = '',
-    actions,
-    children,
-    ...rest
-  }: Props = $props();
-
-  const tiles: Record<Accent, string> = {
-    accent: 'bg-accent',
-    cyan: 'bg-cyan',
-    mint: 'bg-mint',
-    gold: 'bg-yellow',
-    rose: 'bg-rose',
-    violet: 'bg-violet',
-    neutral: 'bg-surface-2',
-  };
-
-  const shadows: Record<'ink' | Accent, string> = {
-    ink: 'var(--color-ink)',
-    accent: 'var(--color-accent)',
-    cyan: 'var(--color-cyan)',
-    mint: 'var(--color-mint)',
-    gold: 'var(--color-yellow)',
-    rose: 'var(--color-rose)',
-    violet: 'var(--color-violet)',
-    neutral: 'var(--color-surface-3)',
-  };
+  let { title, description, icon, accent: _accent = 'neutral', padded = true, hover = false, shadow: _shadow, class: className = '', bodyClass = '', actions, children, ...rest }: Props = $props();
 </script>
 
-<section class="panel overflow-hidden {hover ? 'panel-hover' : ''} {className}" style="--panel-shadow: {shadows[shadow]};" {...rest}>
+<section class="overflow-hidden rounded-lg border border-border bg-surface {hover ? 'transition-[border-color,box-shadow] duration-150 hover:border-border-strong hover:shadow-sm' : ''} {className}" {...rest}>
   {#if title || actions}
-    <header class="flex items-center gap-3 border-b-2 border-ink bg-surface-2/60 px-5 py-3.5">
+    <header class="flex items-center gap-3 border-b border-border px-5 py-3.5">
       {#if icon}
-        <div class="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border-2 border-ink text-ink shadow-xs {tiles[accent]}">
-          <Icon name={icon} size={17} strokeWidth={2.4} />
-        </div>
+        <span class="text-muted"><Icon name={icon} size={16} /></span>
       {/if}
       <div class="min-w-0 flex-1">
-        {#if title}<h3 class="truncate font-head text-[15px] text-ink">{title}</h3>{/if}
+        {#if title}<h3 class="truncate text-sm font-medium text-fg">{title}</h3>{/if}
         {#if description}<p class="mt-0.5 text-[13px] text-muted">{description}</p>{/if}
       </div>
       {#if actions}

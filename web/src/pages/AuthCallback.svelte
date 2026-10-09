@@ -19,10 +19,10 @@
   });
 </script>
 
-<div class="dot-grid flex h-dvh flex-col items-center justify-center gap-5 bg-bg">
-  <div class="animate-[float-y_3s_ease-in-out_infinite]"><Logo size={48} /></div>
-  <div class="flex items-center gap-2 font-head text-[12px] uppercase tracking-[0.1em] text-muted">
-    <span class="inline-block h-4 w-4 rounded-full border-[3px] border-ink/20 border-t-ink animate-[spin_0.7s_linear_infinite]"></span>
+<div class="flex h-dvh flex-col items-center justify-center gap-5 bg-bg">
+  <Logo size={40} />
+  <div class="flex items-center gap-2 text-[13px] text-muted">
+    <span class="inline-block h-4 w-4 rounded-full border-2 border-border-strong border-t-ink animate-[spin_0.7s_linear_infinite]"></span>
     Completing sign in…
   </div>
 </div>
