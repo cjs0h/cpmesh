@@ -66,7 +66,7 @@
 
   <div class="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-2">
     <Card title="Relay health" description="What this instance is doing right now" icon="activity" accent="mint">
-      <ul class="flex flex-col divide-y divide-border text-sm">
+      <ul class="flex flex-col divide-y-2 divide-ink/10 text-sm">
         <li class="flex items-center justify-between py-2.5"><span class="text-muted">Connections per device</span><span class="font-mono text-fg">{adminState.stats.total_devices ? (adminState.stats.active_connections / adminState.stats.total_devices * 100).toFixed(0) : 0}% online</span></li>
         <li class="flex items-center justify-between py-2.5"><span class="text-muted">Entries stored</span><span class="font-mono text-fg">{adminState.stats.total_entries.toLocaleString()}</span></li>
         <li class="flex items-center justify-between py-2.5"><span class="text-muted">Content visibility</span><span class="inline-flex items-center gap-1.5 font-mono text-mint"><Icon name="lock" size={12} /> ciphertext only</span></li>
@@ -84,7 +84,7 @@
 {:else}
   <div class="grid grid-cols-2 gap-4 xl:grid-cols-4">
     {#each Array(4) as _, i (i)}
-      <div class="rounded-xl border border-border bg-surface p-5"><Skeleton class="mb-3 h-3 w-1/2" /><Skeleton class="h-8 w-1/3" /></div>
+      <div class="panel p-5"><Skeleton class="mb-3 h-3 w-1/2" /><Skeleton class="h-8 w-1/3" /></div>
     {/each}
   </div>
 {/if}

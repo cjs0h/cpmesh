@@ -42,20 +42,21 @@
 
 <div class="flex flex-col gap-1.5 {className}">
   {#if label}
-    <label for={inputId} class="flex items-center gap-1 text-[13px] font-medium text-muted">
+    <label for={inputId} class="flex items-center gap-1 font-head text-[12px] uppercase tracking-[0.06em] text-ink">
       {label}
       {#if required}<span class="text-accent" aria-hidden="true">*</span>{/if}
-      {#if optional}<span class="ml-auto text-[11px] font-normal text-dim">Optional</span>{/if}
+      {#if optional}<span class="ml-auto font-sans text-[11px] font-medium normal-case tracking-normal text-dim">Optional</span>{/if}
     </label>
   {/if}
 
   <div class="relative">
     {#if icon}
-      <span class="pointer-events-none absolute inset-y-0 left-3 flex items-center text-dim">
-        <Icon name={icon} size={15} />
+      <span class="pointer-events-none absolute inset-y-0 left-3 flex items-center text-ink/70">
+        <Icon name={icon} size={15} strokeWidth={2.4} />
       </span>
     {/if}
 
+    <!-- RetroUI input: ink border, hard shadow that grows on focus -->
     <input
       id={inputId}
       type={effectiveType}
@@ -63,11 +64,11 @@
       {required}
       aria-invalid={error ? 'true' : undefined}
       aria-describedby={describedBy}
-      class="h-10 w-full rounded-md border bg-surface-2 text-sm text-fg outline-none transition-[border-color,box-shadow,background-color] duration-150 placeholder:text-dim
-        focus:border-accent focus:bg-surface-3 focus:shadow-[0_0_0_3px_rgba(255,122,89,0.18)]
+      class="h-11 w-full rounded-md border-2 bg-surface text-sm text-ink shadow-xs outline-none transition-[box-shadow,transform,border-color,background-color] duration-150 placeholder:text-dim
+        focus:-translate-x-px focus:-translate-y-px focus:bg-cream focus:shadow-md
         disabled:cursor-not-allowed disabled:opacity-60
         {icon ? 'pl-9' : 'pl-3.5'} {type === 'password' ? 'pr-10' : 'pr-3.5'}
-        {error ? 'border-rose/60 focus:border-rose focus:shadow-[0_0_0_3px_rgba(248,113,113,0.18)]' : 'border-border hover:border-border-strong'}
+        {error ? 'border-rose' : 'border-ink'}
         {inputClass}"
       {...rest}
     />
@@ -75,20 +76,20 @@
     {#if type === 'password'}
       <button
         type="button"
-        class="absolute inset-y-0 right-0 flex w-10 items-center justify-center text-dim transition-colors hover:text-fg"
+        class="absolute inset-y-0 right-0 flex w-10 items-center justify-center text-ink/60 transition-colors hover:text-ink"
         aria-label={revealed ? 'Hide password' : 'Show password'}
         aria-pressed={revealed}
         tabindex="-1"
         onclick={() => (revealed = !revealed)}
       >
-        <Icon name={revealed ? 'eye-off' : 'eye'} size={16} />
+        <Icon name={revealed ? 'eye-off' : 'eye'} size={16} strokeWidth={2.4} />
       </button>
     {/if}
   </div>
 
   {#if error}
-    <p id="{inputId}-error" class="flex items-center gap-1 text-[12px] text-rose" role="alert">
-      <Icon name="alert-circle" size={12} />
+    <p id="{inputId}-error" class="flex items-center gap-1 text-[12px] font-semibold text-[#c62828]" role="alert">
+      <Icon name="alert-circle" size={12} strokeWidth={2.5} />
       {error}
     </p>
   {:else if hint}

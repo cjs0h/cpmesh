@@ -12,8 +12,10 @@
     accent?: Accent;
     /** Adds inner padding to the body. */
     padded?: boolean;
-    /** Lift + brighten on hover. */
+    /** Lift on hover. */
     hover?: boolean;
+    /** Colour of the hard shadow. */
+    shadow?: 'ink' | Accent;
     class?: string;
     bodyClass?: string;
     actions?: Snippet;
@@ -27,6 +29,7 @@
     accent = 'accent',
     padded = true,
     hover = false,
+    shadow = 'ink',
     class: className = '',
     bodyClass = '',
     actions,
@@ -35,31 +38,37 @@
   }: Props = $props();
 
   const tiles: Record<Accent, string> = {
-    accent: 'bg-accent/12 border-accent/25 text-accent',
-    cyan: 'bg-cyan/12 border-cyan/25 text-cyan',
-    mint: 'bg-mint/12 border-mint/25 text-mint',
-    gold: 'bg-gold/12 border-gold/25 text-gold',
-    rose: 'bg-rose/12 border-rose/25 text-rose',
-    violet: 'bg-violet/12 border-violet/25 text-violet',
-    neutral: 'bg-surface-3 border-border-strong text-muted',
+    accent: 'bg-accent',
+    cyan: 'bg-cyan',
+    mint: 'bg-mint',
+    gold: 'bg-yellow',
+    rose: 'bg-rose',
+    violet: 'bg-violet',
+    neutral: 'bg-surface-2',
+  };
+
+  const shadows: Record<'ink' | Accent, string> = {
+    ink: 'var(--color-ink)',
+    accent: 'var(--color-accent)',
+    cyan: 'var(--color-cyan)',
+    mint: 'var(--color-mint)',
+    gold: 'var(--color-yellow)',
+    rose: 'var(--color-rose)',
+    violet: 'var(--color-violet)',
+    neutral: 'var(--color-surface-3)',
   };
 </script>
 
-<section
-  class="rounded-xl border border-border bg-surface shadow-card {hover
-    ? 'transition-[border-color,box-shadow,transform] duration-300 hover:-translate-y-0.5 hover:border-border-strong hover:shadow-pop'
-    : ''} {className}"
-  {...rest}
->
+<section class="panel overflow-hidden {hover ? 'panel-hover' : ''} {className}" style="--panel-shadow: {shadows[shadow]};" {...rest}>
   {#if title || actions}
-    <header class="flex items-center gap-3 border-b border-border px-5 py-4">
+    <header class="flex items-center gap-3 border-b-2 border-ink bg-surface-2/60 px-5 py-3.5">
       {#if icon}
-        <div class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border {tiles[accent]}">
-          <Icon name={icon} size={17} />
+        <div class="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border-2 border-ink text-ink shadow-xs {tiles[accent]}">
+          <Icon name={icon} size={17} strokeWidth={2.4} />
         </div>
       {/if}
       <div class="min-w-0 flex-1">
-        {#if title}<h3 class="truncate text-[15px] font-semibold tracking-tight text-fg">{title}</h3>{/if}
+        {#if title}<h3 class="truncate font-head text-[15px] text-ink">{title}</h3>{/if}
         {#if description}<p class="mt-0.5 text-[13px] text-muted">{description}</p>{/if}
       </div>
       {#if actions}

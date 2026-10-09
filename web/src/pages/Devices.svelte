@@ -65,10 +65,10 @@
 {/if}
 
 {#if devicesState.loading && devicesState.list.length === 0}
-  <div class="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+  <div class="grid grid-cols-1 gap-5 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
     {#each Array(3) as _, i (i)}
-      <div class="rounded-xl border border-border bg-surface p-5">
-        <div class="flex items-center gap-3"><Skeleton class="h-10 w-10" rounded="rounded-lg" /><div class="flex-1"><Skeleton class="mb-2 h-3.5 w-1/2" /><Skeleton class="h-3 w-1/3" /></div></div>
+      <div class="panel p-5">
+        <div class="flex items-center gap-3"><Skeleton class="h-10 w-10" rounded="rounded-md" /><div class="flex-1"><Skeleton class="mb-2 h-3.5 w-1/2" /><Skeleton class="h-3 w-1/3" /></div></div>
         <Skeleton class="mt-5 h-8 w-full" />
       </div>
     {/each}
@@ -78,29 +78,21 @@
     <DownloadButtons size="sm" />
   </EmptyState>
 {:else}
-  <div class="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+  <div class="grid grid-cols-1 gap-5 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
     {#each sorted as device, i (device.id)}
       {@const s = statusOf(device)}
       <article
-        class="group relative overflow-hidden rounded-xl border bg-surface p-5 shadow-card transition-[border-color,box-shadow,transform] duration-300 hover:-translate-y-0.5 hover:shadow-pop animate-[fade-up_0.4s_var(--ease-out-expo)_both] {device.online
-          ? 'border-mint/25'
-          : device.status === 'pending'
-            ? 'border-gold/25'
-            : 'border-border hover:border-border-strong'}"
-        style="animation-delay: {i * 50}ms;"
+        class="panel panel-hover group relative overflow-hidden p-5 animate-[fade-up_0.4s_var(--ease-out-expo)_both]"
+        style="animation-delay: {i * 50}ms; --panel-shadow: {device.online ? 'var(--color-mint)' : device.status === 'pending' ? 'var(--color-yellow)' : 'var(--color-ink)'};"
       >
-        {#if device.online}
-          <div class="pointer-events-none absolute -right-12 -top-12 h-36 w-36 rounded-full bg-[radial-gradient(circle,rgba(42,214,160,0.16),transparent_70%)] blur-xl"></div>
-        {/if}
-
         <div class="relative flex items-start gap-3">
-          <span class="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border {device.online ? 'border-mint/25 bg-mint/12 text-mint' : 'border-border-strong bg-surface-3 text-muted'}">
-            <Icon name="monitor" size={20} />
+          <span class="flex h-11 w-11 shrink-0 items-center justify-center rounded-md border-2 border-ink text-ink shadow-xs {device.online ? 'bg-mint' : device.status === 'pending' ? 'bg-yellow' : 'bg-surface-2'}">
+            <Icon name="monitor" size={20} strokeWidth={2.3} />
           </span>
           <div class="min-w-0 flex-1">
-            <h3 class="truncate text-[15px] font-semibold tracking-tight text-fg">{device.name}</h3>
+            <h3 class="truncate font-head text-[15px] text-ink">{device.name}</h3>
             <p class="mt-0.5 flex items-center gap-1.5 text-[12.5px] text-dim">
-              <Icon name="clock" size={11} />
+              <Icon name="clock" size={11} strokeWidth={2.5} />
               {#if device.online}
                 Connected now
               {:else if device.last_seen}
@@ -113,17 +105,17 @@
           <Badge tone={s.tone} dot={s.tone === 'mint' || s.tone === 'neutral'} live={s.live}>{s.label}</Badge>
         </div>
 
-        <div class="relative mt-4 flex items-center justify-between gap-2 rounded-lg border border-border bg-surface-2/70 px-3 py-2">
-          <span class="text-[11px] uppercase tracking-[0.1em] text-dim">Device ID</span>
+        <div class="relative mt-4 flex items-center justify-between gap-2 rounded-md border-2 border-ink bg-surface-2 px-3 py-2 shadow-xs">
+          <span class="font-head text-[10px] uppercase tracking-[0.1em] text-muted">Device ID</span>
           <span class="flex items-center gap-1">
-            <code class="font-mono text-[11.5px] text-muted">{truncateMiddle(device.id, 8)}</code>
+            <code class="font-mono text-[11.5px] font-semibold text-ink">{truncateMiddle(device.id, 8)}</code>
             <CopyButton text={device.id} label="Copy device ID" size={12} />
           </span>
         </div>
 
         <div class="relative mt-4 flex items-center justify-between">
-          <span class="inline-flex items-center gap-1.5 text-[12px] text-dim">
-            <Icon name="shield-check" size={12} class="text-mint" />
+          <span class="inline-flex items-center gap-1.5 text-[12px] font-medium text-dim">
+            <Icon name="shield-check" size={13} class="text-ink" strokeWidth={2.4} />
             E2E keys held on device
           </span>
           <ConfirmAction label="Remove" confirmLabel="Remove" prompt="Remove this device?" size="xs" onconfirm={() => handleDelete(device.id, device.name)} />

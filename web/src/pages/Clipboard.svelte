@@ -70,30 +70,30 @@
   <div class="flex flex-wrap items-center gap-2">
     <button
       type="button"
-      class="rounded-full border px-3 py-1.5 text-[12.5px] font-medium transition-colors {filter === 'all' ? 'border-accent/40 bg-accent/12 text-accent' : 'border-border text-muted hover:border-border-strong hover:text-fg'}"
+      class="rounded-md border-2 border-ink px-3 py-1.5 font-head text-[11px] uppercase tracking-[0.06em] shadow-xs transition-[background-color,transform,box-shadow] hover:-translate-x-px hover:-translate-y-px hover:shadow-sm {filter === 'all' ? 'bg-yellow text-ink' : 'bg-surface text-muted hover:text-ink'}"
       onclick={() => (filter = 'all')}
     >
-      All <span class="ml-1 text-dim">{clipboardState.entries.length}</span>
+      All <span class="ml-1 opacity-60">{clipboardState.entries.length}</span>
     </button>
     {#each types as [label, count] (label)}
       <button
         type="button"
-        class="rounded-full border px-3 py-1.5 text-[12.5px] font-medium transition-colors {filter === label ? 'border-accent/40 bg-accent/12 text-accent' : 'border-border text-muted hover:border-border-strong hover:text-fg'}"
+        class="rounded-md border-2 border-ink px-3 py-1.5 font-head text-[11px] uppercase tracking-[0.06em] shadow-xs transition-[background-color,transform,box-shadow] hover:-translate-x-px hover:-translate-y-px hover:shadow-sm {filter === label ? 'bg-yellow text-ink' : 'bg-surface text-muted hover:text-ink'}"
         onclick={() => (filter = filter === label ? 'all' : label)}
       >
-        {label} <span class="ml-1 text-dim">{count}</span>
+        {label} <span class="ml-1 opacity-60">{count}</span>
       </button>
     {/each}
   </div>
 
   <div class="flex items-center gap-2">
     <div class="relative">
-      <span class="pointer-events-none absolute inset-y-0 left-3 flex items-center text-dim"><Icon name="search" size={14} /></span>
+      <span class="pointer-events-none absolute inset-y-0 left-3 flex items-center text-ink/60"><Icon name="search" size={14} strokeWidth={2.5} /></span>
       <input
         type="search"
         bind:value={query}
         placeholder="Filter by device…"
-        class="h-9 w-full rounded-md border border-border bg-surface-2 pl-9 pr-3 text-[13px] text-fg outline-none transition-[border-color,box-shadow] placeholder:text-dim hover:border-border-strong focus:border-accent focus:shadow-[0_0_0_3px_rgba(255,122,89,0.18)] sm:w-56"
+        class="h-10 w-full rounded-md border-2 border-ink bg-surface pl-9 pr-3 text-[13px] text-ink shadow-xs outline-none transition-[box-shadow,transform] placeholder:text-dim focus:-translate-x-px focus:-translate-y-px focus:shadow-md sm:w-56"
       />
     </div>
     {#if clipboardState.entries.length > 0}
@@ -170,7 +170,7 @@
     </div>
 
     <!-- Footer -->
-    <div class="flex flex-col gap-3 border-t border-border px-5 py-3 sm:flex-row sm:items-center sm:justify-between">
+    <div class="flex flex-col gap-3 border-t-2 border-ink bg-surface-2/60 px-5 py-3 sm:flex-row sm:items-center sm:justify-between">
       <div class="flex items-center gap-3 text-[12.5px] text-dim">
         <span>{visible.length} of {clipboardState.entries.length} on this page</span>
         <span aria-hidden="true">·</span>

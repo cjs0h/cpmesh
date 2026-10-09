@@ -17,34 +17,27 @@
   let { tone = 'info', title, icon, dismissible = false, ondismiss, class: className = '', children }: Props = $props();
 
   const styles: Record<Tone, { box: string; icon: string }> = {
-    info: { box: 'border-cyan/25 bg-cyan/8 text-fg', icon: 'info' },
-    success: { box: 'border-mint/30 bg-mint/10 text-fg', icon: 'check-circle' },
-    warning: { box: 'border-gold/30 bg-gold/10 text-fg', icon: 'alert-triangle' },
-    danger: { box: 'border-rose/30 bg-rose/10 text-fg', icon: 'alert-circle' },
-  };
-
-  const iconTone: Record<Tone, string> = {
-    info: 'text-cyan',
-    success: 'text-mint',
-    warning: 'text-gold',
-    danger: 'text-rose',
+    info: { box: 'bg-cyan/25', icon: 'info' },
+    success: { box: 'bg-mint/30', icon: 'check-circle' },
+    warning: { box: 'bg-yellow/45', icon: 'alert-triangle' },
+    danger: { box: 'bg-rose/25', icon: 'alert-circle' },
   };
 </script>
 
 <div
-  class="flex items-start gap-3 rounded-lg border px-3.5 py-3 text-[13px] leading-relaxed animate-[fade-up_0.3s_var(--ease-out-expo)] {styles[tone].box} {className}"
+  class="flex items-start gap-3 rounded-md border-2 border-ink px-3.5 py-3 text-[13px] leading-relaxed text-ink shadow-sm animate-[fade-up_0.3s_var(--ease-out-expo)] {styles[tone].box} {className}"
   role={tone === 'danger' || tone === 'warning' ? 'alert' : 'status'}
 >
-  <span class="mt-0.5 shrink-0 {iconTone[tone]}">
-    <Icon name={icon ?? styles[tone].icon} size={16} />
+  <span class="mt-0.5 shrink-0 text-ink">
+    <Icon name={icon ?? styles[tone].icon} size={16} strokeWidth={2.5} />
   </span>
   <div class="min-w-0 flex-1">
-    {#if title}<p class="font-semibold">{title}</p>{/if}
-    <div class={title ? 'mt-0.5 text-muted' : ''}>{@render children()}</div>
+    {#if title}<p class="font-head text-[13px]">{title}</p>{/if}
+    <div class={title ? 'mt-0.5 text-ink/80' : ''}>{@render children()}</div>
   </div>
   {#if dismissible}
-    <button type="button" class="-mr-1 -mt-1 rounded p-1 text-dim transition-colors hover:text-fg" aria-label="Dismiss" onclick={ondismiss}>
-      <Icon name="x" size={14} />
+    <button type="button" class="-mr-1 -mt-1 rounded p-1 text-ink/60 transition-colors hover:text-ink" aria-label="Dismiss" onclick={ondismiss}>
+      <Icon name="x" size={14} strokeWidth={2.5} />
     </button>
   {/if}
 </div>

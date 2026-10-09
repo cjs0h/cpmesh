@@ -97,7 +97,7 @@
   </div>
 
   <Card title="Configuration" description="Everything is set through environment variables" icon="sliders" accent="gold" padded={false}>
-    <div class="divide-y divide-border">
+    <div class="divide-y-2 divide-ink/10">
       {#each envGroups as group (group.title)}
         <div class="px-5 py-4">
           <p class="mb-2 flex items-center gap-2 text-[12px] font-semibold uppercase tracking-[0.1em] text-dim"><Icon name={group.icon} size={12} /> {group.title}</p>

@@ -7,6 +7,8 @@ export interface RevealOptions {
   threshold?: number;
   /** Reveal immediately instead of waiting for intersection. */
   immediate?: boolean;
+  /** Start blurred and sharpen while fading in (MagicUI BlurFade). */
+  blur?: boolean;
   /** Called once when the element is revealed. */
   onreveal?: () => void;
 }
@@ -37,8 +39,9 @@ function getObserver(threshold: number): IntersectionObserver {
  * view (or immediately when IntersectionObserver is unavailable).
  */
 export const reveal: Action<HTMLElement, RevealOptions | undefined> = (node, options = {}) => {
-  const { delay = 0, threshold = 0.12, immediate = false, onreveal } = options;
+  const { delay = 0, threshold = 0.12, immediate = false, blur = false, onreveal } = options;
   node.dataset.reveal = 'out';
+  if (blur) node.dataset.revealBlur = '';
   if (delay) node.style.setProperty('--reveal-delay', `${delay}ms`);
 
   const show = () => {

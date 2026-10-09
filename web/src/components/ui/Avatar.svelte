@@ -12,27 +12,22 @@
 
   let failed = $state(false);
   const label = $derived(initials(name));
-  // Deterministic hue per user so avatars stay distinguishable in lists.
-  const hue = $derived.by(() => {
+  // Deterministic flat fill per user so avatars stay distinguishable in lists.
+  const fills = ['#ffd93d', '#ff7a59', '#5ad1f0', '#3ddc97', '#b39dff', '#ff9ec4'];
+  const fill = $derived.by(() => {
     const s = name ?? '';
     let h = 0;
-    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) % 360;
-    return h;
+    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+    return fills[h % fills.length];
   });
 </script>
 
 {#if src && !failed}
-  <img
-    {src}
-    alt={name ?? ''}
-    class="shrink-0 rounded-full object-cover ring-1 ring-white/10 {className}"
-    style="width: {size}px; height: {size}px;"
-    onerror={() => (failed = true)}
-  />
+  <img {src} alt={name ?? ''} class="shrink-0 rounded-md border-2 border-ink object-cover shadow-xs {className}" style="width: {size}px; height: {size}px;" onerror={() => (failed = true)} />
 {:else}
   <span
-    class="inline-flex shrink-0 items-center justify-center rounded-full font-bold uppercase text-white ring-1 ring-white/10 select-none {className}"
-    style="width: {size}px; height: {size}px; font-size: {Math.max(10, Math.round(size * 0.36))}px; background: linear-gradient(135deg, hsl({hue} 70% 55%), hsl({(hue + 40) % 360} 65% 40%));"
+    class="inline-flex shrink-0 items-center justify-center rounded-md border-2 border-ink font-head uppercase text-ink shadow-xs select-none {className}"
+    style="width: {size}px; height: {size}px; font-size: {Math.max(10, Math.round(size * 0.34))}px; background: {fill};"
     aria-label={name ?? undefined}
   >
     {label}

@@ -91,16 +91,27 @@ tested from a `*.svelte.test.ts` file so the runes are compiled.
 
 #### Web dashboard UI conventions
 
-- Design tokens live in `web/src/app.css` (`@theme`): surfaces (`bg-bg`, `bg-surface`, `bg-surface-2`),
-  text (`text-fg`, `text-muted`, `text-dim`) and brand hues (`accent`, `cyan`, `mint`, `gold`, `rose`, `violet`).
-  Prefer these over raw hex values so the landing page, auth screens and app stay visually consistent.
+- The visual language is **neo-brutalist** (RetroUI): cream paper background, `#111` 2px borders
+  (`border-2 border-ink`), hard offset shadows (`shadow-sm/md/lg` are 2/4/6px solid offsets, no blur),
+  Archivo Black headings (`font-head`) with Space Grotesk body text, and flat fills — `bg-yellow`
+  (primary), `bg-accent` (coral), `bg-cyan`, `bg-mint`, `bg-violet`, `bg-rose`.
+- Design tokens live in `web/src/app.css` (`@theme`): surfaces (`bg-bg`, `bg-bg-deep`, `bg-surface`,
+  `bg-surface-2`), text (`text-ink`, `text-muted`, `text-dim`) and the fills above. Prefer these over raw
+  hex values so the landing page, auth screens and app stay visually consistent. The `.panel` /
+  `.panel-ink` classes give a bordered card with a hard shadow whose colour is set via `--panel-shadow`.
 - Reusable primitives are in `web/src/components/ui/` (`Button`, `Card`, `Badge`, `Field`, `Select`, `Switch`,
   `Dialog`, `ConfirmAction`, `EmptyState`, `Alert`, `StatCard`, `Toaster`, …). Reach for these before
   hand-writing utility strings; page files should mostly be layout and data wiring.
+- Animated building blocks ported from MagicUI live in `web/src/components/magic/` (`RetroGrid`,
+  `BorderBeam`, `Marquee`, `NumberTicker`, `WordRotate`, `Meteors`, `OrbitingCircles`, `AnimatedList`,
+  `ScrollProgress`). They are CSS-driven, dependency-free, and respect `prefers-reduced-motion`.
+- Layout is fluid: the landing page uses the `.wrap` container (up to 1680px, 1880px on 2xl+) and the app
+  shell grows to 1700px, so large monitors are filled instead of showing a narrow centred column. Give
+  every responsive grid an explicit `grid-cols-1` so single-column tracks cannot exceed the viewport.
 - Mount-time data loading belongs in `onMount`, not `$effect`, so store reads inside the fetch
   (for example the clipboard `offset`) do not become reactive dependencies that re-trigger the load.
 - User feedback goes through the `toast` store (`lib/stores/toast.svelte.ts`); scroll-reveal animations
-  use the `reveal` action (`lib/actions/reveal.ts`) and respect `prefers-reduced-motion` globally.
+  use the `reveal` action (`lib/actions/reveal.ts`, with an optional MagicUI-style `blur` fade).
 
 ## Submitting Changes
 

@@ -3,7 +3,7 @@
 </script>
 
 <span
-  class="inline-block shrink-0 rounded-full border-2 border-border-strong border-t-accent animate-[spin_0.7s_linear_infinite] {className}"
+  class="inline-block shrink-0 rounded-full border-[3px] border-ink/20 border-t-ink animate-[spin_0.7s_linear_infinite] {className}"
   style="width: {size}px; height: {size}px;"
   role="status"
   aria-label="Loading"

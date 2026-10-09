@@ -91,4 +91,13 @@ describe('reveal action', () => {
     reveal(b);
     expect(b.dataset.reveal).toBe('in');
   });
+
+  it('marks blur-fade reveals so the stylesheet can add the blur', () => {
+    const node = makeNode();
+    reveal(node, { blur: true });
+    expect(node.dataset.revealBlur).toBe('');
+    const plain = makeNode();
+    reveal(plain);
+    expect(plain.dataset.revealBlur).toBeUndefined();
+  });
 });

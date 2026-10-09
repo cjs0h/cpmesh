@@ -169,9 +169,9 @@
 
   <!-- Upload dropzone -->
   <label
-    class="group relative flex cursor-pointer items-center gap-3 rounded-xl border border-dashed px-4 py-3 transition-colors {dragging
-      ? 'border-accent bg-accent/10'
-      : 'border-border-strong bg-surface hover:border-accent/50 hover:bg-surface-2'}"
+    class="group relative flex cursor-pointer items-center gap-3 rounded-md border-2 border-dashed px-4 py-3 transition-[background-color,transform,box-shadow] {dragging
+      ? 'border-ink bg-yellow shadow-md -translate-x-0.5 -translate-y-0.5'
+      : 'border-ink bg-surface shadow-sm hover:bg-surface-2'}"
     ondragover={(e) => { e.preventDefault(); dragging = true; }}
     ondragleave={() => (dragging = false)}
     ondrop={onDrop}

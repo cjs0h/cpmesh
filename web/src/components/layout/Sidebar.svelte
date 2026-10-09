@@ -29,102 +29,85 @@
   }
 </script>
 
+{#snippet navItem(route: (typeof appRoutes)[number], fill: string)}
+  {@const active = isRouteActive(route.path, router.location)}
+  <li>
+    <a
+      href="#{route.path}"
+      aria-current={active ? 'page' : undefined}
+      class="group flex items-center gap-3 rounded-md border-2 px-3 py-2 font-head text-[12.5px] uppercase tracking-[0.04em] transition-[transform,box-shadow,background-color,border-color] duration-150 {active
+        ? `border-ink ${fill} text-ink shadow-sm`
+        : 'border-transparent text-muted hover:-translate-x-px hover:-translate-y-px hover:border-ink hover:bg-surface hover:text-ink hover:shadow-sm'}"
+    >
+      <span class="flex h-7 w-7 items-center justify-center rounded border-2 transition-colors {active ? 'border-ink bg-cream' : 'border-transparent group-hover:border-ink'}">
+        <Icon name={route.icon} size={15} strokeWidth={2.4} />
+      </span>
+      {route.label}
+    </a>
+  </li>
+{/snippet}
+
 {#if uiState.sidebarOpen}
-  <button
-    type="button"
-    class="fixed inset-0 z-40 bg-bg-deep/70 backdrop-blur-sm lg:hidden animate-[fade-in_0.2s_ease-out]"
-    aria-label="Close navigation"
-    onclick={closeSidebar}
-  ></button>
+  <button type="button" class="fixed inset-0 z-40 bg-ink/50 lg:hidden animate-[fade-in_0.2s_ease-out]" aria-label="Close navigation" onclick={closeSidebar}></button>
 {/if}
 
 <aside
-  class="fixed inset-y-0 left-0 z-50 flex w-[268px] shrink-0 flex-col border-r border-border bg-[#0a1324] transition-transform duration-300 ease-[var(--ease-out-expo)] lg:static lg:translate-x-0 {uiState.sidebarOpen
+  class="fixed inset-y-0 left-0 z-50 flex w-[272px] shrink-0 flex-col border-r-2 border-ink bg-surface transition-transform duration-300 ease-[var(--ease-out-expo)] lg:static lg:translate-x-0 {uiState.sidebarOpen
     ? 'translate-x-0 shadow-pop'
     : '-translate-x-full'}"
   aria-label="Main navigation"
 >
-  <div class="flex items-center justify-between px-5 pb-4 pt-5">
+  <div class="flex items-center justify-between border-b-2 border-ink px-5 py-4">
     <a href="#/" class="inline-flex items-center gap-2.5">
-      <Logo size={34} withText textClass="text-[17px]" />
+      <Logo size={36} withText textClass="text-[18px]" />
     </a>
-    <button type="button" class="flex h-8 w-8 items-center justify-center rounded-md text-dim hover:bg-white/5 hover:text-fg lg:hidden" aria-label="Close navigation" onclick={closeSidebar}>
-      <Icon name="x" size={16} />
+    <button type="button" class="flex h-8 w-8 items-center justify-center rounded border-2 border-ink bg-cream text-ink shadow-xs lg:hidden" aria-label="Close navigation" onclick={closeSidebar}>
+      <Icon name="x" size={16} strokeWidth={2.5} />
     </button>
   </div>
 
-  <nav class="flex-1 overflow-y-auto px-3 pb-4">
-    <ul class="flex flex-col gap-0.5">
+  <nav class="flex-1 overflow-y-auto px-3 py-4">
+    <ul class="flex flex-col gap-1">
       {#each primary as route (route.path)}
-        {@const active = isRouteActive(route.path, router.location)}
-        <li>
-          <a
-            href="#{route.path}"
-            aria-current={active ? 'page' : undefined}
-            class="group relative flex items-center gap-3 rounded-lg px-3 py-2.5 text-[13.5px] font-medium transition-colors duration-150 {active
-              ? 'bg-accent/10 text-fg'
-              : 'text-muted hover:bg-white/[0.04] hover:text-fg'}"
-          >
-            {#if active}
-              <span class="absolute inset-y-2 -left-3 w-[3px] rounded-r-full bg-accent shadow-[0_0_12px_rgba(255,122,89,0.8)]"></span>
-            {/if}
-            <span class="transition-colors {active ? 'text-accent' : 'text-dim group-hover:text-muted'}"><Icon name={route.icon} size={17} /></span>
-            {route.label}
-          </a>
-        </li>
+        {@render navItem(route, 'bg-yellow')}
       {/each}
     </ul>
 
     {#if userState.isAdmin}
-      <p class="mb-1.5 mt-6 px-3 text-[10.5px] font-semibold uppercase tracking-[0.14em] text-dim">Administration</p>
-      <ul class="flex flex-col gap-0.5">
+      <p class="mb-2 mt-6 px-3 font-head text-[10px] uppercase tracking-[0.16em] text-dim">Administration</p>
+      <ul class="flex flex-col gap-1">
         {#each admin as route (route.path)}
-          {@const active = isRouteActive(route.path, router.location)}
-          <li>
-            <a
-              href="#{route.path}"
-              aria-current={active ? 'page' : undefined}
-              class="group relative flex items-center gap-3 rounded-lg px-3 py-2.5 text-[13.5px] font-medium transition-colors duration-150 {active
-                ? 'bg-cyan/10 text-fg'
-                : 'text-muted hover:bg-white/[0.04] hover:text-fg'}"
-            >
-              {#if active}
-                <span class="absolute inset-y-2 -left-3 w-[3px] rounded-r-full bg-cyan shadow-[0_0_12px_rgba(73,198,229,0.8)]"></span>
-              {/if}
-              <span class="transition-colors {active ? 'text-cyan' : 'text-dim group-hover:text-muted'}"><Icon name={route.icon} size={17} /></span>
-              {route.label}
-            </a>
-          </li>
+          {@render navItem(route, 'bg-cyan')}
         {/each}
       </ul>
     {/if}
   </nav>
 
-  <div class="border-t border-border p-3">
+  <div class="border-t-2 border-ink p-3">
     <!-- Connection status -->
-    <div class="mb-3 flex items-center justify-between rounded-lg border border-border bg-surface px-3 py-2 text-[12px]">
-      <span class="flex items-center gap-2 font-medium {status === 'online' ? 'text-mint' : status === 'offline' ? 'text-dim' : 'text-gold'}">
-        <span class="status-dot" data-live={status === 'online'}></span>
-        {#if status === 'online'}Live sync{:else if status === 'connecting'}Connecting…{:else if status === 'reconnecting'}Reconnecting…{:else}Offline{/if}
+    <div class="mb-3 flex items-center justify-between rounded-md border-2 border-ink px-3 py-2 font-mono text-[11.5px] shadow-xs {status === 'online' ? 'bg-mint' : status === 'offline' ? 'bg-surface-2' : 'bg-yellow'}">
+      <span class="flex items-center gap-2 font-semibold text-ink">
+        <span class="status-dot text-ink" data-live={status === 'online'}></span>
+        {#if status === 'online'}LIVE SYNC{:else if status === 'connecting'}CONNECTING…{:else if status === 'reconnecting'}RECONNECTING…{:else}OFFLINE{/if}
       </span>
-      <span class="font-mono text-[10px] uppercase tracking-wider text-dim">wss</span>
+      <span class="text-[10px] uppercase tracking-wider text-ink/60">wss</span>
     </div>
 
     <!-- User card -->
-    <div class="flex items-center gap-3 rounded-lg px-2 py-1.5">
-      <Avatar name={displayName} src={userState.avatarUrl} size={34} />
+    <div class="flex items-center gap-3 rounded-md px-1 py-1">
+      <Avatar name={displayName} src={userState.avatarUrl} size={36} />
       <div class="min-w-0 flex-1">
-        <p class="truncate text-[13px] font-semibold text-fg">{displayName}</p>
+        <p class="truncate font-head text-[12.5px] text-ink">{displayName}</p>
         <p class="truncate text-[11.5px] text-dim">{userState.isAdmin ? 'Administrator' : userState.email || `@${userState.username}`}</p>
       </div>
       <button
         type="button"
-        class="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-dim transition-colors hover:bg-rose/10 hover:text-rose"
+        class="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border-2 border-ink bg-surface text-ink shadow-xs transition-[transform,box-shadow,background-color] hover:-translate-x-px hover:-translate-y-px hover:bg-rose hover:shadow-sm active:translate-x-px active:translate-y-px active:shadow-none"
         title="Sign out"
         aria-label="Sign out"
         onclick={logout}
       >
-        <Icon name="log-out" size={16} />
+        <Icon name="log-out" size={16} strokeWidth={2.4} />
       </button>
     </div>
   </div>
