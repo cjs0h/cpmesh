@@ -16,7 +16,7 @@ Thank you for your interest in contributing to cpmesh! This document provides gu
 ### Server
 
 ```bash
-# Requires Rust 1.75+ and a running PostgreSQL instance
+# Requires Rust 1.94+ and a running PostgreSQL instance
 cp .env.example .env
 # Generate repo-local dev JWT keys
 ./scripts/generate-dev-jwt.sh
@@ -31,6 +31,7 @@ cargo run -p cpmesh-server
 ### Web Dashboard
 
 ```bash
+# Requires Node.js 22.12+ (24 LTS recommended)
 cd web
 npm install
 npm run dev
@@ -39,15 +40,86 @@ npm run dev
 ### Desktop App
 
 ```bash
+# Requires Node.js 22.17+ (24 LTS recommended)
 cd desktop-tauri
 npm install
 npx tauri dev
 ```
 
+## Testing
+
+All suites run in CI; please run the ones relevant to your change locally first.
+
+### Rust
+
+```bash
+# Server + shared proto crate: unit tests, router tests (no database needed) and wire-format tests
+cargo test --workspace
+
+# Desktop crate: crypto, key exchange, local history (SQLite), config and WebSocket client tests
+cd desktop-tauri/src-tauri && cargo test
+```
+
+The server's PostgreSQL integration tests (`crates/cpmesh-server/tests/db.rs`) are skipped unless
+`TEST_DATABASE_URL` is set. Each test migrates into its own throwaway schema, so any scratch
+database works — for example with Docker:
+
+```bash
+docker run --rm -d --name cpmesh-test-pg -e POSTGRES_PASSWORD=pw -p 127.0.0.1:55432:5432 postgres:16-alpine
+TEST_DATABASE_URL=postgres://postgres:pw@127.0.0.1:55432/postgres cargo test -p cpmesh-server --test db
+docker rm -f cpmesh-test-pg
+```
+
+Lints are enforced with warnings denied, so also run:
+
+```bash
+cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings
+cd desktop-tauri/src-tauri && cargo fmt --check && cargo clippy --all-targets -- -D warnings
+```
+
+### Frontends
+
+Both frontends use [Vitest](https://vitest.dev/) for unit tests and `svelte-check` for type checking:
+
+```bash
+cd web && npm run check && npm test
+cd desktop-tauri && npm run check && npm test
+```
+
+Tests live next to the code they cover (`*.test.ts`). Modules that use Svelte runes must be
+tested from a `*.svelte.test.ts` file so the runes are compiled.
+
+#### Web dashboard UI conventions
+
+- The visual language is **minimal monochrome**: white surfaces, 1px `#e5e5e5` hairlines
+  (`border border-border`), near-black text, Geist for UI text and Geist Mono for identifiers/code.
+  Primary actions are solid black (`Button` default); the single coral accent (`text-accent`,
+  `bg-accent`) is reserved for live indicators and small points of emphasis — never for large fills.
+  Semantic states use the muted `success` / `warning` / `danger` tokens.
+- Design tokens live in `web/src/app.css` (`@theme`): surfaces (`bg-bg`, `bg-bg-deep`, `bg-surface`,
+  `bg-surface-2`, `bg-surface-3`), borders (`border-border`, `border-border-strong`), text (`text-fg`,
+  `text-ink`, `text-muted`, `text-dim`) and the accent/semantic colours. Prefer these over raw hex values.
+  Shadows are faint (`shadow-xs/sm/md/lg`) and used sparingly; there are no gradients or glows.
+- Reusable primitives are in `web/src/components/ui/` (`Button`, `Card`, `Badge`, `Field`, `Select`, `Switch`,
+  `Dialog`, `ConfirmAction`, `EmptyState`, `Alert`, `StatCard`, `Toaster`, …). Reach for these before
+  hand-writing utility strings; page files should mostly be layout and data wiring. Use `.cell-grid`
+  for feature/stat grids that should only show hairlines *between* cells, and `.tbl` for data tables.
+- Motion is intentional and minimal: the only sustained animation is the `SyncDemo` product demo on the
+  landing page (transform/opacity only, static frame under `prefers-reduced-motion`). Everything else is
+  limited to ~150ms colour/border hover transitions. Do not add scroll-reveal, parallax, blur or
+  background-plane animations; content must be visible immediately on load.
+- Layout: the landing page uses the `.wrap` container (1200px, growing to 1360px/1520px on large
+  monitors) with full-bleed hairline section dividers, and the app shell grows to 1600px, so wide screens
+  do not feel boxed. Give every responsive grid an explicit `grid-cols-1` so single-column tracks cannot
+  exceed the viewport.
+- Mount-time data loading belongs in `onMount`, not `$effect`, so store reads inside the fetch
+  (for example the clipboard `offset`) do not become reactive dependencies that re-trigger the load.
+- User feedback goes through the `toast` store (`lib/stores/toast.svelte.ts`).
+
 ## Submitting Changes
 
 1. Make sure your code compiles without warnings (`cargo check`, `cargo clippy`)
-2. Test your changes locally
+2. Add or update tests for your change and make sure the relevant suites pass
 3. Commit your changes with a clear, descriptive commit message
 4. Push to your fork and submit a pull request
 
@@ -58,6 +130,61 @@ npx tauri dev
 - Describe what the PR does and why
 - Make sure CI passes
 - PRs without a linked issue may be closed
+
+## Releasing
+
+Maintainers publish releases with the [Release workflow](.github/workflows/release.yml). It builds every
+app, attaches the installers to a GitHub Release, then registers that release on the website so the
+Downloads section on cpmesh.com and the apps' update check offer the new version.
+
+### Cutting a release
+
+Push a version tag (the subject of an annotated tag becomes the one-line note in the apps' update banner):
+
+```bash
+git tag -a v0.2.0 -m "Faster sync and file previews"
+git push origin v0.2.0
+```
+
+Or run **Actions → Release → Run workflow** on a branch with a version (`0.2.0`) and an optional note; the
+branch is tagged `v0.2.0` when the release is published.
+
+The tag decides the version: the workflow stamps it into `tauri.conf.json`, `Cargo.toml`/`Cargo.lock` and
+`package.json`/`package-lock.json` before building, so the apps report the version they were released as.
+To bump the version in the repository too, run `node scripts/release/set-version.mjs 0.2.0`.
+
+| Platform | Release asset |
+| --- | --- |
+| Windows x64 | `cpmesh-<version>-windows-amd64-setup.exe` (NSIS installer) |
+| macOS (Apple silicon and Intel) | `cpmesh-<version>-macos-universal.dmg` |
+| Linux x64 (built on Ubuntu 22.04) | `cpmesh-<version>-linux-amd64.deb`, `cpmesh-<version>-linux-amd64.AppImage` |
+| Android (arm64, armv7, x86_64) | `cpmesh-<version>-android.apk` |
+
+The release stays a draft until every build succeeds; re-running failed jobs replaces the installers. Once it
+is published, `scripts/release/publish-website.mjs` signs in to the server's admin API and creates a download
+link for each installer plus a current app release for each platform the update check reports
+(`windows/amd64`, `darwin/arm64`, `darwin/amd64`, `linux/amd64`, `android/arm64`, `android/amd64`).
+Re-publishing a version is safe, and the script refuses to replace a newer version unless run by hand with
+`--force`. Use `--dry-run` to preview what a release JSON (from `gh release view <tag> --json tagName,url,isDraft,assets`)
+would publish. The release scripts have tests: `node --test "scripts/release/*.test.mjs"`.
+
+### Secrets and variables
+
+| Name | Needed for | Purpose |
+| --- | --- | --- |
+| `CPMESH_ADMIN_USERNAME`, `CPMESH_ADMIN_PASSWORD` | Website update | Admin account on the server the release is registered with |
+| `CPMESH_URL` (variable) | Optional | Server to update, `https://cpmesh.com` by default |
+| `ANDROID_KEYSTORE_BASE64` | Android | The release keystore, base64 encoded |
+| `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS` | Android | Keystore password and key alias |
+| `ANDROID_KEY_PASSWORD` | Optional | Key password, when it differs from the keystore password |
+| `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY` | Optional | Developer ID signing for macOS (base64 `.p12`) |
+| `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` | Optional | Notarization for macOS (app-specific password) |
+
+Without the Android secrets the APK is skipped with a warning; without the admin credentials the GitHub
+Release is still published but the website is left unchanged. Android only installs an update signed with the
+same key as the installed app, so keep the keystore and its password backed up. Without Apple credentials the
+macOS app is ad-hoc signed and users allow it on first launch in **System Settings → Privacy & Security**;
+the Windows installer is unsigned, so SmartScreen may warn as well.
 
 ## Reporting Bugs
 

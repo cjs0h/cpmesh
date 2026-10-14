@@ -1,14 +1,16 @@
+use p256::PublicKey;
 use std::collections::BTreeMap;
 use std::path::Path;
-use p256::PublicKey;
 use zeroize::Zeroize;
 
 use super::encrypt::{
-    decrypt, decrypt_group_key, derive_key_from_group_key, encrypt, encrypt_group_key,
-    generate_group_key, CryptoError,
+    CryptoError, decrypt, decrypt_group_key, derive_key_from_group_key, encrypt, encrypt_group_key,
+    fill_random, generate_group_key,
 };
 use super::keys::KeyPair;
-use rand::RngCore;
+
+/// A group key encrypted for a specific peer device: `(device_id, encrypted_key)`.
+pub type WrappedKey = (String, Vec<u8>);
 
 /// Manages versioned group keys for a user's devices.
 /// Supports multiple key versions to allow decryption of historical clipboard entries
@@ -21,7 +23,7 @@ pub struct KeyExchange {
 
 impl Drop for KeyExchange {
     fn drop(&mut self) {
-        for (_, key) in self.keys_by_version.iter_mut() {
+        for key in self.keys_by_version.values_mut() {
             key.zeroize();
         }
     }
@@ -80,7 +82,11 @@ impl KeyExchange {
 
     /// Encrypts a specific key version for a device (used during rotation/approval).
     #[allow(dead_code)]
-    pub fn encrypt_version_for_device(&self, version: i32, peer_public_key: &PublicKey) -> Result<Vec<u8>, CryptoError> {
+    pub fn encrypt_version_for_device(
+        &self,
+        version: i32,
+        peer_public_key: &PublicKey,
+    ) -> Result<Vec<u8>, CryptoError> {
         let gk = self.key_for_version(version)?;
         encrypt_group_key(gk, &self.key_pair.private, peer_public_key)
     }
@@ -98,11 +104,11 @@ impl KeyExchange {
     }
 
     /// Generates the next group key version and returns wrapped keys for all provided devices.
-    /// Returns (new_version, wrapped_keys) where wrapped_keys is (device_id_str, encrypted_key).
+    /// Returns `(new_version, wrapped_keys)`.
     pub fn generate_next_version(
         &mut self,
         peer_devices: &[(String, PublicKey)],
-    ) -> Result<(i32, Vec<(String, Vec<u8>)>), CryptoError> {
+    ) -> Result<(i32, Vec<WrappedKey>), CryptoError> {
         let new_version = self.current_version + 1;
         let new_key = generate_group_key().to_vec();
 
@@ -121,7 +127,7 @@ impl KeyExchange {
     pub fn encrypt_payload(&self, plaintext: &[u8]) -> Result<(Vec<u8>, i32), CryptoError> {
         let gk = self.current_key()?;
         let mut salt = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut salt);
+        fill_random(&mut salt);
         let key = derive_key_from_group_key(gk, &salt)?;
         let encrypted = encrypt(&key, plaintext)?;
         let mut result = Vec::with_capacity(16 + encrypted.len());
@@ -149,12 +155,16 @@ impl KeyExchange {
             return Ok(result);
         }
         for (&version, _) in self.keys_by_version.iter().rev() {
-            if version == self.current_version { continue; }
+            if version == self.current_version {
+                continue;
+            }
             if let Ok(result) = self.decrypt_payload(ciphertext, version) {
                 return Ok(result);
             }
         }
-        Err(CryptoError::Decrypt("no key version could decrypt this payload".into()))
+        Err(CryptoError::Decrypt(
+            "no key version could decrypt this payload".into(),
+        ))
     }
 
     /// Save the keyring to an encrypted file.
@@ -174,9 +184,10 @@ impl KeyExchange {
         // Derive KEK from device private key
         let private_bytes = self.key_pair.private.to_bytes();
         let mut salt = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut salt);
+        fill_random(&mut salt);
 
-        let kek = super::encrypt::derive_key_from_secret(&private_bytes, &salt, b"cpnet-keyring-v1")?;
+        let kek =
+            super::encrypt::derive_key_from_secret(&private_bytes, &salt, b"cpnet-keyring-v1")?;
         let encrypted = encrypt(&kek, &plaintext)?;
 
         // File format: [16-byte salt] + [encrypted keyring]
@@ -185,15 +196,18 @@ impl KeyExchange {
         output.extend_from_slice(&encrypted);
 
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| CryptoError::Encrypt(format!("create dir: {e}")))?;
+            std::fs::create_dir_all(dir)
+                .map_err(|e| CryptoError::Encrypt(format!("create dir: {e}")))?;
         }
-        std::fs::write(path, &output).map_err(|e| CryptoError::Encrypt(format!("write keyring: {e}")))?;
+        std::fs::write(path, &output)
+            .map_err(|e| CryptoError::Encrypt(format!("write keyring: {e}")))?;
         Ok(())
     }
 
     /// Load the keyring from an encrypted file.
     pub fn load_keyring(&mut self, path: &Path) -> Result<(), CryptoError> {
-        let data = std::fs::read(path).map_err(|e| CryptoError::Decrypt(format!("read keyring: {e}")))?;
+        let data =
+            std::fs::read(path).map_err(|e| CryptoError::Decrypt(format!("read keyring: {e}")))?;
         if data.len() < 16 {
             return Err(CryptoError::CiphertextTooShort);
         }
@@ -202,7 +216,8 @@ impl KeyExchange {
         let encrypted = &data[16..];
 
         let private_bytes = self.key_pair.private.to_bytes();
-        let kek = super::encrypt::derive_key_from_secret(&private_bytes, salt, b"cpnet-keyring-v1")?;
+        let kek =
+            super::encrypt::derive_key_from_secret(&private_bytes, salt, b"cpnet-keyring-v1")?;
         let plaintext = decrypt(&kek, encrypted)?;
 
         let keyring_data: serde_json::Value = serde_json::from_slice(&plaintext)
@@ -211,10 +226,11 @@ impl KeyExchange {
         self.current_version = keyring_data["current_version"].as_i64().unwrap_or(0) as i32;
         if let Some(keys) = keyring_data["keys"].as_object() {
             for (v_str, k_val) in keys {
-                if let (Ok(version), Some(key_b64)) = (v_str.parse::<i32>(), k_val.as_str()) {
-                    if let Ok(key_bytes) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, key_b64) {
-                        self.keys_by_version.insert(version, key_bytes);
-                    }
+                if let (Ok(version), Some(key_b64)) = (v_str.parse::<i32>(), k_val.as_str())
+                    && let Ok(key_bytes) =
+                        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, key_b64)
+                {
+                    self.keys_by_version.insert(version, key_bytes);
                 }
             }
         }
@@ -305,17 +321,154 @@ mod tests {
     fn test_encrypt_without_group_key() {
         let kp = KeyPair::generate();
         let exch = KeyExchange::new(kp);
+        assert!(!exch.has_group_key());
         assert!(exch.encrypt_payload(b"test").is_err());
+        assert!(
+            exch.decrypt_payload(b"0123456789abcdef_ciphertext", 1)
+                .is_err()
+        );
+        assert!(
+            exch.decrypt_payload_legacy(b"0123456789abcdef_ciphertext")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_decrypt_payload_too_short() {
+        let kp = KeyPair::generate();
+        let mut exch = KeyExchange::new(kp);
+        exch.init_group_key();
+        assert!(matches!(
+            exch.decrypt_payload(&[0u8; 15], 1),
+            Err(CryptoError::CiphertextTooShort)
+        ));
+    }
+
+    #[test]
+    fn test_decrypt_payload_wrong_version_fails() {
+        let kp = KeyPair::generate();
+        let mut exch = KeyExchange::new(kp);
+        exch.init_group_key();
+        let (enc, v) = exch.encrypt_payload(b"hello").unwrap();
+        assert_eq!(v, 1);
+        // Version 2 does not exist in the keyring
+        assert!(exch.decrypt_payload(&enc, 2).is_err());
+    }
+
+    #[test]
+    fn test_decrypt_payload_legacy_tries_all_versions() {
+        let kp = KeyPair::generate();
+        let mut exch = KeyExchange::new(kp);
+        exch.init_group_key();
+        let (enc_v1, _) = exch.encrypt_payload(b"old data").unwrap();
+
+        let peer = KeyPair::generate();
+        exch.generate_next_version(&[("peer".to_string(), peer.public)])
+            .unwrap();
+        assert_eq!(exch.current_version, 2);
+
+        // Legacy decrypt should fall back to v1 for data encrypted before rotation
+        assert_eq!(exch.decrypt_payload_legacy(&enc_v1).unwrap(), b"old data");
+
+        // And still handle current-version data
+        let (enc_v2, _) = exch.encrypt_payload(b"new data").unwrap();
+        assert_eq!(exch.decrypt_payload_legacy(&enc_v2).unwrap(), b"new data");
+    }
+
+    #[test]
+    fn test_add_key_version_tracks_highest_version() {
+        let kp = KeyPair::generate();
+        let mut exch = KeyExchange::new(kp);
+        exch.add_key_version(3, vec![3u8; 32]);
+        assert_eq!(exch.current_version, 3);
+        // Adding an older version must not lower the current version
+        exch.add_key_version(1, vec![1u8; 32]);
+        assert_eq!(exch.current_version, 3);
+        assert_eq!(exch.keys_by_version.len(), 2);
+    }
+
+    #[test]
+    fn test_generate_next_version_wraps_for_all_peers() {
+        let kp_a = KeyPair::generate();
+        let kp_b = KeyPair::generate();
+        let kp_c = KeyPair::generate();
+        let mut exch_a = KeyExchange::new(kp_a);
+        exch_a.init_group_key();
+
+        let peers = vec![
+            ("device-b".to_string(), kp_b.public),
+            ("device-c".to_string(), kp_c.public),
+        ];
+        let (version, wrapped) = exch_a.generate_next_version(&peers).unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(wrapped.len(), 2);
+        assert_eq!(wrapped[0].0, "device-b");
+        assert_eq!(wrapped[1].0, "device-c");
+
+        // Each peer can unwrap its copy and ends up with the same v2 key
+        let pub_a = exch_a.key_pair().public;
+        let mut exch_b = KeyExchange::new(kp_b);
+        exch_b
+            .decrypt_from_device(&wrapped[0].1, &pub_a, version)
+            .unwrap();
+        let mut exch_c = KeyExchange::new(kp_c);
+        exch_c
+            .decrypt_from_device(&wrapped[1].1, &pub_a, version)
+            .unwrap();
+        assert_eq!(exch_b.keys_by_version[&2], exch_c.keys_by_version[&2]);
+        assert_eq!(exch_b.keys_by_version[&2], exch_a.keys_by_version[&2]);
+    }
+
+    #[test]
+    fn test_encrypt_version_for_device() {
+        let kp_a = KeyPair::generate();
+        let kp_b = KeyPair::generate();
+        let pub_a = kp_a.public;
+        let pub_b = kp_b.public;
+        let mut exch_a = KeyExchange::new(kp_a);
+        exch_a.init_group_key();
+        exch_a
+            .generate_next_version(&[("b".to_string(), pub_b)])
+            .unwrap();
+
+        // Explicitly wrap the OLD version for device B
+        let wrapped_v1 = exch_a.encrypt_version_for_device(1, &pub_b).unwrap();
+        let mut exch_b = KeyExchange::new(kp_b);
+        exch_b.decrypt_from_device(&wrapped_v1, &pub_a, 1).unwrap();
+        assert_eq!(exch_b.keys_by_version[&1], exch_a.keys_by_version[&1]);
+
+        // Unknown version is an error
+        assert!(exch_a.encrypt_version_for_device(99, &pub_b).is_err());
+    }
+
+    #[test]
+    fn test_decrypt_from_device_with_wrong_peer_key_fails() {
+        let kp_a = KeyPair::generate();
+        let kp_b = KeyPair::generate();
+        let kp_mallory = KeyPair::generate();
+        let pub_b = kp_b.public;
+        let mut exch_a = KeyExchange::new(kp_a);
+        exch_a.init_group_key();
+        let wrapped = exch_a.encrypt_for_device(&pub_b).unwrap();
+
+        let mut exch_b = KeyExchange::new(kp_b);
+        // B believes the key came from Mallory — ECDH shared secret differs, decryption fails
+        assert!(
+            exch_b
+                .decrypt_from_device(&wrapped, &kp_mallory.public, 1)
+                .is_err()
+        );
+        assert!(!exch_b.has_group_key());
     }
 
     #[test]
     fn test_keyring_persistence() {
         let dir = tempfile::TempDir::new().unwrap();
+        let key_path = dir.path().join("device.key");
         let keyring_path = dir.path().join("keyring.enc");
 
-        let kp = KeyPair::generate();
-        let private_bytes = kp.private.to_bytes().to_vec();
-
+        // Same device key must be used to save and load the keyring
+        let kp = KeyPair::load_or_generate(&key_path).unwrap();
         let mut exch = KeyExchange::new(kp);
         exch.init_group_key();
 
@@ -323,15 +476,49 @@ mod tests {
         let kp_b = KeyPair::generate();
         let peers = vec![("b".to_string(), kp_b.public)];
         exch.generate_next_version(&peers).unwrap();
+        let (ciphertext, _) = exch.encrypt_payload(b"persisted").unwrap();
 
-        // Save keyring
+        exch.save_keyring(&keyring_path).unwrap();
+        assert!(keyring_path.exists());
+
+        // Load into a fresh KeyExchange backed by the same device key
+        let kp_again = KeyPair::load_or_generate(&key_path).unwrap();
+        let mut restored = KeyExchange::new(kp_again);
+        assert!(!restored.has_group_key());
+        restored.load_keyring(&keyring_path).unwrap();
+
+        assert_eq!(restored.current_version, 2);
+        assert_eq!(restored.keys_by_version, exch.keys_by_version);
+        assert_eq!(
+            restored.decrypt_payload(&ciphertext, 2).unwrap(),
+            b"persisted"
+        );
+    }
+
+    #[test]
+    fn test_keyring_cannot_be_loaded_with_other_device_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let keyring_path = dir.path().join("keyring.enc");
+
+        let mut exch = KeyExchange::new(KeyPair::generate());
+        exch.init_group_key();
         exch.save_keyring(&keyring_path).unwrap();
 
-        // Load into a new KeyExchange
-        let kp2 = KeyPair::load_or_generate(&dir.path().join("test.key")).unwrap();
-        // We need the same private key to decrypt, so let's use a trick:
-        // Actually in the real flow, the same device key loads the keyring.
-        // For this test, we'll just verify the save doesn't error.
-        assert!(keyring_path.exists());
+        let mut other = KeyExchange::new(KeyPair::generate());
+        assert!(other.load_keyring(&keyring_path).is_err());
+        assert!(!other.has_group_key());
+    }
+
+    #[test]
+    fn test_load_keyring_rejects_truncated_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let keyring_path = dir.path().join("keyring.enc");
+        std::fs::write(&keyring_path, [0u8; 8]).unwrap();
+
+        let mut exch = KeyExchange::new(KeyPair::generate());
+        assert!(matches!(
+            exch.load_keyring(&keyring_path),
+            Err(CryptoError::CiphertextTooShort)
+        ));
     }
 }

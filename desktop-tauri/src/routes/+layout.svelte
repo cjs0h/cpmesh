@@ -1,10 +1,26 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { page } from '$app/stores';
-	import { initEventListeners, destroyEventListeners, getAppStateValue, getAvailableUpdate, dismissUpdate } from '$lib/store.svelte';
-	import { downloadAndInstallUpdate, getConfig, getMyApprovalStatus, connectToServer, logout, type MyApprovalStatus } from '$lib/api';
-	import { isDesktop } from '$lib/platform';
-	import '$lib/app.css';
+	import { page } from '$app/state';
+
+	import {
+		initEventListeners,
+		destroyEventListeners,
+		getAppStateValue,
+		getAvailableUpdate,
+		dismissUpdate
+	} from '#lib/store.svelte.js';
+
+	import {
+		downloadAndInstallUpdate,
+		getConfig,
+		getMyApprovalStatus,
+		connectToServer,
+		logout,
+		type MyApprovalStatus
+	} from '#lib/api.js';
+
+	import { isDesktop } from '#lib/platform.js';
+	import '#lib/app.css';
 
 	let { children } = $props();
 
@@ -137,7 +153,7 @@
 				</div>
 			{/if}
 
-			<button class="logout-btn" onclick={handleLogout}>Cancel &amp; Log Out</button>
+			<button class="logout-btn" onclick={handleLogout}>Cancel & Log Out</button>
 		</div>
 	</div>
 {:else if isRejected}
@@ -157,10 +173,28 @@
 				<h2>cpmesh</h2>
 			</div>
 			<ul class="nav-links">
-				<li><a href="/" class:active={$page.url.pathname === '/'}>Status</a></li>
-				<li><a href="/history" class:active={$page.url.pathname === '/history'}>History</a></li>
-				<li><a href="/devices" class:active={$page.url.pathname === '/devices'}>Devices</a></li>
-				<li><a href="/settings" class:active={$page.url.pathname === '/settings'}>Settings</a></li>
+				<li><a href="/" class:active={page.url.pathname === '/'}>Status</a></li>
+
+				<li>
+					<a
+						href="/history"
+						class:active={page.url.pathname === '/history'}
+					>History</a>
+				</li>
+
+				<li>
+					<a
+						href="/devices"
+						class:active={page.url.pathname === '/devices'}
+					>Devices</a>
+				</li>
+
+				<li>
+					<a
+						href="/settings"
+						class:active={page.url.pathname === '/settings'}
+					>Settings</a>
+				</li>
 			</ul>
 		</nav>
 		<main class="content">
@@ -186,19 +220,31 @@
 			{@render children()}
 		</main>
 		<nav class="bottom-nav">
-			<a href="/" class:active={$page.url.pathname === '/'}>
+			<a href="/" class:active={page.url.pathname === '/'}>
 				<span class="nav-icon">⚡</span>
 				<span class="nav-label">Status</span>
 			</a>
-			<a href="/history" class:active={$page.url.pathname === '/history'}>
+
+			<a
+				href="/history"
+				class:active={page.url.pathname === '/history'}
+			>
 				<span class="nav-icon">📋</span>
 				<span class="nav-label">History</span>
 			</a>
-			<a href="/devices" class:active={$page.url.pathname === '/devices'}>
+
+			<a
+				href="/devices"
+				class:active={page.url.pathname === '/devices'}
+			>
 				<span class="nav-icon">📱</span>
 				<span class="nav-label">Devices</span>
 			</a>
-			<a href="/settings" class:active={$page.url.pathname === '/settings'}>
+
+			<a
+				href="/settings"
+				class:active={page.url.pathname === '/settings'}
+			>
 				<span class="nav-icon">⚙️</span>
 				<span class="nav-label">Settings</span>
 			</a>

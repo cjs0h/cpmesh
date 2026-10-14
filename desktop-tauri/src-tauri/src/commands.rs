@@ -1,19 +1,19 @@
-use log::{error, info, debug};
+use log::{debug, error, info};
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, Ordering};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{Emitter, Manager, State};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::api::client::ApiClient;
 use crate::config::{AppConfig, TokenStore};
-use crate::state::AppState;
 use crate::crypto::exchange::KeyExchange;
 use crate::crypto::keys::{KeyPair, derive_approval_code};
 use crate::history::History;
 use crate::proto::models::*;
+use crate::state::AppState;
 use crate::ws::connection::{WsConnection, WsEvent};
 use base64::Engine as _;
 
@@ -40,8 +40,16 @@ impl AppContext {
         let state = if config.is_configured() {
             // Load tokens from secure storage
             let token_store = TokenStore::new(&cfg_dir);
-            let access = token_store.load_access_token().ok().flatten().unwrap_or_default();
-            let refresh = token_store.load_refresh_token().ok().flatten().unwrap_or_default();
+            let access = token_store
+                .load_access_token()
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let refresh = token_store
+                .load_refresh_token()
+                .ok()
+                .flatten()
+                .unwrap_or_default();
             if !access.is_empty() && !refresh.is_empty() {
                 api.set_tokens(access, refresh);
             }
@@ -94,14 +102,7 @@ pub struct HistoryPage {
 
 fn plain_to_history_entry(e: &PlainEntry) -> HistoryEntry {
     let preview = match &e.content_type {
-        ContentType::Text => {
-            let text = String::from_utf8_lossy(&e.data);
-            if text.len() > 200 {
-                format!("{}...", &text[..200])
-            } else {
-                text.to_string()
-            }
-        }
+        ContentType::Text => truncate_preview(&String::from_utf8_lossy(&e.data), 200),
         ContentType::Image => {
             let w = e.metadata.width.unwrap_or(0);
             let h = e.metadata.height.unwrap_or(0);
@@ -121,6 +122,15 @@ fn plain_to_history_entry(e: &PlainEntry) -> HistoryEntry {
         preview,
         size: e.metadata.size,
         created_at: e.created_at.to_rfc3339(),
+    }
+}
+
+/// Truncates `text` to at most `max_chars` characters (never splitting a UTF-8
+/// character) and appends an ellipsis when something was cut off.
+fn truncate_preview(text: &str, max_chars: usize) -> String {
+    match text.char_indices().nth(max_chars) {
+        Some((cut, _)) => format!("{}...", &text[..cut]),
+        None => text.to_string(),
     }
 }
 
@@ -146,6 +156,8 @@ pub async fn get_app_state(ctx: State<'_, AppContext>) -> Result<AppState, Strin
     Ok(ctx.state.read().await.clone())
 }
 
+// Tauri IPC commands receive each frontend argument as a separate parameter.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn setup_and_login(
     ctx: State<'_, AppContext>,
@@ -172,22 +184,23 @@ pub async fn setup_and_login(
         let email = email.ok_or("Email is required for registration")?;
         let full_name = full_name.ok_or("Full name is required for registration")?;
         let password_confirm = password_confirm.ok_or("Password confirmation is required")?;
-        api.register(
-            &username,
-            &email,
-            &full_name,
-            &password,
-            &password_confirm,
-            country.as_deref(),
-            mobile.as_deref(),
-        )
+        api.register(&RegisterRequest {
+            username: username.clone(),
+            password: password.clone(),
+            password_confirm,
+            email,
+            full_name,
+            country,
+            mobile,
+        })
         .await
         .map_err(|e| format!("Registration failed: {e}"))?;
     }
 
     let device_name = crate::fingerprint::auto_device_name();
 
-    let auth_resp = api.login(&username, &password, &device_name)
+    let auth_resp = api
+        .login(&username, &password, &device_name)
         .await
         .map_err(|e| format!("Login failed: {e}"))?;
 
@@ -197,7 +210,8 @@ pub async fn setup_and_login(
 
     // Generate device key pair
     let key_path = AppConfig::key_path(&ctx.config_dir);
-    let kp = KeyPair::load_or_generate(&key_path).map_err(|e| format!("Key generation failed: {e}"))?;
+    let kp =
+        KeyPair::load_or_generate(&key_path).map_err(|e| format!("Key generation failed: {e}"))?;
     let pub_bytes = kp.public_key_bytes();
     let sig = kp.sign_public_key();
 
@@ -220,10 +234,12 @@ pub async fn setup_and_login(
 
     // Save tokens to secure storage
     let token_store = TokenStore::new(&ctx.config_dir);
-    token_store.save_tokens(
-        api.access_token().unwrap_or_default(),
-        api.refresh_token().unwrap_or_default(),
-    ).map_err(|e| format!("Token save failed: {e}"))?;
+    token_store
+        .save_tokens(
+            api.access_token().unwrap_or_default(),
+            api.refresh_token().unwrap_or_default(),
+        )
+        .map_err(|e| format!("Token save failed: {e}"))?;
 
     // Save config (no tokens in plaintext)
     let mut config = ctx.config.write().await;
@@ -232,7 +248,9 @@ pub async fn setup_and_login(
     config.device_id = device_id;
     config.device_name = device_name;
     config.device_status = device_status;
-    config.save(&ctx.config_dir).map_err(|e| format!("Config save failed: {e}"))?;
+    config
+        .save(&ctx.config_dir)
+        .map_err(|e| format!("Config save failed: {e}"))?;
 
     // Update state
     *ctx.state.write().await = AppState::Disconnected;
@@ -259,14 +277,18 @@ async fn setup_group_key(
     // Try to get existing group key
     match api.get_group_key().await.map_err(|e| e.to_string())? {
         Some(gk_resp) => {
-            let peer_pub = KeyPair::parse_public_key(&gk_resp.from_public_key)
-                .map_err(|e| e.to_string())?;
+            let peer_pub =
+                KeyPair::parse_public_key(&gk_resp.from_public_key).map_err(|e| e.to_string())?;
 
             // Verify ECDSA signature on sender's public key
             if let Some(sig) = &gk_resp.from_public_key_sig {
-                KeyPair::verify_public_key_signature(&peer_pub, sig)
-                    .map_err(|e| format!("SECURITY: Sender key signature invalid (possible MITM): {e}"))?;
-                info!("Verified sender key signature (device {})", gk_resp.from_device_id);
+                KeyPair::verify_public_key_signature(&peer_pub, sig).map_err(|e| {
+                    format!("SECURITY: Sender key signature invalid (possible MITM): {e}")
+                })?;
+                info!(
+                    "Verified sender key signature (device {})",
+                    gk_resp.from_device_id
+                );
             } else {
                 info!("WARNING: Sender device has no key signature (legacy device)");
             }
@@ -286,8 +308,12 @@ async fn setup_group_key(
             exchange
                 .decrypt_from_device(&gk_resp.encrypted_key, &peer_pub, version)
                 .map_err(|e| e.to_string())?;
-            info!("Received group key v{} from device {} (fingerprint: {})",
-                version, gk_resp.from_device_id, KeyPair::short_fingerprint(&peer_pub));
+            info!(
+                "Received group key v{} from device {} (fingerprint: {})",
+                version,
+                gk_resp.from_device_id,
+                KeyPair::short_fingerprint(&peer_pub)
+            );
 
             // Save keyring
             let keyring_path = AppConfig::keyring_path(config_dir);
@@ -307,25 +333,32 @@ async fn setup_group_key(
                 if dev.status != DeviceStatus::Approved {
                     continue;
                 }
-                if let Some(pk_bytes) = &dev.public_key {
-                    if let Ok(peer_pub) = KeyPair::parse_public_key(pk_bytes) {
-                        if let Some(sig) = &dev.public_key_sig {
-                            if let Err(e) = KeyPair::verify_public_key_signature(&peer_pub, sig) {
-                                info!("SECURITY: Device {} ({}) has invalid key signature, skipping: {e}", dev.name, dev.id);
-                                continue;
-                            }
-                        }
+                if let Some(pk_bytes) = &dev.public_key
+                    && let Ok(peer_pub) = KeyPair::parse_public_key(pk_bytes)
+                {
+                    if let Some(sig) = &dev.public_key_sig
+                        && let Err(e) = KeyPair::verify_public_key_signature(&peer_pub, sig)
+                    {
+                        info!(
+                            "SECURITY: Device {} ({}) has invalid key signature, skipping: {e}",
+                            dev.name, dev.id
+                        );
+                        continue;
+                    }
 
-                        // Pin approved peer's key
-                        let _ = verifier.migrate_legacy(&dev.id, &peer_pub);
+                    // Pin approved peer's key
+                    let _ = verifier.migrate_legacy(&dev.id, &peer_pub);
 
-                        if let Ok(encrypted) = exchange.encrypt_for_device(&peer_pub) {
-                            store_keys.push(StoreGroupKeyEntry {
-                                device_id: dev.id.clone(),
-                                encrypted_key: encrypted,
-                            });
-                            info!("Encrypted group key for device {} (fingerprint: {})", dev.name, KeyPair::short_fingerprint(&peer_pub));
-                        }
+                    if let Ok(encrypted) = exchange.encrypt_for_device(&peer_pub) {
+                        store_keys.push(StoreGroupKeyEntry {
+                            device_id: dev.id.clone(),
+                            encrypted_key: encrypted,
+                        });
+                        info!(
+                            "Encrypted group key for device {} (fingerprint: {})",
+                            dev.name,
+                            KeyPair::short_fingerprint(&peer_pub)
+                        );
                     }
                 }
             }
@@ -371,10 +404,10 @@ pub async fn connect(
 
             // Try loading cached keyring from disk first
             let keyring_path = AppConfig::keyring_path(&ctx.config_dir);
-            if keyring_path.exists() {
-                if let Err(e) = exchange.load_keyring(&keyring_path) {
-                    info!("Could not load cached keyring, will fetch from server: {e}");
-                }
+            if keyring_path.exists()
+                && let Err(e) = exchange.load_keyring(&keyring_path)
+            {
+                info!("Could not load cached keyring, will fetch from server: {e}");
             }
 
             // If keyring didn't have keys, fetch from server
@@ -410,7 +443,11 @@ pub async fn connect(
 
     // Create WebSocket connection (load token from secure storage)
     let token_store = TokenStore::new(&ctx.config_dir);
-    let ws_token = token_store.load_access_token().ok().flatten().unwrap_or_default();
+    let ws_token = token_store
+        .load_access_token()
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     let fingerprint = crate::fingerprint::generate_device_fingerprint(&config.user_id).ok();
     let (ws_conn, mut event_rx) = WsConnection::new(&config.server_url, &ws_token, fingerprint);
     let ws_conn = Arc::new(ws_conn);
@@ -447,8 +484,7 @@ pub async fn connect(
                     let current = ctx.state.read().await.clone();
                     if current != AppState::Disconnected {
                         *ctx.state.write().await = AppState::Connecting;
-                        let _ =
-                            handle.emit("connection-state-changed", AppState::Connecting);
+                        let _ = handle.emit("connection-state-changed", AppState::Connecting);
                     }
                 }
                 WsEvent::ClipboardNew(payload) => {
@@ -461,14 +497,15 @@ pub async fn connect(
                             exchange.decrypt_payload(&payload.entry.encrypted_data, kv)
                         {
                             let mut meta = Metadata::default();
-                            if !payload.entry.metadata.is_empty() {
-                                if let Ok(meta_encrypted) = base64::engine::general_purpose::STANDARD.decode(&payload.entry.metadata) {
-                                    if let Ok(meta_bytes) = exchange.decrypt_payload(&meta_encrypted, kv) {
-                                        if let Ok(m) = serde_json::from_slice(&meta_bytes) {
-                                            meta = m;
-                                        }
-                                    }
-                                }
+                            if !payload.entry.metadata.is_empty()
+                                && let Ok(meta_encrypted) =
+                                    base64::engine::general_purpose::STANDARD
+                                        .decode(&payload.entry.metadata)
+                                && let Ok(meta_bytes) =
+                                    exchange.decrypt_payload(&meta_encrypted, kv)
+                                && let Ok(m) = serde_json::from_slice(&meta_bytes)
+                            {
+                                meta = m;
                             }
 
                             let plain = PlainEntry {
@@ -504,7 +541,10 @@ pub async fn connect(
                                         }
                                         let flag = ctx.skip_clipboard.clone();
                                         tokio::spawn(async move {
-                                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                            tokio::time::sleep(std::time::Duration::from_millis(
+                                                500,
+                                            ))
+                                            .await;
                                             flag.store(false, Ordering::SeqCst);
                                         });
                                     }
@@ -514,14 +554,17 @@ pub async fn connect(
                                     ctx.skip_clipboard.store(true, Ordering::SeqCst);
                                     let write_ok = tokio::task::spawn_blocking(move || {
                                         set_clipboard_image(&img_data)
-                                    }).await.unwrap_or(false);
+                                    })
+                                    .await
+                                    .unwrap_or(false);
 
                                     if !write_ok {
                                         error!("Failed to write image to clipboard");
                                     }
                                     let flag = ctx.skip_clipboard.clone();
                                     tokio::spawn(async move {
-                                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                        tokio::time::sleep(std::time::Duration::from_millis(500))
+                                            .await;
                                         flag.store(false, Ordering::SeqCst);
                                     });
                                 }
@@ -540,7 +583,10 @@ pub async fn connect(
                                         }
                                         let flag = ctx.skip_clipboard.clone();
                                         tokio::spawn(async move {
-                                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                            tokio::time::sleep(std::time::Duration::from_millis(
+                                                500,
+                                            ))
+                                            .await;
                                             flag.store(false, Ordering::SeqCst);
                                         });
                                     }
@@ -565,12 +611,16 @@ pub async fn connect(
                                             }
                                         }
                                         ContentType::Image => "Image copied".into(),
-                                        ContentType::File => {
-                                            plain.metadata.filename.clone().unwrap_or_else(|| "File received".into())
-                                        }
+                                        ContentType::File => plain
+                                            .metadata
+                                            .filename
+                                            .clone()
+                                            .unwrap_or_else(|| "File received".into()),
                                     };
                                     use tauri_plugin_notification::NotificationExt;
-                                    let _ = handle.notification().builder()
+                                    let _ = handle
+                                        .notification()
+                                        .builder()
                                         .title(title)
                                         .body(body)
                                         .show();
@@ -602,23 +652,35 @@ pub async fn connect(
                                 let peer_pub = KeyPair::parse_public_key(&gk_resp.from_public_key);
                                 if let Ok(peer_pub) = peer_pub {
                                     // Verify signature
-                                    if let Some(sig) = &gk_resp.from_public_key_sig {
-                                        if let Err(e) = KeyPair::verify_public_key_signature(&peer_pub, sig) {
-                                            error!("SECURITY: Group key sender signature invalid: {e}");
-                                            continue;
-                                        }
+                                    if let Some(sig) = &gk_resp.from_public_key_sig
+                                        && let Err(e) =
+                                            KeyPair::verify_public_key_signature(&peer_pub, sig)
+                                    {
+                                        error!("SECURITY: Group key sender signature invalid: {e}");
+                                        continue;
                                     }
                                     // TOFU check
-                                    if let Ok(mut verifier) = crate::crypto::verify::KeyVerifier::new(&ctx.config_dir) {
-                                        if let Err(e) = verifier.migrate_legacy(&gk_resp.from_device_id, &peer_pub) {
-                                            error!("SECURITY: Group key sender key verification failed: {e}");
-                                            continue;
-                                        }
+                                    if let Ok(mut verifier) =
+                                        crate::crypto::verify::KeyVerifier::new(&ctx.config_dir)
+                                        && let Err(e) = verifier
+                                            .migrate_legacy(&gk_resp.from_device_id, &peer_pub)
+                                    {
+                                        error!(
+                                            "SECURITY: Group key sender key verification failed: {e}"
+                                        );
+                                        continue;
                                     }
 
                                     let mut new_exchange = KeyExchange::new(kp);
                                     let version = gk_resp.version;
-                                    if new_exchange.decrypt_from_device(&gk_resp.encrypted_key, &peer_pub, version).is_ok() {
+                                    if new_exchange
+                                        .decrypt_from_device(
+                                            &gk_resp.encrypted_key,
+                                            &peer_pub,
+                                            version,
+                                        )
+                                        .is_ok()
+                                    {
                                         // Preserve old key versions from existing exchange
                                         if let Some(old_exch) = ctx.exchange.lock().await.as_ref() {
                                             for (&v, k) in &old_exch.keys_by_version {
@@ -628,7 +690,10 @@ pub async fn connect(
                                             }
                                         }
                                         *ctx.exchange.lock().await = Some(new_exchange);
-                                        info!("Group key refreshed successfully from device {} (v{})", gk_resp.from_device_id, version);
+                                        info!(
+                                            "Group key refreshed successfully from device {} (v{})",
+                                            gk_resp.from_device_id, version
+                                        );
                                     } else {
                                         error!("Failed to decrypt new group key");
                                     }
@@ -675,10 +740,13 @@ pub async fn connect(
 // === Image clipboard helpers (desktop only) ===
 
 #[cfg(desktop)]
-#[cfg(desktop)]
 enum ClipboardContent {
     Text(String),
-    Image { rgba: Vec<u8>, width: usize, height: usize },
+    Image {
+        rgba: Vec<u8>,
+        width: usize,
+        height: usize,
+    },
     Empty,
 }
 
@@ -754,10 +822,10 @@ async fn clipboard_monitor(handle: tauri::AppHandle, ws: Arc<WsConnection>) {
                 Err(_) => return ClipboardContent::Empty,
             };
             // Try text first
-            if let Ok(text) = c.get_text() {
-                if !text.is_empty() {
-                    return ClipboardContent::Text(text);
-                }
+            if let Ok(text) = c.get_text()
+                && !text.is_empty()
+            {
+                return ClipboardContent::Text(text);
             }
             // Try image
             if let Ok(img) = c.get_image() {
@@ -782,7 +850,11 @@ async fn clipboard_monitor(handle: tauri::AppHandle, ws: Arc<WsConnection>) {
                 };
                 (ContentType::Text, bytes, meta)
             }
-            ClipboardContent::Image { rgba, width, height } => {
+            ClipboardContent::Image {
+                rgba,
+                width,
+                height,
+            } => {
                 // Encode RGBA to PNG
                 let png_bytes = match encode_rgba_to_png(&rgba, width as u32, height as u32) {
                     Some(b) => b,
@@ -828,7 +900,10 @@ async fn clipboard_monitor(handle: tauri::AppHandle, ws: Arc<WsConnection>) {
         };
 
         let meta_json = serde_json::to_vec(&meta).unwrap_or_default();
-        let enc_meta_bytes = exchange.encrypt_payload(&meta_json).map(|(d, _)| d).unwrap_or_default();
+        let enc_meta_bytes = exchange
+            .encrypt_payload(&meta_json)
+            .map(|(d, _)| d)
+            .unwrap_or_default();
 
         // Must drop exchange lock before other operations
         drop(exchange_guard);
@@ -943,7 +1018,10 @@ async fn mobile_clipboard_monitor(handle: tauri::AppHandle, ws: Arc<WsConnection
             ..Default::default()
         };
         let meta_json = serde_json::to_vec(&meta).unwrap_or_default();
-        let enc_meta_bytes = exchange.encrypt_payload(&meta_json).map(|(d, _)| d).unwrap_or_default();
+        let enc_meta_bytes = exchange
+            .encrypt_payload(&meta_json)
+            .map(|(d, _)| d)
+            .unwrap_or_default();
         drop(exchange_guard);
 
         let enc_meta_b64 = base64::engine::general_purpose::STANDARD.encode(&enc_meta_bytes);
@@ -1039,16 +1117,21 @@ pub struct MyApprovalStatusInfo {
 }
 
 #[tauri::command]
-pub async fn get_pending_devices(ctx: State<'_, AppContext>) -> Result<Vec<PendingDeviceEntry>, String> {
+pub async fn get_pending_devices(
+    ctx: State<'_, AppContext>,
+) -> Result<Vec<PendingDeviceEntry>, String> {
     let pending = {
         let api = ctx.api.lock().await;
         api.get_pending_devices().await.map_err(|e| e.to_string())?
     };
-    Ok(pending.iter().map(|d| PendingDeviceEntry {
-        id: d.id.clone(),
-        name: d.name.clone(),
-        created_at: d.created_at.to_rfc3339(),
-    }).collect())
+    Ok(pending
+        .iter()
+        .map(|d| PendingDeviceEntry {
+            id: d.id.clone(),
+            name: d.name.clone(),
+            created_at: d.created_at.to_rfc3339(),
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -1059,12 +1142,15 @@ pub async fn begin_device_approval(
     // Lock API briefly to call begin_approval, then release
     let session = {
         let api = ctx.api.lock().await;
-        api.begin_approval(&pending_device_id).await.map_err(|e| e.to_string())?
+        api.begin_approval(&pending_device_id)
+            .await
+            .map_err(|e| e.to_string())?
     };
 
     // Derive 8-digit verification code from ECDH between our key and the pending device's key
     let key_path = AppConfig::key_path(&ctx.config_dir);
-    let kp = KeyPair::load_or_generate(&key_path).map_err(|e| format!("Failed to load key: {e}"))?;
+    let kp =
+        KeyPair::load_or_generate(&key_path).map_err(|e| format!("Failed to load key: {e}"))?;
 
     let pending_pub = KeyPair::parse_public_key(&session.pending_public_key)
         .map_err(|e| format!("Invalid pending device public key: {e}"))?;
@@ -1093,7 +1179,8 @@ pub async fn confirm_device_approval(
         (all, pending)
     };
 
-    let pending_dev = pending_devices.iter()
+    let pending_dev = pending_devices
+        .iter()
         .find(|d| d.id == pending_device_id)
         .ok_or("Pending device not found")?;
 
@@ -1104,10 +1191,10 @@ pub async fn confirm_device_approval(
         if dev.status != DeviceStatus::Approved {
             continue;
         }
-        if let Some(pk_bytes) = &dev.public_key {
-            if let Ok(pub_key) = KeyPair::parse_public_key(pk_bytes) {
-                peer_devices.push((dev.id.clone(), pub_key));
-            }
+        if let Some(pk_bytes) = &dev.public_key
+            && let Ok(pub_key) = KeyPair::parse_public_key(pk_bytes)
+        {
+            peer_devices.push((dev.id.clone(), pub_key));
         }
     }
 
@@ -1119,13 +1206,20 @@ pub async fn confirm_device_approval(
     // Generate next group key version (exchange lock only)
     let req = {
         let mut exchange_guard = ctx.exchange.lock().await;
-        let exchange = exchange_guard.as_mut().ok_or("Encryption not initialized")?;
+        let exchange = exchange_guard
+            .as_mut()
+            .ok_or("Encryption not initialized")?;
 
-        let (new_version, wrapped) = exchange.generate_next_version(&peer_devices)
+        let (new_version, wrapped) = exchange
+            .generate_next_version(&peer_devices)
             .map_err(|e| format!("Key rotation failed: {e}"))?;
 
-        let wrapped_keys: Vec<StoreGroupKeyEntry> = wrapped.into_iter()
-            .map(|(device_id, encrypted_key)| StoreGroupKeyEntry { device_id, encrypted_key })
+        let wrapped_keys: Vec<StoreGroupKeyEntry> = wrapped
+            .into_iter()
+            .map(|(device_id, encrypted_key)| StoreGroupKeyEntry {
+                device_id,
+                encrypted_key,
+            })
             .collect();
 
         // Save keyring while we have the lock
@@ -1143,10 +1237,15 @@ pub async fn confirm_device_approval(
     // Send approval with API lock (exchange is released)
     {
         let api = ctx.api.lock().await;
-        api.approve_device(&pending_device_id, &req).await.map_err(|e| e.to_string())?;
+        api.approve_device(&pending_device_id, &req)
+            .await
+            .map_err(|e| e.to_string())?;
     }
 
-    info!("Device {} approved, group key rotated to v{}", pending_device_id, req.new_version);
+    info!(
+        "Device {} approved, group key rotated to v{}",
+        pending_device_id, req.new_version
+    );
     Ok(())
 }
 
@@ -1157,23 +1256,32 @@ pub async fn reject_pending_device(
 ) -> Result<(), String> {
     {
         let api = ctx.api.lock().await;
-        api.reject_device(&pending_device_id).await.map_err(|e| e.to_string())?;
+        api.reject_device(&pending_device_id)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     info!("Device {} rejected", pending_device_id);
     Ok(())
 }
 
 #[tauri::command]
-pub async fn get_my_approval_status(ctx: State<'_, AppContext>) -> Result<MyApprovalStatusInfo, String> {
+pub async fn get_my_approval_status(
+    ctx: State<'_, AppContext>,
+) -> Result<MyApprovalStatusInfo, String> {
     let resp = {
         let api = ctx.api.lock().await;
-        api.get_my_approval_status().await.map_err(|e| e.to_string())?
+        api.get_my_approval_status()
+            .await
+            .map_err(|e| e.to_string())?
     };
 
     // If there's an active approval session, derive the verification code
-    let approval_code = if let (Some(_session_id), Some(approver_pub_bytes)) = (&resp.session_id, &resp.approver_public_key) {
+    let approval_code = if let (Some(_session_id), Some(approver_pub_bytes)) =
+        (&resp.session_id, &resp.approver_public_key)
+    {
         let key_path = AppConfig::key_path(&ctx.config_dir);
-        let kp = KeyPair::load_or_generate(&key_path).map_err(|e| format!("Failed to load key: {e}"))?;
+        let kp =
+            KeyPair::load_or_generate(&key_path).map_err(|e| format!("Failed to load key: {e}"))?;
         let approver_pub = KeyPair::parse_public_key(approver_pub_bytes)
             .map_err(|e| format!("Invalid approver public key: {e}"))?;
         derive_approval_code(&kp.private, &approver_pub, &kp.public).ok()
@@ -1223,7 +1331,11 @@ pub async fn search_history(
 }
 
 #[tauri::command]
-pub async fn copy_entry(#[allow(unused)] app_handle: tauri::AppHandle, ctx: State<'_, AppContext>, entry_id: String) -> Result<(), String> {
+pub async fn copy_entry(
+    #[allow(unused)] app_handle: tauri::AppHandle,
+    ctx: State<'_, AppContext>,
+    entry_id: String,
+) -> Result<(), String> {
     let history = ctx.history.lock().await;
     let history = history.as_ref().ok_or("History not initialized")?;
 
@@ -1244,7 +1356,10 @@ pub async fn copy_entry(#[allow(unused)] app_handle: tauri::AppHandle, ctx: Stat
             {
                 // On mobile, use tauri clipboard plugin
                 use tauri_plugin_clipboard_manager::ClipboardExt;
-                app_handle.clipboard().write_text(&text).map_err(|e| e.to_string())?;
+                app_handle
+                    .clipboard()
+                    .write_text(&text)
+                    .map_err(|e| e.to_string())?;
             }
         }
         ContentType::Image => {
@@ -1318,7 +1433,9 @@ pub async fn sync_history(ctx: State<'_, AppContext>) -> Result<usize, String> {
         // Decrypt entries — hold exchange lock only for decryption
         let plain_entries = {
             let exchange_guard = ctx.exchange.lock().await;
-            let exchange = exchange_guard.as_ref().ok_or("Encryption not initialized")?;
+            let exchange = exchange_guard
+                .as_ref()
+                .ok_or("Encryption not initialized")?;
 
             let mut entries = Vec::new();
             for entry in &resp.entries {
@@ -1335,14 +1452,13 @@ pub async fn sync_history(ctx: State<'_, AppContext>) -> Result<usize, String> {
                 };
 
                 let mut meta = Metadata::default();
-                if !entry.metadata.is_empty() {
-                    if let Ok(meta_encrypted) = base64::engine::general_purpose::STANDARD.decode(&entry.metadata) {
-                        if let Ok(meta_bytes) = exchange.decrypt_payload(&meta_encrypted, kv) {
-                            if let Ok(m) = serde_json::from_slice(&meta_bytes) {
-                                meta = m;
-                            }
-                        }
-                    }
+                if !entry.metadata.is_empty()
+                    && let Ok(meta_encrypted) =
+                        base64::engine::general_purpose::STANDARD.decode(&entry.metadata)
+                    && let Ok(meta_bytes) = exchange.decrypt_payload(&meta_encrypted, kv)
+                    && let Ok(m) = serde_json::from_slice(&meta_bytes)
+                {
+                    meta = m;
                 }
 
                 entries.push(PlainEntry {
@@ -1494,15 +1610,26 @@ pub async fn check_update(ctx: State<'_, AppContext>) -> Result<Option<UpdateInf
     }
 
     let current_version = env!("CARGO_PKG_VERSION");
-    let platform = if cfg!(target_os = "macos") { "darwin" }
-        else if cfg!(target_os = "windows") { "windows" }
-        else if cfg!(target_os = "linux") { "linux" }
-        else if cfg!(target_os = "android") { "android" }
-        else if cfg!(target_os = "ios") { "ios" }
-        else { "unknown" };
-    let arch = if cfg!(target_arch = "aarch64") { "arm64" }
-        else if cfg!(target_arch = "x86_64") { "amd64" }
-        else { "" };
+    let platform = if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "android") {
+        "android"
+    } else if cfg!(target_os = "ios") {
+        "ios"
+    } else {
+        "unknown"
+    };
+    let arch = if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else if cfg!(target_arch = "x86_64") {
+        "amd64"
+    } else {
+        ""
+    };
 
     match api.check_update(platform, arch, current_version).await {
         Ok(resp) => {
@@ -1555,7 +1682,7 @@ pub async fn download_and_install_update(
     // Extract filename from URL path
     let filename = full_url
         .split('/')
-        .last()
+        .next_back()
         .unwrap_or("cpmesh-update")
         .to_string();
 
@@ -1567,8 +1694,7 @@ pub async fn download_and_install_update(
         .await
         .map_err(|e| format!("Failed to read download: {e}"))?;
 
-    std::fs::write(&file_path, &bytes)
-        .map_err(|e| format!("Failed to save file: {e}"))?;
+    std::fs::write(&file_path, &bytes).map_err(|e| format!("Failed to save file: {e}"))?;
 
     info!("Update downloaded to: {}", file_path.display());
 
@@ -1593,19 +1719,24 @@ pub struct SocialStatus {
 
 /// Check if the server supports social/OIDC login.
 #[tauri::command]
-pub async fn check_social_status(
-    server_url: String,
-) -> Result<SocialStatus, String> {
-    let url = format!("{}/api/auth/social/status", server_url.trim_end_matches('/'));
+pub async fn check_social_status(server_url: String) -> Result<SocialStatus, String> {
+    let url = format!(
+        "{}/api/auth/social/status",
+        server_url.trim_end_matches('/')
+    );
     let client = reqwest::Client::new();
-    let resp = client.get(&url)
+    let resp = client
+        .get(&url)
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
         .map_err(|e| format!("Failed to reach server: {e}"))?;
 
     if !resp.status().is_success() {
-        return Ok(SocialStatus { enabled: false, provider: String::new() });
+        return Ok(SocialStatus {
+            enabled: false,
+            provider: String::new(),
+        });
     }
 
     #[derive(serde::Deserialize)]
@@ -1614,7 +1745,10 @@ pub async fn check_social_status(
         provider: String,
     }
 
-    let data: StatusResp = resp.json().await.map_err(|e| format!("Invalid response: {e}"))?;
+    let data: StatusResp = resp
+        .json()
+        .await
+        .map_err(|e| format!("Invalid response: {e}"))?;
     Ok(SocialStatus {
         enabled: data.enabled,
         provider: data.provider,
@@ -1640,7 +1774,10 @@ pub async fn setup_with_oauth_tokens(
     api.set_tokens(access_token, refresh_token);
 
     // Get user info to obtain user_id for fingerprinting
-    let user_info = api.get_me().await.map_err(|e| format!("Failed to get user info: {e}"))?;
+    let user_info = api
+        .get_me()
+        .await
+        .map_err(|e| format!("Failed to get user info: {e}"))?;
     let user_id = user_info.id.clone();
 
     let device_name = crate::fingerprint::auto_device_name();
@@ -1648,7 +1785,8 @@ pub async fn setup_with_oauth_tokens(
 
     // Generate device key pair
     let key_path = AppConfig::key_path(&ctx.config_dir);
-    let kp = KeyPair::load_or_generate(&key_path).map_err(|e| format!("Key generation failed: {e}"))?;
+    let kp =
+        KeyPair::load_or_generate(&key_path).map_err(|e| format!("Key generation failed: {e}"))?;
     let pub_bytes = kp.public_key_bytes();
     let sig = kp.sign_public_key();
 
@@ -1671,10 +1809,12 @@ pub async fn setup_with_oauth_tokens(
 
     // Save tokens to secure storage
     let token_store = TokenStore::new(&ctx.config_dir);
-    token_store.save_tokens(
-        api.access_token().unwrap_or_default(),
-        api.refresh_token().unwrap_or_default(),
-    ).map_err(|e| format!("Token save failed: {e}"))?;
+    token_store
+        .save_tokens(
+            api.access_token().unwrap_or_default(),
+            api.refresh_token().unwrap_or_default(),
+        )
+        .map_err(|e| format!("Token save failed: {e}"))?;
 
     // Save config
     let mut config = ctx.config.write().await;
@@ -1683,7 +1823,9 @@ pub async fn setup_with_oauth_tokens(
     config.device_id = device_id;
     config.device_name = device_name;
     config.device_status = device_status;
-    config.save(&ctx.config_dir).map_err(|e| format!("Config save failed: {e}"))?;
+    config
+        .save(&ctx.config_dir)
+        .map_err(|e| format!("Config save failed: {e}"))?;
 
     // Update state
     *ctx.state.write().await = AppState::Disconnected;
@@ -1712,9 +1854,7 @@ pub struct UserInfo {
 
 /// Fetch the current user's profile from the server.
 #[tauri::command]
-pub async fn get_user_info(
-    ctx: State<'_, AppContext>,
-) -> Result<UserInfo, String> {
+pub async fn get_user_info(ctx: State<'_, AppContext>) -> Result<UserInfo, String> {
     let api = ctx.api.lock().await;
     api.get_me().await.map_err(|e| e.to_string())
 }
@@ -1734,9 +1874,13 @@ pub async fn exchange_oauth_code(
     code: String,
     code_verifier: String,
 ) -> Result<OAuthTokens, String> {
-    let url = format!("{}/api/auth/social/exchange", server_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/api/auth/social/exchange",
+        server_url.trim_end_matches('/')
+    );
     let client = reqwest::Client::new();
-    let resp = client.post(&url)
+    let resp = client
+        .post(&url)
         .timeout(std::time::Duration::from_secs(15))
         .json(&serde_json::json!({
             "code": code,
@@ -1752,7 +1896,11 @@ pub async fn exchange_oauth_code(
         // Try to extract error message from JSON body
         let msg = serde_json::from_str::<serde_json::Value>(&body)
             .ok()
-            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()))
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(|e| e.as_str())
+                    .map(|s| s.to_string())
+            })
             .unwrap_or_else(|| format!("Exchange failed (HTTP {status})"));
         return Err(msg);
     }
@@ -1760,4 +1908,132 @@ pub async fn exchange_oauth_code(
     resp.json::<OAuthTokens>()
         .await
         .map_err(|e| format!("Invalid exchange response: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn plain(content_type: ContentType, data: &[u8], metadata: Metadata) -> PlainEntry {
+        PlainEntry {
+            id: "e1".into(),
+            device_id: "d1".into(),
+            device_name: "Laptop".into(),
+            content_type,
+            data: data.to_vec(),
+            metadata,
+            created_at: chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        }
+    }
+
+    #[test]
+    fn truncate_preview_keeps_short_text_intact() {
+        assert_eq!(truncate_preview("hello", 200), "hello");
+        assert_eq!(truncate_preview("", 200), "");
+        let exactly = "x".repeat(200);
+        assert_eq!(truncate_preview(&exactly, 200), exactly);
+    }
+
+    #[test]
+    fn truncate_preview_adds_ellipsis_and_respects_char_boundaries() {
+        let long = "a".repeat(250);
+        let out = truncate_preview(&long, 200);
+        assert_eq!(out.len(), 203);
+        assert!(out.ends_with("..."));
+
+        // Multi-byte characters must not be split (this used to panic on byte slicing)
+        let emoji = "😀".repeat(150);
+        let out = truncate_preview(&emoji, 200);
+        assert_eq!(out, emoji, "150 chars is under the limit");
+        let emoji = "😀".repeat(300);
+        let out = truncate_preview(&emoji, 200);
+        assert_eq!(out.chars().count(), 203);
+        assert!(out.ends_with("..."));
+    }
+
+    #[test]
+    fn history_entry_text_preview_and_fields() {
+        let e = plain(
+            ContentType::Text,
+            b"copied text",
+            Metadata {
+                size: 11,
+                ..Metadata::default()
+            },
+        );
+        let h = plain_to_history_entry(&e);
+        assert_eq!(h.id, "e1");
+        assert_eq!(h.device_name, "Laptop");
+        assert_eq!(h.content_type, "text");
+        assert_eq!(h.preview, "copied text");
+        assert_eq!(h.size, 11);
+        assert_eq!(h.created_at, "2023-11-14T22:13:20+00:00");
+    }
+
+    #[test]
+    fn history_entry_text_preview_truncates_long_text() {
+        let text = "é".repeat(500); // 2 bytes per char; byte slicing at 200 would panic
+        let e = plain(ContentType::Text, text.as_bytes(), Metadata::default());
+        let h = plain_to_history_entry(&e);
+        assert_eq!(h.preview.chars().count(), 203);
+        assert!(h.preview.ends_with("..."));
+    }
+
+    #[test]
+    fn history_entry_image_preview_uses_dimensions() {
+        let e = plain(
+            ContentType::Image,
+            &[0, 1, 2],
+            Metadata {
+                width: Some(1920),
+                height: Some(1080),
+                ..Metadata::default()
+            },
+        );
+        assert_eq!(plain_to_history_entry(&e).preview, "Image 1920x1080");
+        assert_eq!(plain_to_history_entry(&e).content_type, "image");
+
+        let e = plain(ContentType::Image, &[0], Metadata::default());
+        assert_eq!(plain_to_history_entry(&e).preview, "Image 0x0");
+    }
+
+    #[test]
+    fn history_entry_file_preview_uses_filename() {
+        let e = plain(
+            ContentType::File,
+            &[0],
+            Metadata {
+                filename: Some("report.pdf".into()),
+                ..Metadata::default()
+            },
+        );
+        assert_eq!(plain_to_history_entry(&e).preview, "report.pdf");
+        assert_eq!(plain_to_history_entry(&e).content_type, "file");
+
+        let e = plain(ContentType::File, &[0], Metadata::default());
+        assert_eq!(plain_to_history_entry(&e).preview, "Unknown file");
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn encode_rgba_to_png_roundtrips_pixels() {
+        // 2x2 image: red, green / blue, transparent
+        let rgba: Vec<u8> = vec![
+            255, 0, 0, 255, 0, 255, 0, 255, //
+            0, 0, 255, 255, 0, 0, 0, 0,
+        ];
+        let png = encode_rgba_to_png(&rgba, 2, 2).expect("valid dimensions encode");
+        assert!(png.starts_with(&[0x89, b'P', b'N', b'G']));
+
+        let decoded = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert_eq!(decoded.dimensions(), (2, 2));
+        assert_eq!(decoded.as_raw(), &rgba);
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn encode_rgba_to_png_rejects_mismatched_buffer() {
+        assert!(encode_rgba_to_png(&[0u8; 3], 2, 2).is_none());
+    }
 }

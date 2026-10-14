@@ -38,42 +38,40 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         tray.set_show_menu_on_left_click(false)?;
 
         let handle = app.handle().clone();
-        tray.on_menu_event(move |app_handle, event| {
-            match event.id().as_ref() {
-                "show" => {
-                    if let Some(w) = app_handle.get_webview_window("main") {
-                        let _ = w.show();
-                        let _ = w.set_focus();
-                    }
+        tray.on_menu_event(move |app_handle, event| match event.id().as_ref() {
+            "show" => {
+                if let Some(w) = app_handle.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.set_focus();
                 }
-                "connect" => {
-                    let h = handle.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let ctx: tauri::State<'_, AppContext> = h.state::<AppContext>();
-                        let _ = commands::connect(h.clone(), ctx).await;
-                    });
-                }
-                "disconnect" => {
-                    let h = handle.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let ctx: tauri::State<'_, AppContext> = h.state::<AppContext>();
-                        let _ = commands::disconnect(h.clone(), ctx).await;
-                    });
-                }
-                "quit" => {
-                    app_handle.exit(0);
-                }
-                _ => {}
             }
+            "connect" => {
+                let h = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let ctx: tauri::State<'_, AppContext> = h.state::<AppContext>();
+                    let _ = commands::connect(h.clone(), ctx).await;
+                });
+            }
+            "disconnect" => {
+                let h = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let ctx: tauri::State<'_, AppContext> = h.state::<AppContext>();
+                    let _ = commands::disconnect(h.clone(), ctx).await;
+                });
+            }
+            "quit" => {
+                app_handle.exit(0);
+            }
+            _ => {}
         });
 
         let handle2 = app.handle().clone();
         tray.on_tray_icon_event(move |_tray, event| {
-            if let TrayIconEvent::DoubleClick { .. } = event {
-                if let Some(w) = handle2.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.set_focus();
-                }
+            if let TrayIconEvent::DoubleClick { .. } = event
+                && let Some(w) = handle2.get_webview_window("main")
+            {
+                let _ = w.show();
+                let _ = w.set_focus();
             }
         });
     }
@@ -146,24 +144,29 @@ pub fn run() {
 
             // Check argv for a deep-link URL (e.g. cpmesh://auth/callback?code=...)
             for arg in &argv {
-                if arg.starts_with("cpmesh://auth/callback") {
-                    if let Some(query_str) = arg.split('?').nth(1) {
-                        let params: std::collections::HashMap<String, String> = query_str
-                            .split('&')
-                            .filter_map(|pair| {
-                                let mut parts = pair.splitn(2, '=');
-                                Some((
-                                    parts.next()?.to_string(),
-                                    urlencoding::decode(parts.next().unwrap_or("")).unwrap_or_default().to_string(),
-                                ))
-                            })
-                            .collect();
+                if arg.starts_with("cpmesh://auth/callback")
+                    && let Some(query_str) = arg.split('?').nth(1)
+                {
+                    let params: std::collections::HashMap<String, String> = query_str
+                        .split('&')
+                        .filter_map(|pair| {
+                            let mut parts = pair.splitn(2, '=');
+                            Some((
+                                parts.next()?.to_string(),
+                                urlencoding::decode(parts.next().unwrap_or(""))
+                                    .unwrap_or_default()
+                                    .to_string(),
+                            ))
+                        })
+                        .collect();
 
-                        if let Some(code) = params.get("code") {
-                            let _ = app.emit("oauth-callback", serde_json::json!({
+                    if let Some(code) = params.get("code") {
+                        let _ = app.emit(
+                            "oauth-callback",
+                            serde_json::json!({
                                 "code": code,
-                            }));
-                        }
+                            }),
+                        );
                     }
                 }
             }
@@ -203,7 +206,10 @@ pub fn run() {
         ])
         .setup(|app| {
             // Resolve config directory: use Tauri's app data dir (works on all platforms including Android/iOS)
-            let cfg_dir = app.path().app_data_dir().unwrap_or_else(|_| config::config_dir());
+            let cfg_dir = app
+                .path()
+                .app_data_dir()
+                .unwrap_or_else(|_| config::config_dir());
             std::fs::create_dir_all(&cfg_dir).ok();
             log::info!("Config directory: {}", cfg_dir.display());
 
@@ -224,15 +230,20 @@ pub fn run() {
                                         let mut parts = pair.splitn(2, '=');
                                         Some((
                                             parts.next()?.to_string(),
-                                            urlencoding::decode(parts.next().unwrap_or("")).unwrap_or_default().to_string(),
+                                            urlencoding::decode(parts.next().unwrap_or(""))
+                                                .unwrap_or_default()
+                                                .to_string(),
                                         ))
                                     })
                                     .collect();
 
                                 if let Some(code) = params.get("code") {
-                                    let _ = handle_for_deep_link.emit("oauth-callback", serde_json::json!({
-                                        "code": code,
-                                    }));
+                                    let _ = handle_for_deep_link.emit(
+                                        "oauth-callback",
+                                        serde_json::json!({
+                                            "code": code,
+                                        }),
+                                    );
                                 }
                             }
                         }
@@ -262,14 +273,17 @@ pub fn run() {
                 {
                     use tauri_plugin_global_shortcut::GlobalShortcutExt;
                     let handle_for_hotkey = app.handle().clone();
-                    if let Err(e) = app.global_shortcut().on_shortcut("CmdOrCtrl+Shift+Space", move |_app, _shortcut, event| {
-                        if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
-                            if let Some(w) = handle_for_hotkey.get_webview_window("main") {
+                    if let Err(e) = app.global_shortcut().on_shortcut(
+                        "CmdOrCtrl+Shift+Space",
+                        move |_app, _shortcut, event| {
+                            if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed
+                                && let Some(w) = handle_for_hotkey.get_webview_window("main")
+                            {
                                 let _ = w.show();
                                 let _ = w.set_focus();
                             }
-                        }
-                    }) {
+                        },
+                    ) {
                         log::error!("Failed to register global shortcut: {e}");
                     }
                 }
@@ -296,11 +310,18 @@ pub fn run() {
 
                         if let Some(server_url) = server_url {
                             let current_version = env!("CARGO_PKG_VERSION");
-                            let platform = if cfg!(target_os = "macos") { "darwin" }
-                                else if cfg!(target_os = "windows") { "windows" }
-                                else { "linux" };
-                            let arch = if cfg!(target_arch = "aarch64") { "arm64" }
-                                else { "amd64" };
+                            let platform = if cfg!(target_os = "macos") {
+                                "darwin"
+                            } else if cfg!(target_os = "windows") {
+                                "windows"
+                            } else {
+                                "linux"
+                            };
+                            let arch = if cfg!(target_arch = "aarch64") {
+                                "arm64"
+                            } else {
+                                "amd64"
+                            };
 
                             let client = api::client::ApiClient::new(&server_url);
                             match client.check_update(platform, arch, current_version).await {
@@ -349,21 +370,26 @@ pub fn run() {
                             *api = api::client::ApiClient::new(&cfg.server_url);
                             let ts = config::TokenStore::new(&ctx.config_dir);
                             let access = ts.load_access_token().ok().flatten().unwrap_or_default();
-                            let refresh = ts.load_refresh_token().ok().flatten().unwrap_or_default();
+                            let refresh =
+                                ts.load_refresh_token().ok().flatten().unwrap_or_default();
                             api.set_tokens(access, refresh);
                         }
 
                         // Try to setup group key
                         {
-                            let api: tokio::sync::MutexGuard<'_, api::client::ApiClient> = ctx.api.lock().await;
+                            let api: tokio::sync::MutexGuard<'_, api::client::ApiClient> =
+                                ctx.api.lock().await;
                             if let Ok(gk) = api.get_group_key().await {
                                 if let Some(gk_resp) = gk {
-                                    if let Ok(peer_pub) =
-                                        crypto::keys::KeyPair::parse_public_key(&gk_resp.from_public_key)
-                                    {
+                                    if let Ok(peer_pub) = crypto::keys::KeyPair::parse_public_key(
+                                        &gk_resp.from_public_key,
+                                    ) {
                                         let version = gk_resp.version;
-                                        let _ = exchange
-                                            .decrypt_from_device(&gk_resp.encrypted_key, &peer_pub, version);
+                                        let _ = exchange.decrypt_from_device(
+                                            &gk_resp.encrypted_key,
+                                            &peer_pub,
+                                            version,
+                                        );
                                     }
                                 } else {
                                     exchange.init_group_key();

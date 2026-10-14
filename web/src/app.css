@@ -1,173 +1,264 @@
-@import '@fontsource/manrope/400.css';
-@import '@fontsource/manrope/500.css';
-@import '@fontsource/manrope/600.css';
-@import '@fontsource/manrope/700.css';
-@import '@fontsource/manrope/800.css';
-@import '@fontsource/space-grotesk/500.css';
-@import '@fontsource/space-grotesk/700.css';
+@import '@fontsource-variable/geist';
+@import '@fontsource-variable/geist-mono';
 @import 'tailwindcss';
 
+/*
+ * cpmesh design tokens — minimal monochrome.
+ *
+ * White surfaces, hairline neutral borders, near-black type set in Geist, and
+ * one accent used sparingly for live indicators and emphasis. Semantic status
+ * colours are muted tints so they never compete with the content.
+ */
 @theme {
-  /* Home / landing page palette */
-  --color-home-bg: #07111f;
-  --color-home-deep: #030814;
-  --color-home-surface: rgba(11,20,35,0.8);
-  --color-home-border: rgba(158,178,201,0.16);
-  --color-home-text: #f5f7fb;
-  --color-home-muted: #9eb2c9;
-  --color-home-dim: #677992;
-  --color-home-accent: #ff7a59;
-  --color-home-cyan: #49c6e5;
-  --color-home-green: #2ad6a0;
-  --color-home-gold: #f4c95d;
+  /* Surfaces */
+  --color-bg: #ffffff;
+  --color-bg-deep: #fafafa;
+  --color-surface: #ffffff;
+  --color-surface-2: #f5f5f5;
+  --color-surface-3: #ebebeb;
 
-  /* App backgrounds */
-  --color-bg: #0b0d14;
-  --color-bg-card: #12151f;
-  --color-bg-sidebar: #0e1019;
-  --color-bg-input: #181b28;
-  --color-bg-hover: #1a1e2e;
-  --color-bg-elevated: #161a26;
+  /* Lines */
+  --color-border: #e5e5e5;
+  --color-border-strong: #d4d4d4;
 
-  /* App borders */
-  --color-border: #1e2235;
-  --color-border-hover: #2d3250;
+  /* Type */
+  --color-ink: #0a0a0a;
+  --color-fg: #171717;
+  --color-muted: #666666;
+  --color-dim: #8f8f8f;
 
-  /* App text */
-  --color-text-DEFAULT: #e8eaf0;
-  --color-text-muted: #6b7194;
-  --color-text-dim: #454b6b;
+  /* Accent (single) */
+  --color-accent: #ff5c38;
+  --color-accent-hover: #e94a27;
 
-  /* Primary */
-  --color-primary: #818cf8;
-  --color-primary-hover: #6d78f2;
-  --color-primary-dim: #3730a3;
-  --color-primary-glow: rgba(129, 140, 248, 0.15);
-  --color-primary-glow-strong: rgba(129, 140, 248, 0.25);
-
-  /* Semantic */
-  --color-danger: #f87171;
-  --color-danger-hover: #ef4444;
-  --color-danger-glow: rgba(248, 113, 113, 0.12);
-  --color-success: #34d399;
-  --color-success-dim: #065f46;
-  --color-success-glow: rgba(52, 211, 153, 0.12);
-  --color-warning: #fbbf24;
-  --color-warning-glow: rgba(251, 191, 36, 0.12);
+  /* Semantic (muted) */
+  --color-success: #16a34a;
+  --color-warning: #d97706;
+  --color-danger: #dc2626;
 
   /* Fonts */
-  --font-sans: 'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  --font-display: 'Space Grotesk', 'Manrope', sans-serif;
+  --font-sans: 'Geist Variable', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'Geist Mono Variable', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 
-  /* Shadows */
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3), 0 1px 3px rgba(0, 0, 0, 0.15);
-  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4), 0 2px 4px rgba(0, 0, 0, 0.2);
-  --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.5), 0 4px 12px rgba(0, 0, 0, 0.3);
-  --shadow-primary: 0 4px 24px rgba(129, 140, 248, 0.2), 0 2px 8px rgba(129, 140, 248, 0.1);
+  /* Elevation — hairlines carry the hierarchy; shadows stay faint */
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.06), 0 1px 2px rgba(0, 0, 0, 0.04);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.06), 0 1px 3px rgba(0, 0, 0, 0.04);
+  --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.08), 0 2px 6px rgba(0, 0, 0, 0.04);
+  --shadow-pop: 0 24px 48px -12px rgba(0, 0, 0, 0.18), 0 0 0 1px rgba(0, 0, 0, 0.04);
 
   /* Radii */
-  --radius-sm: 6px;
-  --radius-DEFAULT: 8px;
-  --radius-lg: 12px;
-  --radius-xl: 16px;
-  --radius-2xl: 20px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+  --radius-2xl: 16px;
 
-  /* Breakpoints */
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
   --breakpoint-3xl: 1920px;
 }
 
-html {
-  scroll-behavior: smooth;
+/* ───────────────────────── Base ───────────────────────── */
+
+@layer base {
+  html {
+    color-scheme: light;
+    scrollbar-gutter: stable;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background-color: var(--color-bg);
+    color: var(--color-fg);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    font-feature-settings: 'cv11', 'ss01';
+  }
+
+  ::selection {
+    background: #171717;
+    color: #ffffff;
+  }
+
+  a {
+    color: inherit;
+    text-decoration: none;
+  }
+
+  button {
+    cursor: pointer;
+    font-family: inherit;
+  }
+
+  button:disabled {
+    cursor: not-allowed;
+  }
+
+  input,
+  select,
+  textarea {
+    font-family: inherit;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-ink);
+    outline-offset: 2px;
+  }
+
+  code,
+  kbd,
+  pre {
+    font-family: var(--font-mono);
+    font-feature-settings: normal;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    text-wrap: balance;
+  }
 }
 
-::selection {
-  background: var(--color-primary-dim);
-  color: var(--color-text-DEFAULT);
+/* ───────────────────────── Components ───────────────────────── */
+
+@layer components {
+  /* Data tables */
+  .tbl {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.875rem;
+  }
+  .tbl th {
+    text-align: left;
+    padding: 0.625rem 1rem;
+    font-size: 0.75rem;
+    font-weight: 500;
+    color: var(--color-muted);
+    border-bottom: 1px solid var(--color-border);
+    background: var(--color-bg-deep);
+    white-space: nowrap;
+  }
+  .tbl td {
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid var(--color-border);
+    vertical-align: middle;
+  }
+  .tbl tbody tr:last-child td {
+    border-bottom: 0;
+  }
+  .tbl tbody tr:hover {
+    background: var(--color-bg-deep);
+  }
+
+  /* Monospace chip for ids / hashes */
+  .mono-chip {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    color: var(--color-muted);
+    background: var(--color-surface-2);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    padding: 0.125rem 0.4rem;
+  }
+
+  /* Status dot; `data-live` adds a soft pulse */
+  .status-dot {
+    position: relative;
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    border-radius: 999px;
+    background: currentColor;
+  }
+  .status-dot[data-live='true']::after {
+    content: '';
+    position: absolute;
+    inset: -3px;
+    border-radius: inherit;
+    border: 1.5px solid currentColor;
+    opacity: 0.5;
+    animation: ping-ring 2s var(--ease-out-expo) infinite;
+  }
+
+  /* Hairline grid used for feature/stat cells: borders only between cells */
+  .cell-grid {
+    display: grid;
+    border-top: 1px solid var(--color-border);
+    border-left: 1px solid var(--color-border);
+  }
+  .cell-grid > * {
+    border-right: 1px solid var(--color-border);
+    border-bottom: 1px solid var(--color-border);
+  }
 }
 
-body {
-  font-family: var(--font-sans);
-  background: var(--color-bg);
-  color: var(--color-text-DEFAULT);
-  line-height: 1.5;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-}
+/* ───────────────────────── Keyframes (kept to a minimum) ───────────────────────── */
 
-/* Scrollbar */
-::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
-}
-::-webkit-scrollbar-track {
-  background: transparent;
-}
-::-webkit-scrollbar-thumb {
-  background: var(--color-border);
-  border-radius: 3px;
-}
-::-webkit-scrollbar-thumb:hover {
-  background: var(--color-border-hover);
-}
-
-a {
-  color: var(--color-primary);
-  text-decoration: none;
-  transition: color 0.15s ease;
-}
-
-a:hover {
-  text-decoration: underline;
-}
-
-button {
-  cursor: pointer;
-  font-family: inherit;
-}
-
-input, select, textarea {
-  font-family: inherit;
-}
-
-/* Focus styles */
-:focus-visible {
-  outline: 2px solid var(--color-primary);
-  outline-offset: 2px;
-}
-
-/* Shared keyframes */
 @keyframes spin {
-  to { transform: rotate(360deg); }
-}
-
-@keyframes drift {
-  0%,
-  100% {
-    transform: translate3d(0, 0, 0);
-  }
-  50% {
-    transform: translate3d(0, -1rem, 0);
+  to {
+    transform: rotate(360deg);
   }
 }
 
-@keyframes pulse {
-  0%,
+@keyframes ping-ring {
+  0% {
+    transform: scale(0.7);
+    opacity: 0.6;
+  }
   100% {
-    transform: scale(1);
+    transform: scale(1.9);
+    opacity: 0;
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
     opacity: 1;
   }
-  50% {
-    transform: scale(0.82);
-    opacity: 0.55;
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
   }
 }
 
-@keyframes float1 {
-  0%, 100% { transform: translateY(0) rotate(0deg); }
-  50% { transform: translateY(-14px) rotate(1deg); }
+@keyframes dash-flow {
+  to {
+    stroke-dashoffset: -16;
+  }
 }
 
-@keyframes float2 {
-  0%, 100% { transform: translateY(0) rotate(0deg); }
-  50% { transform: translateY(-10px) rotate(-1.5deg); }
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+/* ───────────────────────── Accessibility ───────────────────────── */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

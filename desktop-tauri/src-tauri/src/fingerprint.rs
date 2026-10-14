@@ -1,4 +1,4 @@
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 const FINGERPRINT_SALT: &str = "cpnet-device-fp-v1";
 
@@ -7,14 +7,33 @@ const FINGERPRINT_SALT: &str = "cpnet-device-fp-v1";
 /// for a given user, even across reinstalls.
 pub fn generate_device_fingerprint(user_id: &str) -> Result<String, String> {
     let raw_id = get_platform_id()?;
+    Ok(fingerprint_from_platform_id(&raw_id, user_id))
+}
+
+/// Deterministically derives the fingerprint: `hex(SHA-256("{raw_id}:{user_id}:{salt}"))`.
+fn fingerprint_from_platform_id(raw_id: &str, user_id: &str) -> String {
     let input = format!("{}:{}:{}", raw_id, user_id, FINGERPRINT_SALT);
     let hash = Sha256::digest(input.as_bytes());
-    Ok(hex::encode(hash))
+    hex::encode(hash)
 }
 
 /// Auto-generate a human-readable device name from platform + hostname.
 pub fn auto_device_name() -> String {
-    let platform = if cfg!(target_os = "macos") {
+    let platform = platform_name();
+
+    let hostname = gethostname::gethostname().to_string_lossy().to_string();
+
+    // On mobile, hostname is often generic; just use platform name
+    if cfg!(any(target_os = "android", target_os = "ios")) || hostname.is_empty() {
+        platform.to_string()
+    } else {
+        format!("{} - {}", platform, hostname)
+    }
+}
+
+/// Human-readable name of the current platform.
+fn platform_name() -> &'static str {
+    if cfg!(target_os = "macos") {
         "macOS"
     } else if cfg!(target_os = "windows") {
         "Windows"
@@ -26,17 +45,6 @@ pub fn auto_device_name() -> String {
         "iOS"
     } else {
         "Unknown"
-    };
-
-    let hostname = gethostname::gethostname()
-        .to_string_lossy()
-        .to_string();
-
-    // On mobile, hostname is often generic; just use platform name
-    if cfg!(any(target_os = "android", target_os = "ios")) || hostname.is_empty() {
-        platform.to_string()
-    } else {
-        format!("{} - {}", platform, hostname)
     }
 }
 
@@ -44,8 +52,8 @@ pub fn auto_device_name() -> String {
 
 #[cfg(target_os = "windows")]
 fn get_platform_id() -> Result<String, String> {
-    use winreg::enums::HKEY_LOCAL_MACHINE;
     use winreg::RegKey;
+    use winreg::enums::HKEY_LOCAL_MACHINE;
 
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
     let key = hklm
@@ -130,6 +138,63 @@ fn get_platform_id() -> Result<String, String> {
 
 mod hex {
     pub fn encode(bytes: impl AsRef<[u8]>) -> String {
-        bytes.as_ref().iter().map(|b| format!("{:02x}", b)).collect()
+        bytes
+            .as_ref()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_is_sha256_hex_of_salted_input() {
+        let fp = fingerprint_from_platform_id("machine-guid", "user-1");
+        assert_eq!(fp.len(), 64);
+        assert!(
+            fp.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+
+        let expected = hex::encode(Sha256::digest(b"machine-guid:user-1:cpnet-device-fp-v1"));
+        assert_eq!(fp, expected);
+    }
+
+    #[test]
+    fn fingerprint_is_deterministic_and_user_scoped() {
+        let a1 = fingerprint_from_platform_id("machine-guid", "user-1");
+        let a2 = fingerprint_from_platform_id("machine-guid", "user-1");
+        let b = fingerprint_from_platform_id("machine-guid", "user-2");
+        let c = fingerprint_from_platform_id("other-machine", "user-1");
+        assert_eq!(a1, a2);
+        assert_ne!(a1, b);
+        assert_ne!(a1, c);
+    }
+
+    #[test]
+    fn device_fingerprint_uses_platform_id_when_available() {
+        // The platform ID comes from the OS (registry / machine-id / ioreg); CI
+        // containers do not always expose one, so only assert when it does.
+        match generate_device_fingerprint("user-1") {
+            Ok(fp) => {
+                assert_eq!(fp.len(), 64);
+                assert_eq!(fp, generate_device_fingerprint("user-1").unwrap());
+                assert_ne!(fp, generate_device_fingerprint("user-2").unwrap());
+            }
+            Err(e) => eprintln!("platform ID unavailable on this host, skipping: {e}"),
+        }
+    }
+
+    #[test]
+    fn auto_device_name_starts_with_platform() {
+        let name = auto_device_name();
+        assert!(!name.is_empty());
+        assert!(name.starts_with(platform_name()), "{name}");
+        if cfg!(any(target_os = "android", target_os = "ios")) {
+            assert_eq!(name, platform_name());
+        }
     }
 }

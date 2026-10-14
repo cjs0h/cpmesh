@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { getAppStateValue, getStatusValue, refreshStatus } from '$lib/store.svelte';
-	import { setupAndLogin, connectToServer, disconnectFromServer, checkSocialStatus, setupWithOAuthTokens, exchangeOAuthCode, type SocialStatus } from '$lib/api';
+	import { getAppStateValue, getStatusValue, refreshStatus } from '#lib/store.svelte.js';
+	import { setupAndLogin, connectToServer, disconnectFromServer, checkSocialStatus, setupWithOAuthTokens, exchangeOAuthCode, type SocialStatus } from '#lib/api.js';
 	import { listen } from '@tauri-apps/api/event';
 
 	const appState = $derived(getAppStateValue());

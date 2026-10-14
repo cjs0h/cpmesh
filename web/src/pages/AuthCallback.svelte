@@ -1,5 +1,6 @@
 <script lang="ts">
   import { setTokens } from '../lib/auth';
+  import Logo from '../components/Logo.svelte';
 
   $effect(() => {
     const hash = window.location.hash;
@@ -18,9 +19,10 @@
   });
 </script>
 
-<div class="flex items-center justify-center min-h-screen bg-bg">
-  <div class="text-center">
-    <span class="inline-block w-6 h-6 border-2 border-primary/30 border-t-primary rounded-full animate-[spin_0.6s_linear_infinite] mb-3"></span>
-    <p class="text-muted text-sm">Completing sign in...</p>
+<div class="flex h-dvh flex-col items-center justify-center gap-5 bg-bg">
+  <Logo size={40} />
+  <div class="flex items-center gap-2 text-[13px] text-muted">
+    <span class="inline-block h-4 w-4 rounded-full border-2 border-border-strong border-t-ink animate-[spin_0.7s_linear_infinite]"></span>
+    Completing sign in…
   </div>
 </div>

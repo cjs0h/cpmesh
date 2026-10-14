@@ -184,6 +184,19 @@ mod tests {
     }
 
     #[test]
+    fn version_comparison_handles_uneven_lengths_and_prefixes() {
+        assert!(is_newer_version("1.0.0.1", "1.0.0"));
+        assert!(!is_newer_version("1.0.0", "1.0.0.0"));
+        assert!(is_newer_version("1.1", "1.0.5"));
+        assert!(!is_newer_version("v1.0", "v1.0.0"));
+        assert!(is_newer_version("2", "1.9.9"));
+        // Non-numeric segments are ignored rather than crashing
+        assert!(is_newer_version("1.2.0-beta", "1.1.0"));
+        assert!(!is_newer_version("", "0.0.1"));
+        assert!(!is_newer_version("", ""));
+    }
+
+    #[test]
     fn test_mime_for_download() {
         assert_eq!(
             mime_for_download("app.dmg"),
@@ -202,5 +215,22 @@ mod tests {
             "application/vnd.debian.binary-package"
         );
         assert_eq!(mime_for_download("random.bin"), "application/octet-stream");
+    }
+
+    #[test]
+    fn mime_for_download_covers_all_formats_case_insensitively() {
+        assert_eq!(mime_for_download("Setup.MSI"), "application/x-msi");
+        assert_eq!(
+            mime_for_download("app.PKG"),
+            "application/vnd.apple.installer+xml"
+        );
+        assert_eq!(mime_for_download("app.rpm"), "application/x-rpm");
+        assert_eq!(
+            mime_for_download("app.AppImage"),
+            "application/x-executable"
+        );
+        assert_eq!(mime_for_download("app.tar.gz"), "application/gzip");
+        assert_eq!(mime_for_download("app.zip"), "application/zip");
+        assert_eq!(mime_for_download("noextension"), "application/octet-stream");
     }
 }

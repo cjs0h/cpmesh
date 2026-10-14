@@ -1,10 +1,12 @@
-use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes256Gcm, Nonce};
+use aes_gcm::Aes256Gcm;
+use aes_gcm::aead::{Aead, KeyInit, Nonce};
 use hkdf::Hkdf;
-use p256::{ecdh::diffie_hellman, PublicKey, SecretKey};
-use rand::RngCore;
+use p256::{PublicKey, SecretKey, ecdh::diffie_hellman};
+use rand::TryRng;
 use sha2::Sha256;
 use thiserror::Error;
+
+type GcmNonce = Nonce<Aes256Gcm>;
 
 #[derive(Error, Debug)]
 pub enum CryptoError {
@@ -18,6 +20,16 @@ pub enum CryptoError {
     CiphertextTooShort,
 }
 
+/// Fills `buf` with bytes from the operating system's CSPRNG.
+///
+/// Used for nonces, salts and key material. Panics only if the OS RNG is
+/// unavailable, which mirrors the behaviour of the former `OsRng`.
+pub fn fill_random(buf: &mut [u8]) {
+    rand::rngs::SysRng
+        .try_fill_bytes(buf)
+        .expect("operating system RNG failure");
+}
+
 /// Derives a shared AES-256 key from ECDH key exchange + HKDF.
 /// Matches Go: DeriveSharedKey(privateKey, peerPublicKey, salt)
 pub fn derive_shared_key(
@@ -25,20 +37,15 @@ pub fn derive_shared_key(
     peer_public_key: &PublicKey,
     salt: &[u8],
 ) -> Result<[u8; 32], CryptoError> {
-    let shared_secret = diffie_hellman(
-        private_key.to_nonzero_scalar(),
-        peer_public_key.as_affine(),
-    );
+    let shared_secret =
+        diffie_hellman(private_key.to_nonzero_scalar(), peer_public_key.as_affine());
     let secret_bytes = shared_secret.raw_secret_bytes();
-    derive_key(&secret_bytes, salt, b"cpmesh-clipboard-v1")
+    derive_key(secret_bytes, salt, b"cpmesh-clipboard-v1")
 }
 
 /// Derives an AES-256 key from a group key + salt.
 /// Matches Go: DeriveKeyFromGroupKey(groupKey, salt)
-pub fn derive_key_from_group_key(
-    group_key: &[u8],
-    salt: &[u8],
-) -> Result<[u8; 32], CryptoError> {
+pub fn derive_key_from_group_key(group_key: &[u8], salt: &[u8]) -> Result<[u8; 32], CryptoError> {
     derive_key(group_key, salt, b"cpmesh-group-v1")
 }
 
@@ -66,8 +73,8 @@ pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError>
         .map_err(|e| CryptoError::Encrypt(format!("create cipher: {e}")))?;
 
     let mut nonce_bytes = [0u8; 12];
-    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from(nonce_bytes);
+    fill_random(&mut nonce_bytes);
+    let nonce = GcmNonce::from(nonce_bytes);
 
     let ciphertext = cipher
         .encrypt(&nonce, plaintext)
@@ -90,8 +97,10 @@ pub fn decrypt(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| CryptoError::Decrypt(format!("create cipher: {e}")))?;
 
-    let nonce_arr: [u8; 12] = data[..12].try_into().map_err(|_| CryptoError::CiphertextTooShort)?;
-    let nonce = Nonce::from(nonce_arr);
+    let nonce_arr: [u8; 12] = data[..12]
+        .try_into()
+        .map_err(|_| CryptoError::CiphertextTooShort)?;
+    let nonce = GcmNonce::from(nonce_arr);
     let ciphertext = &data[12..];
 
     cipher
@@ -102,7 +111,7 @@ pub fn decrypt(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, CryptoError> {
 /// Generates a random 256-bit group key.
 pub fn generate_group_key() -> [u8; 32] {
     let mut key = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut key);
+    fill_random(&mut key);
     key
 }
 

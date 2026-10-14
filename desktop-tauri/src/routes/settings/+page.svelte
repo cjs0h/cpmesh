@@ -1,9 +1,9 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
-	import { getConfig, updateConfig, changePassword, checkUpdate, downloadAndInstallUpdate, logout, disconnectFromServer, connectToServer, setupAndLogin, getUserInfo, type AppConfig } from '$lib/api';
-	import { setAppState, refreshStatus } from '$lib/store.svelte';
-	import { isDesktop } from '$lib/platform';
+	import { getConfig, updateConfig, changePassword, checkUpdate, downloadAndInstallUpdate, logout, disconnectFromServer, connectToServer, setupAndLogin, getUserInfo, type AppConfig } from '#lib/api.js';
+	import { setAppState, refreshStatus } from '#lib/store.svelte.js';
+	import { isDesktop } from '#lib/platform.js';
 	import { getVersion } from '@tauri-apps/api/app';
 
 	let config = $state<AppConfig | null>(null);
@@ -22,7 +22,7 @@
 	let changingPassword = $state(false);
 
 	// Update check
-	let updateInfo = $state<import('$lib/api').UpdateInfo | null>(null);
+	let updateInfo = $state<import('#lib/api.js').UpdateInfo | null>(null);
 	let checkingUpdate = $state(false);
 	let updateCheckFailed = $state(false);
 	let downloadingUpdate = $state(false);

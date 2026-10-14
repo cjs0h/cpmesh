@@ -1,90 +1,123 @@
 <script lang="ts">
-  import { devicesState, fetchDevices, updateDeviceStatus } from '../lib/stores/devices.svelte';
-  import { onWSMessage } from '../lib/ws';
+  import { onMount } from 'svelte';
+  import { devicesState, fetchDevices } from '../lib/stores/devices.svelte';
+  import { toast } from '../lib/stores/toast.svelte';
   import { api } from '../lib/api';
+  import { createClock } from '../lib/clock.svelte';
+  import { absoluteTime, relativeTime, truncateMiddle } from '../lib/format';
   import Icon from '../components/Icon.svelte';
+  import Badge from '../components/ui/Badge.svelte';
+  import Button from '../components/ui/Button.svelte';
+  import ConfirmAction from '../components/ui/ConfirmAction.svelte';
+  import EmptyState from '../components/ui/EmptyState.svelte';
+  import Skeleton from '../components/ui/Skeleton.svelte';
+  import CopyButton from '../components/ui/CopyButton.svelte';
+  import Alert from '../components/ui/Alert.svelte';
+  import DownloadButtons from '../components/ui/DownloadButtons.svelte';
 
-  let deleteConfirm = $state<string | null>(null);
+  const clock = createClock();
 
-  $effect(() => {
+  onMount(() => {
     fetchDevices();
-    const unsub = onWSMessage((msg) => {
-      if (msg.type === 'device_status') {
-        updateDeviceStatus(msg.payload.device_id, msg.payload.online);
-      }
-    });
-    return unsub;
   });
 
-  async function handleDelete(id: string) {
-    await api(`/api/devices/${id}`, { method: 'DELETE' });
-    devicesState.list = devicesState.list.filter((d) => d.id !== id);
-    deleteConfirm = null;
+  const online = $derived(devicesState.list.filter((d) => d.online).length);
+  const pending = $derived(devicesState.list.filter((d) => d.status === 'pending'));
+  const sorted = $derived(
+    [...devicesState.list].sort((a, b) => {
+      const rank = (d: typeof a) => (d.status === 'pending' ? 0 : d.online ? 1 : 2);
+      return rank(a) - rank(b) || a.name.localeCompare(b.name);
+    })
+  );
+
+  async function handleDelete(id: string, name: string) {
+    try {
+      await api(`/api/devices/${id}`, { method: 'DELETE' });
+      devicesState.list = devicesState.list.filter((d) => d.id !== id);
+      toast.success('Device removed', `${name} can no longer sync with your account.`);
+    } catch (err: any) {
+      toast.error('Could not remove device', err.message);
+    }
+  }
+
+  function statusOf(d: (typeof devicesState.list)[number]): { tone: 'mint' | 'gold' | 'rose' | 'neutral'; label: string; live: boolean } {
+    if (d.status === 'pending') return { tone: 'gold', label: 'Pending approval', live: false };
+    if (d.status === 'rejected') return { tone: 'rose', label: 'Rejected', live: false };
+    if (d.status === 'revoked') return { tone: 'rose', label: 'Revoked', live: false };
+    return d.online ? { tone: 'mint', label: 'Online', live: true } : { tone: 'neutral', label: 'Offline', live: false };
   }
 </script>
 
-<div>
-  {#if devicesState.loading}
-    <div class="flex items-center gap-2.5 p-6 text-muted">
-      <span class="inline-block w-4 h-4 border-2 border-border border-t-primary rounded-full animate-[spin_0.6s_linear_infinite]"></span>
-      <span>Loading...</span>
-    </div>
-  {:else if devicesState.list.length === 0}
-    <div class="text-center py-15 px-4 bg-bg-card border border-border rounded-xl">
-      <div class="text-dim mb-4"><Icon name="monitor" size={32} /></div>
-      <p class="mb-1 font-medium">No devices registered.</p>
-      <p class="text-muted text-[13px]">Connect a device using the cpmesh client to see it here.</p>
-    </div>
-  {:else}
-    <div class="grid grid-cols-[repeat(auto-fill,minmax(300px,1fr))] gap-4">
-      {#each devicesState.list as device}
-        <div class="bg-bg-card border rounded-xl p-[22px] transition-all duration-200 hover:border-border-hover hover:shadow-md {device.online ? 'border-success/20' : 'border-border'}">
-          <div class="flex items-center gap-2.5 mb-3">
-            <div class="w-[34px] h-[34px] rounded bg-primary-glow border border-primary/15 text-primary flex items-center justify-center shrink-0">
-              <Icon name="monitor" size={18} />
-            </div>
-            <span class="font-semibold text-[15px] flex-1">{device.name}</span>
-            <div class="flex items-center gap-2">
-              {#if device.status === 'pending'}
-                <span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-yellow-500/15 text-yellow-400 border border-yellow-500/20">Pending</span>
-              {:else if device.status === 'rejected'}
-                <span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-red-500/15 text-red-400 border border-red-500/20">Rejected</span>
-              {:else if device.status === 'revoked'}
-                <span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-red-500/15 text-red-400 border border-red-500/20">Revoked</span>
-              {:else}
-                <div class="flex items-center gap-1.5">
-                  <span class="w-2 h-2 rounded-full {device.online ? 'bg-success shadow-[0_0_8px_rgba(52,211,153,0.5)]' : 'bg-text-dim'}"></span>
-                  <span class="text-xs font-medium {device.online ? 'text-success' : 'text-muted'}">{device.online ? 'Online' : 'Offline'}</span>
-                </div>
-              {/if}
-            </div>
-          </div>
-          {#if device.status === 'pending'}
-            <div class="text-xs text-yellow-400/80 bg-yellow-500/10 rounded px-2.5 py-2 mb-2 border border-yellow-500/15">
-              <p class="mb-1 font-medium">Waiting for approval</p>
-              <p>Open the <strong>cpmesh desktop app</strong> on an already-approved device, go to <strong>Devices</strong>, and tap <strong>Approve</strong> next to this device.</p>
-            </div>
-          {/if}
-          {#if device.last_seen}
-            <div class="flex items-center gap-1.5 text-xs text-muted mb-2">
-              <Icon name="clock" size={12} />
-              <span>Last seen: {new Date(device.last_seen).toLocaleString()}</span>
-            </div>
-          {/if}
-          <div class="text-[11px] font-mono text-dim break-all mb-3.5 px-2.5 py-1.5 bg-bg-input rounded-sm border border-border">{device.id}</div>
-          <div class="flex items-center gap-2">
-            {#if deleteConfirm === device.id}
-              <span class="text-[13px] text-warning font-medium">Remove device?</span>
-              <button class="inline-flex items-center gap-[5px] border-none rounded text-[13px] font-medium py-[7px] px-3.5 transition-all duration-150 bg-danger text-white hover:bg-danger-hover" onclick={() => handleDelete(device.id)}>Yes</button>
-              <button class="inline-flex items-center gap-[5px] border border-border rounded text-[13px] font-medium py-[7px] px-3.5 transition-all duration-150 bg-transparent text-muted hover:bg-bg-hover hover:text-text hover:border-border-hover" onclick={() => (deleteConfirm = null)}>No</button>
-            {:else}
-              <button class="inline-flex items-center gap-[5px] border border-border rounded text-[13px] font-medium py-[7px] px-3.5 transition-all duration-150 bg-transparent text-muted hover:bg-bg-hover hover:text-text hover:border-border-hover" onclick={() => (deleteConfirm = device.id)}>
-                <Icon name="trash" size={13} /> Remove
-              </button>
-            {/if}
-          </div>
-        </div>
-      {/each}
-    </div>
-  {/if}
+<div class="mb-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+  <div class="flex flex-wrap items-center gap-2 text-[13px] text-muted">
+    <Badge tone="mint" dot live={online > 0}>{online} online</Badge>
+    <Badge tone="neutral">{devicesState.list.length} total</Badge>
+    {#if pending.length}<Badge tone="gold" icon="clock">{pending.length} pending</Badge>{/if}
+  </div>
+  <Button variant="outline" size="sm" icon="refresh" loading={devicesState.loading} onclick={fetchDevices}>Refresh</Button>
 </div>
+
+{#if pending.length > 0}
+  <Alert tone="warning" title="A device is waiting for approval" class="mb-5">
+    Open the <strong class="text-fg">cpmesh desktop app</strong> on an already-approved device, go to <strong class="text-fg">Devices</strong> and tap
+    <strong class="text-fg">Approve</strong>. Approval exchanges encryption keys directly between your devices — the relay never sees them.
+  </Alert>
+{/if}
+
+{#if devicesState.loading && devicesState.list.length === 0}
+  <div class="grid grid-cols-1 gap-5 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
+    {#each Array(3) as _, i (i)}
+      <div class="rounded-lg border border-border bg-surface p-5">
+        <div class="flex items-center gap-3"><Skeleton class="h-10 w-10" rounded="rounded-md" /><div class="flex-1"><Skeleton class="mb-2 h-3.5 w-1/2" /><Skeleton class="h-3 w-1/3" /></div></div>
+        <Skeleton class="mt-5 h-8 w-full" />
+      </div>
+    {/each}
+  </div>
+{:else if devicesState.list.length === 0}
+  <EmptyState icon="smartphone" title="No devices paired yet" description="Install cpmesh on your laptop, desktop or phone and sign in. The first device is approved automatically; every additional one is approved from an existing device.">
+    <DownloadButtons size="sm" />
+  </EmptyState>
+{:else}
+  <div class="grid grid-cols-1 gap-5 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
+    {#each sorted as device (device.id)}
+      {@const s = statusOf(device)}
+      <article class="group relative flex flex-col rounded-lg border border-border bg-surface p-5 transition-[border-color,box-shadow] duration-150 hover:border-border-strong hover:shadow-sm">
+        <div class="relative flex items-start gap-3">
+          <span class="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-border bg-surface-2 {device.online ? 'text-fg' : 'text-dim'}">
+            <Icon name="monitor" size={18} />
+          </span>
+          <div class="min-w-0 flex-1">
+            <h3 class="truncate text-sm font-medium text-fg">{device.name}</h3>
+            <p class="mt-0.5 flex items-center gap-1.5 text-[12.5px] text-dim">
+              <Icon name="clock" size={11} />
+              {#if device.online}
+                Connected now
+              {:else if device.last_seen}
+                <time datetime={device.last_seen} title={absoluteTime(device.last_seen)}>Last seen {relativeTime(device.last_seen, clock.now)}</time>
+              {:else}
+                Never connected
+              {/if}
+            </p>
+          </div>
+          <Badge tone={s.tone} dot={s.tone === 'mint' || s.tone === 'neutral'} live={s.live}>{s.label}</Badge>
+        </div>
+
+        <div class="relative mt-4 flex items-center justify-between gap-2 rounded-md border border-border bg-bg-deep px-3 py-2">
+          <span class="text-xs text-muted">Device ID</span>
+          <span class="flex items-center gap-1">
+            <code class="font-mono text-[11.5px] text-fg">{truncateMiddle(device.id, 8)}</code>
+            <CopyButton text={device.id} label="Copy device ID" size={12} />
+          </span>
+        </div>
+
+        <div class="relative mt-4 flex items-center justify-between">
+          <span class="inline-flex items-center gap-1.5 text-xs text-dim">
+            <Icon name="shield-check" size={13} />
+            E2E keys held on device
+          </span>
+          <ConfirmAction label="Remove" confirmLabel="Remove" prompt="Remove this device?" size="xs" onconfirm={() => handleDelete(device.id, device.name)} />
+        </div>
+      </article>
+    {/each}
+  </div>
+{/if}

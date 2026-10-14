@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { getHistory, searchHistory, copyEntry, deleteEntry, clearHistory, syncHistory, type HistoryEntry, type HistoryPage } from '$lib/api';
+	import { getHistory, searchHistory, copyEntry, deleteEntry, clearHistory, syncHistory, type HistoryEntry, type HistoryPage } from '#lib/api.js';
 	import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-	import { getAppStateValue } from '$lib/store.svelte';
+	import { getAppStateValue } from '#lib/store.svelte.js';
 
 	let entries = $state<HistoryEntry[]>([]);
 	let hasMore = $state(false);

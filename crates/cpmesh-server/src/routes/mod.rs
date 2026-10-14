@@ -9,10 +9,13 @@ pub mod middleware;
 pub mod user;
 pub mod websocket;
 
+#[cfg(test)]
+mod tests;
+
 use axum::http::{HeaderValue, Method};
 use axum::{Router, extract::DefaultBodyLimit, middleware as axum_mw};
 use std::sync::Arc;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowHeaders, Any, CorsLayer};
 
 use crate::AppState;
 use crate::spa::spa_handler;
@@ -291,6 +294,8 @@ fn build_cors(allowed_origins: &[String]) -> CorsLayer {
         .filter_map(|o| o.parse().ok())
         .collect();
 
+    // With credentials enabled, browsers (and tower-http) reject the `*` wildcard for
+    // headers, so echo back whatever headers the preflight request asks for instead.
     CorsLayer::new()
         .allow_origin(origins)
         .allow_methods([
@@ -300,6 +305,6 @@ fn build_cors(allowed_origins: &[String]) -> CorsLayer {
             Method::DELETE,
             Method::OPTIONS,
         ])
-        .allow_headers(Any)
+        .allow_headers(AllowHeaders::mirror_request())
         .allow_credentials(true)
 }

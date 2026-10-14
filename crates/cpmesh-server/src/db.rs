@@ -1233,11 +1233,11 @@ impl Db {
         &self,
         user_id: uuid::Uuid,
     ) -> Result<String, sqlx::Error> {
-        use rand::RngCore;
+        use rand::Rng;
         use sha2::{Digest, Sha256};
 
         let mut token_bytes = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut token_bytes);
+        rand::rng().fill_bytes(&mut token_bytes);
         let token = hex::encode(token_bytes);
         let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
         let expires_at = chrono::Utc::now() + chrono::Duration::hours(24);
@@ -1372,19 +1372,6 @@ impl Db {
         user_id_filter: Option<uuid::Uuid>,
         action_filter: Option<&str>,
     ) -> Result<Vec<AuditLog>, sqlx::Error> {
-        // Build query dynamically based on filters
-        let mut query = String::from(
-            "SELECT id, user_id, action, ip_address, user_agent, details, created_at FROM audit_logs WHERE 1=1",
-        );
-        if user_id_filter.is_some() {
-            query.push_str(" AND user_id = $3");
-        }
-        if action_filter.is_some() {
-            let idx = if user_id_filter.is_some() { "$4" } else { "$3" };
-            query.push_str(&format!(" AND action = {}", idx));
-        }
-        query.push_str(" ORDER BY created_at DESC LIMIT $1 OFFSET $2");
-
         // Use a simple approach: query with all possible filters
         if let (Some(uid), Some(act)) = (user_id_filter, action_filter) {
             sqlx::query_as::<_, AuditLog>(
@@ -1771,3 +1758,119 @@ ALTER TABLE devices ADD COLUMN IF NOT EXISTS fingerprint VARCHAR(64);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_user_fingerprint
     ON devices(user_id, fingerprint) WHERE fingerprint IS NOT NULL;
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{TEST_PII_HMAC_KEY, TEST_PII_MASTER_KEY};
+
+    fn pii() -> PiiService {
+        PiiService::new(TEST_PII_MASTER_KEY, TEST_PII_HMAC_KEY).unwrap()
+    }
+
+    #[test]
+    fn detect_platform_arch_format_from_filenames() {
+        let cases = [
+            ("cpmesh_0.1.0_x64-setup.exe", ("windows", "amd64", "exe")),
+            ("cpmesh_0.1.0_x64_en-US.msi", ("windows", "amd64", "msi")),
+            ("cpmesh_0.1.0_aarch64.dmg", ("macos", "arm64", "dmg")),
+            ("cpmesh-darwin-amd64.tar.gz", ("macos", "amd64", "tar.gz")),
+            ("cpmesh_0.1.0_amd64.deb", ("linux", "amd64", "deb")),
+            (
+                "cpmesh_0.1.0_arm64.AppImage",
+                ("linux", "arm64", "appimage"),
+            ),
+            ("cpmesh-linux-386.zip", ("linux", "386", "zip")),
+            ("cpmesh-i686-linux.zip", ("linux", "386", "zip")),
+            ("cpmesh-release.apk", ("android", "", "apk")),
+            ("README.txt", ("unknown", "", "")),
+        ];
+        for (name, (platform, arch, format)) in cases {
+            assert_eq!(
+                detect_platform_arch_format(name),
+                (platform.to_string(), arch.to_string(), format.to_string()),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn hex_encodes_lowercase() {
+        assert_eq!(hex::encode([0x00, 0xab, 0xff]), "00abff");
+        assert_eq!(hex::encode([]), "");
+    }
+
+    #[test]
+    fn user_fields_without_pii_are_plain_and_lowercased_indexes() {
+        let (email, email_idx, full_name, username_idx, country, mobile) = encrypt_user_fields(
+            " Alice ",
+            "Alice@Example.COM",
+            "Alice Liddell",
+            Some("GB"),
+            None,
+            None,
+        );
+        assert_eq!(email, "Alice@Example.COM");
+        assert_eq!(email_idx, "alice@example.com");
+        assert_eq!(full_name, "Alice Liddell");
+        assert_eq!(username_idx, "alice");
+        assert_eq!(country.as_deref(), Some("GB"));
+        assert!(mobile.is_none());
+    }
+
+    #[test]
+    fn user_fields_with_pii_are_encrypted_and_blind_indexed() {
+        let p = pii();
+        let (email, email_idx, full_name, username_idx, country, mobile) = encrypt_user_fields(
+            "Bob",
+            "bob@example.com",
+            "Bob Builder",
+            Some("US"),
+            Some("+1555"),
+            Some(&p),
+        );
+        assert_ne!(email, "bob@example.com");
+        assert_eq!(p.decrypt(&email).unwrap(), "bob@example.com");
+        assert_eq!(email_idx, p.blind_index("bob@example.com"));
+        assert_eq!(p.decrypt(&full_name).unwrap(), "Bob Builder");
+        assert_eq!(username_idx, "bob", "usernames are indexed in the clear");
+        assert_eq!(p.decrypt(&country.unwrap()).unwrap(), "US");
+        assert_eq!(p.decrypt(&mobile.unwrap()).unwrap(), "+1555");
+    }
+
+    #[test]
+    fn decrypt_optional_field_handles_all_combinations() {
+        let p = pii();
+        let enc = p.encrypt("hidden").unwrap();
+        assert_eq!(decrypt_optional_field(Some(&enc), Some(&p)), "hidden");
+        assert_eq!(decrypt_optional_field(Some("plain"), None), "plain");
+        assert_eq!(decrypt_optional_field(None, Some(&p)), "");
+        assert_eq!(decrypt_optional_field(None, None), "");
+        // Undecryptable data degrades to an empty string rather than failing
+        assert_eq!(decrypt_optional_field(Some("not-ciphertext"), Some(&p)), "");
+    }
+
+    #[test]
+    fn schema_creates_every_table_the_code_queries() {
+        for table in [
+            "users",
+            "devices",
+            "clipboard_entries",
+            "group_keys",
+            "subscription_plans",
+            "download_links",
+            "app_releases",
+            "email_verifications",
+            "revoked_tokens",
+            "audit_logs",
+            "device_approval_sessions",
+            "group_key_versions",
+            "device_group_keys",
+        ] {
+            assert!(
+                SCHEMA.contains(&format!("CREATE TABLE IF NOT EXISTS {table}")),
+                "schema is missing table {table}"
+            );
+        }
+    }
+}

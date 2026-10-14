@@ -20,3 +20,33 @@ impl std::fmt::Display for AppState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_matches_serde_snake_case() {
+        for (state, text) in [
+            (AppState::NotConfigured, "not_configured"),
+            (AppState::Disconnected, "disconnected"),
+            (AppState::Connecting, "connecting"),
+            (AppState::Connected, "connected"),
+        ] {
+            assert_eq!(state.to_string(), text);
+            assert_eq!(
+                serde_json::to_string(&state).unwrap(),
+                format!("\"{text}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<AppState>(&format!("\"{text}\"")).unwrap(),
+                state
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_state_is_rejected() {
+        assert!(serde_json::from_str::<AppState>("\"online\"").is_err());
+    }
+}

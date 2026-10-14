@@ -1,4 +1,5 @@
 import { api } from '../api';
+import { getAccessToken } from '../auth';
 
 export interface AdminUserRow {
   id: string;
@@ -216,7 +217,7 @@ export async function adminUploadBinary(file: File): Promise<{ uploaded: Array<{
   const formData = new FormData();
   formData.append('file', file);
 
-  const token = (await import('../auth')).getAccessToken();
+  const token = getAccessToken();
   const res = await fetch('/api/admin/downloads/upload', {
     method: 'POST',
     headers: token ? { Authorization: `Bearer ${token}` } : {},

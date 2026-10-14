@@ -1,0 +1,344 @@
+name: Release
+
+# Builds the desktop and Android apps, publishes them as a GitHub Release, then registers the
+# release on the website so its Downloads section and the apps' update check offer it.
+# See "Releasing" in CONTRIBUTING.md for the required secrets.
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, e.g. 0.2.0 (the selected branch is tagged v<version> when the release is published)
+        required: true
+        type: string
+      notes:
+        description: Optional one-line summary shown in the apps' update banner
+        required: false
+        type: string
+      publish_website:
+        description: Register the release on the website after publishing it
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+# An explicit bash shell runs with -eo pipefail on every OS (the implicit default lacks pipefail)
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      notes: ${{ steps.meta.outputs.notes }}
+      android: ${{ steps.signing.outputs.android }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Test release scripts
+        run: node --test "scripts/release/*.test.mjs"
+
+      - name: Resolve version
+        id: meta
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_NOTES: ${{ inputs.notes }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            version="${INPUT_VERSION#v}"
+            notes="$INPUT_NOTES"
+          else
+            version="${GITHUB_REF_NAME#v}"
+            # The subject line of an annotated tag becomes the note in the apps' update banner
+            git fetch --quiet --depth=1 origin "+refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME" || true
+            notes=""
+            if [ "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME" 2>/dev/null)" = "tag" ]; then
+              notes="$(git for-each-ref --format='%(contents:subject)' "refs/tags/$GITHUB_REF_NAME")"
+            fi
+          fi
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::The version must look like 1.2.3, got '$version'"
+            exit 1
+          fi
+          notes="$(printf '%s' "$notes" | tr '\r\n' '  ' | cut -c1-300)"
+          {
+            echo "version=$version"
+            echo "tag=v$version"
+            echo "notes=$notes"
+          } >> "$GITHUB_OUTPUT"
+          declared="$(node -p "require('./desktop-tauri/src-tauri/tauri.conf.json').version")"
+          if [ "$declared" != "$version" ]; then
+            echo "::notice::Building $version while the repository declares $declared. Run 'node scripts/release/set-version.mjs $version' to bump it in the repository."
+          fi
+
+      - name: Check Android signing secrets
+        id: signing
+        env:
+          HAS_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' && secrets.ANDROID_KEYSTORE_PASSWORD != '' && secrets.ANDROID_KEY_ALIAS != '' }}
+        run: |
+          echo "android=$HAS_KEYSTORE" >> "$GITHUB_OUTPUT"
+          if [ "$HAS_KEYSTORE" != "true" ]; then
+            echo "::warning title=Android APK skipped::Add the ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD and ANDROID_KEY_ALIAS secrets to build a signed APK."
+          fi
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          NOTES: ${{ steps.meta.outputs.notes }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            tagged="$(git ls-remote origin "refs/tags/$TAG" "refs/tags/$TAG^{}" | tail -n1 | cut -f1)"
+            if [ -n "$tagged" ] && [ "$tagged" != "$GITHUB_SHA" ]; then
+              echo "::error::Tag $TAG already points at $tagged, not $GITHUB_SHA. Release a new version or run the workflow on the tagged commit."
+              exit 1
+            fi
+          fi
+          if gh release view "$TAG" --json tagName > /dev/null 2>&1; then
+            echo "Release $TAG already exists; its installers will be replaced."
+          else
+            args=(--draft --title "cpmesh $VERSION" --target "$GITHUB_SHA" --generate-notes)
+            if [ -n "$NOTES" ]; then
+              args+=(--notes "$NOTES")
+            fi
+            gh release create "$TAG" "${args[@]}"
+          fi
+
+  desktop:
+    name: Desktop (${{ matrix.name }})
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+            platform: windows
+            target: x86_64-pc-windows-msvc
+            rust-targets: x86_64-pc-windows-msvc
+            bundles: nsis
+          - name: macOS universal
+            os: macos-latest
+            platform: macos
+            target: universal-apple-darwin
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+            bundles: app
+          - name: Linux x64
+            # The oldest available runner keeps the glibc requirement of the Linux packages low
+            os: ubuntu-22.04
+            platform: linux
+            target: x86_64-unknown-linux-gnu
+            rust-targets: x86_64-unknown-linux-gnu
+            bundles: deb,appimage
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: desktop-tauri/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            pkg-config \
+            patchelf \
+            xdg-utils \
+            libfuse2 \
+            file
+
+      - name: Install frontend dependencies
+        working-directory: desktop-tauri
+        run: npm ci
+
+      - name: Set app version
+        run: node scripts/release/set-version.mjs "$VERSION"
+
+      - name: Build
+        working-directory: desktop-tauri
+        env:
+          TARGET: ${{ matrix.target }}
+          BUNDLES: ${{ matrix.bundles }}
+          # Optional Developer ID signing and notarization, used only for macOS
+          APPLE_CERTIFICATE: ${{ matrix.platform == 'macos' && secrets.APPLE_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ matrix.platform == 'macos' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_SIGNING_IDENTITY: ${{ matrix.platform == 'macos' && secrets.APPLE_SIGNING_IDENTITY || '' }}
+          APPLE_ID: ${{ matrix.platform == 'macos' && secrets.APPLE_ID || '' }}
+          APPLE_PASSWORD: ${{ matrix.platform == 'macos' && secrets.APPLE_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ matrix.platform == 'macos' && secrets.APPLE_TEAM_ID || '' }}
+        run: |
+          # Tauri treats a set-but-empty variable as configured, so unset the missing secrets
+          for var in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!var}" ]; then
+              unset "$var"
+            fi
+          done
+          npx tauri build --ci --target "$TARGET" --bundles "$BUNDLES"
+
+      - name: Collect installers
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          TARGET: ${{ matrix.target }}
+          MACOS_SIGNED: ${{ matrix.platform == 'macos' && secrets.APPLE_CERTIFICATE != '' }}
+        run: bash scripts/release/collect-desktop.sh "$PLATFORM" "$TARGET" "$VERSION" dist
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" dist/* --clobber
+
+  android:
+    name: Android APK
+    needs: prepare
+    if: needs.prepare.outputs.android == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: desktop-tauri/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Locate the Android NDK
+        run: |
+          ndk="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-}}"
+          if [ -z "$ndk" ] || [ ! -d "$ndk" ]; then
+            echo "::error::No Android NDK found on the runner"
+            exit 1
+          fi
+          echo "NDK_HOME=$ndk" >> "$GITHUB_ENV"
+
+      - name: Install frontend dependencies
+        working-directory: desktop-tauri
+        run: npm ci
+
+      - name: Set app version
+        run: node scripts/release/set-version.mjs "$VERSION"
+
+      - name: Build APK
+        working-directory: desktop-tauri
+        run: |
+          npx tauri android init --ci --skip-targets-install
+          # One universal APK for phones (arm64, armv7) and x86_64 Chromebooks and emulators
+          npx tauri android build --ci --apk --target aarch64 armv7 x86_64
+
+      - name: Sign APK
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD || secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          shopt -s nullglob
+          apks=(desktop-tauri/src-tauri/gen/android/app/build/outputs/apk/universal/release/*-unsigned.apk)
+          if [ "${#apks[@]}" -ne 1 ]; then
+            echo "::error::Expected one unsigned universal APK, found ${#apks[@]}"
+            exit 1
+          fi
+          build_tools="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n1)"
+          keystore="$RUNNER_TEMP/release.keystore"
+          trap 'rm -f "$keystore"' EXIT
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          mkdir -p dist
+          apk="dist/cpmesh-$VERSION-android.apk"
+          # -P 16 keeps native libraries 16 KB page-aligned, which Android 15+ devices require
+          "$build_tools/zipalign" -f -P 16 4 "${apks[0]}" "$RUNNER_TEMP/aligned.apk"
+          "$build_tools/apksigner" sign \
+            --ks "$keystore" --ks-key-alias "$ANDROID_KEY_ALIAS" \
+            --ks-pass env:ANDROID_KEYSTORE_PASSWORD --key-pass env:ANDROID_KEY_PASSWORD \
+            --v4-signing-enabled false \
+            --out "$apk" "$RUNNER_TEMP/aligned.apk"
+          "$build_tools/apksigner" verify --print-certs "$apk"
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" dist/* --clobber
+
+  publish:
+    name: Publish
+    needs: [prepare, desktop, android]
+    # Android is skipped when its signing secrets are missing; the desktop apps are still released
+    if: >-
+      !cancelled() && needs.prepare.result == 'success' && needs.desktop.result == 'success' &&
+      (needs.android.result == 'success' || needs.android.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+      NOTES: ${{ needs.prepare.outputs.notes }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Publish the GitHub release
+        run: |
+          gh release edit "$TAG" --draft=false
+          echo "Published $(gh release view "$TAG" --json url --jq .url)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Update the website
+        if: github.event_name == 'push' || inputs.publish_website
+        env:
+          CPMESH_URL: ${{ vars.CPMESH_URL || 'https://cpmesh.com' }}
+          CPMESH_ADMIN_USERNAME: ${{ secrets.CPMESH_ADMIN_USERNAME }}
+          CPMESH_ADMIN_PASSWORD: ${{ secrets.CPMESH_ADMIN_PASSWORD }}
+        run: |
+          gh release view "$TAG" --json tagName,url,isDraft,assets > "$RUNNER_TEMP/release.json"
+          node scripts/release/publish-website.mjs --release "$RUNNER_TEMP/release.json" --notes "$NOTES"

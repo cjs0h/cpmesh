@@ -1,6 +1,10 @@
 <script lang="ts">
   import { setTokens } from '../lib/auth';
   import Icon from '../components/Icon.svelte';
+  import Logo from '../components/Logo.svelte';
+  import Button from '../components/ui/Button.svelte';
+  import Field from '../components/ui/Field.svelte';
+  import Alert from '../components/ui/Alert.svelte';
 
   let mode: 'login' | 'register' = $state('login');
   let error = $state('');
@@ -12,7 +16,7 @@
   let socialProvider = $state('');
 
   // Login fields
-  let loginIdentifier = $state(''); // username or email
+  let loginIdentifier = $state('');
   let loginPassword = $state('');
 
   // Register fields
@@ -23,20 +27,24 @@
   let regMobile = $state('');
   let regPassword = $state('');
   let regPasswordConfirm = $state('');
-
-  // Field validation state
   let regErrors: Record<string, string> = $state({});
+
+  // Resend verification
+  let resendOpen = $state(false);
+  let resendLoading = $state(false);
+  let resendEmail = $state('');
 
   // Check URL params for verification status and social errors
   $effect(() => {
     const hash = window.location.hash;
     if (hash.includes('verified=true')) {
-      success = 'Email verified successfully! You can now log in.';
+      success = 'Email verified — you can sign in now.';
       mode = 'login';
       window.location.hash = '#/login';
     } else if (hash.includes('verified=error')) {
-      error = 'Email verification failed. The link may have expired. Please request a new one.';
+      error = 'Email verification failed. The link may have expired — request a new one below.';
       mode = 'login';
+      resendOpen = true;
       window.location.hash = '#/login';
     }
     const socialError = new URLSearchParams(hash.split('?')[1] || '').get('social_error');
@@ -49,45 +57,48 @@
   // Fetch social login status
   $effect(() => {
     fetch('/api/auth/social/status')
-      .then(r => r.json())
-      .then(data => {
-        socialEnabled = data.enabled;
+      .then((r) => r.json())
+      .then((data) => {
+        socialEnabled = Boolean(data.enabled);
         socialProvider = data.provider || '';
       })
       .catch(() => {});
   });
 
-  function validateRegForm(): boolean {
+  function switchMode(next: 'login' | 'register') {
+    mode = next;
+    error = '';
+    success = '';
     regErrors = {};
-    if (regFullName.trim().length < 2) regErrors.fullName = 'At least 2 characters';
-    if (regFullName.trim().length > 100) regErrors.fullName = 'At most 100 characters';
-    if (!regEmail.match(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)) regErrors.email = 'Invalid email format';
-    if (regUsername.trim().length < 3) regErrors.username = 'At least 3 characters';
-    if (regUsername.trim().length > 50) regErrors.username = 'At most 50 characters';
-    if (regPassword.length < 8) regErrors.password = 'At least 8 characters';
-    if (regPassword.length > 128) regErrors.password = 'At most 128 characters';
-    if (regPassword !== regPasswordConfirm) regErrors.passwordConfirm = 'Passwords do not match';
-    if (regMobile && (regMobile.trim().length < 7 || regMobile.trim().length > 20)) {
-      regErrors.mobile = 'Between 7 and 20 characters';
-    }
-    return Object.keys(regErrors).length === 0;
   }
 
-  // Password strength indicator
-  let passwordStrength = $derived.by(() => {
+  function validateRegForm(): boolean {
+    const errs: Record<string, string> = {};
+    if (regFullName.trim().length < 2) errs.fullName = 'At least 2 characters';
+    if (regFullName.trim().length > 100) errs.fullName = 'At most 100 characters';
+    if (!regEmail.match(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)) errs.email = 'Enter a valid email address';
+    if (regUsername.trim().length < 3) errs.username = 'At least 3 characters';
+    if (regUsername.trim().length > 50) errs.username = 'At most 50 characters';
+    if (regPassword.length < 8) errs.password = 'At least 8 characters';
+    if (regPassword.length > 128) errs.password = 'At most 128 characters';
+    if (regPassword !== regPasswordConfirm) errs.passwordConfirm = 'Passwords do not match';
+    if (regMobile && (regMobile.trim().length < 7 || regMobile.trim().length > 20)) errs.mobile = 'Between 7 and 20 characters';
+    regErrors = errs;
+    return Object.keys(errs).length === 0;
+  }
+
+  const strength = $derived.by(() => {
     const p = regPassword;
-    if (!p) return { label: '', color: '', width: '0%' };
+    if (!p) return { score: 0, label: '', tone: '' };
     let score = 0;
     if (p.length >= 8) score++;
     if (p.length >= 12) score++;
     if (/[A-Z]/.test(p) && /[a-z]/.test(p)) score++;
     if (/\d/.test(p)) score++;
     if (/[^A-Za-z0-9]/.test(p)) score++;
-    if (score <= 1) return { label: 'Weak', color: '#ef4444', width: '20%' };
-    if (score <= 2) return { label: 'Fair', color: '#f59e0b', width: '40%' };
-    if (score <= 3) return { label: 'Good', color: '#3b82f6', width: '60%' };
-    if (score <= 4) return { label: 'Strong', color: '#22c55e', width: '80%' };
-    return { label: 'Very Strong', color: '#16a34a', width: '100%' };
+    const labels = ['Weak', 'Weak', 'Fair', 'Good', 'Strong', 'Excellent'];
+    const tones = ['bg-danger', 'bg-danger', 'bg-warning', 'bg-fg', 'bg-success', 'bg-success'];
+    return { score, label: labels[score], tone: tones[score] };
   });
 
   async function handleLogin(e: Event) {
@@ -99,12 +110,14 @@
       const res = await fetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: loginIdentifier, password: loginPassword }),
+        body: JSON.stringify({ username: loginIdentifier.trim(), password: loginPassword }),
       });
       const data = await res.json();
       if (!res.ok) {
         if (data.error === 'email_not_verified') {
           error = data.message || 'Please verify your email address first.';
+          resendOpen = true;
+          resendEmail = loginIdentifier.includes('@') ? loginIdentifier.trim() : resendEmail;
           return;
         }
         throw new Error(data.error || 'Login failed');
@@ -141,7 +154,8 @@
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Registration failed');
-      success = data.message || 'Account created! Please check your email to verify your account.';
+      success = data.message || 'Account created! Check your inbox to verify your email.';
+      resendEmail = regEmail.trim();
       mode = 'login';
     } catch (err: any) {
       error = err.message;
@@ -150,191 +164,124 @@
     }
   }
 
-  let resendLoading = $state(false);
-  let resendEmail = $state('');
-
-  async function handleResend() {
+  async function handleResend(e: Event) {
+    e.preventDefault();
     if (!resendEmail) return;
     resendLoading = true;
     try {
       const res = await fetch('/api/auth/resend-verification', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: resendEmail }),
+        body: JSON.stringify({ email: resendEmail.trim() }),
       });
       const data = await res.json();
       success = data.message || 'Verification email sent.';
       error = '';
     } catch {
-      // intentionally silent
+      // intentionally silent — the API answers the same way for unknown emails
     } finally {
       resendLoading = false;
     }
   }
+
 </script>
 
-<div class="flex items-center justify-center min-h-screen bg-bg relative overflow-hidden py-8">
-  <div class="absolute w-[500px] h-[500px] rounded-full top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-none" style="background: radial-gradient(circle, rgba(129, 140, 248, 0.08) 0%, transparent 70%)"></div>
-  <div class="relative w-[440px] bg-bg-card border border-border rounded-xl px-8 py-10 shadow-lg">
-    <div
-      class="w-11 h-11 rounded-lg flex items-center justify-center text-white mx-auto mb-4 shadow-primary"
-      style="background: linear-gradient(135deg, var(--color-primary) 0%, var(--color-primary-dim) 100%)"
-    >
-      <Icon name="network" size={22} />
-    </div>
-    <h1 class="text-[26px] font-bold text-center tracking-[-0.03em]">cpmesh</h1>
-    <p class="text-center text-muted text-[13.5px] mb-7">Encrypted clipboard sync</p>
+<svelte:head>
+  <title>{mode === 'login' ? 'Sign in' : 'Create account'} — cpmesh</title>
+</svelte:head>
 
-    <div class="flex gap-1 mb-6 bg-bg-input rounded p-1 border border-border">
-      <button
-        class="flex-1 py-[9px] border-none rounded-sm text-[13.5px] font-medium transition-all duration-150 {mode === 'login' ? 'bg-primary text-white shadow-[0_2px_8px_rgba(129,140,248,0.3)]' : 'bg-transparent text-muted'}"
-        onclick={() => { mode = 'login'; error = ''; success = ''; }}
-      >Login</button>
-      <button
-        class="flex-1 py-[9px] border-none rounded-sm text-[13.5px] font-medium transition-all duration-150 {mode === 'register' ? 'bg-primary text-white shadow-[0_2px_8px_rgba(129,140,248,0.3)]' : 'bg-transparent text-muted'}"
-        onclick={() => { mode = 'register'; error = ''; success = ''; }}
-      >Register</button>
-    </div>
+<div class="flex min-h-dvh flex-col bg-bg-deep">
+  <header class="flex h-14 items-center justify-between px-5 sm:px-8">
+    <a href="#/" class="inline-flex items-center gap-2" aria-label="cpmesh home">
+      <Logo size={24} withText textClass="text-[15px]" />
+    </a>
+    <a href="#/" class="inline-flex items-center gap-1.5 text-[13px] text-muted transition-colors hover:text-fg">
+      <Icon name="arrow-left" size={14} /> Back to site
+    </a>
+  </header>
 
-    {#if error}
-      <div class="bg-danger-glow border border-danger/30 text-danger px-3.5 py-2.5 rounded text-[13px] mb-4">{error}</div>
-    {/if}
-    {#if success}
-      <div class="bg-[rgba(34,197,94,0.08)] border border-[rgba(34,197,94,0.3)] text-[#22c55e] px-3.5 py-2.5 rounded text-[13px] mb-4">{success}</div>
-    {/if}
-
-    {#if mode === 'login'}
-      <form onsubmit={handleLogin}>
-        <label class="flex flex-col gap-1.5 mb-4">
-          <span class="text-[13px] text-muted font-medium">Username or Email</span>
-          <input type="text" bind:value={loginIdentifier} required autocomplete="username"
-            class="py-[11px] px-3.5 border border-border rounded bg-bg-input text-text text-sm outline-none transition-all duration-150 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)]" />
-        </label>
-        <label class="flex flex-col gap-1.5 mb-4">
-          <span class="text-[13px] text-muted font-medium">Password</span>
-          <input type="password" bind:value={loginPassword} required minlength="8" autocomplete="current-password"
-            class="py-[11px] px-3.5 border border-border rounded bg-bg-input text-text text-sm outline-none transition-all duration-150 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)]" />
-        </label>
-        <button type="submit" class="w-full py-3 border-none rounded bg-primary text-white text-sm font-semibold transition-all duration-200 flex items-center justify-center gap-2 hover:not-disabled:bg-primary-hover hover:not-disabled:shadow-primary disabled:opacity-60" disabled={loading}>
-          {#if loading}
-            <span class="inline-block w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-[spin_0.6s_linear_infinite]"></span>
-          {:else}
-            Login
-          {/if}
-        </button>
-      </form>
-
-      {#if socialEnabled}
-        <div class="flex items-center gap-3 my-4">
-          <div class="flex-1 h-px bg-border"></div>
-          <span class="text-[12px] text-muted uppercase tracking-wider">or</span>
-          <div class="flex-1 h-px bg-border"></div>
-        </div>
-        <a href="/api/auth/social/login" class="w-full py-3 border border-border rounded bg-bg-input text-text text-sm font-medium transition-all duration-200 flex items-center justify-center gap-2 hover:bg-bg-hover hover:border-border-hover no-underline">
-          <Icon name="network" size={16} />
-          Continue with {socialProvider || 'Social Login'}
-        </a>
-      {/if}
-
-      <!-- Resend verification -->
-      <div class="mt-4 pt-4 border-t border-border">
-        <p class="text-[12px] text-muted mb-2">Didn't receive a verification email?</p>
-        <div class="flex gap-2">
-          <input type="email" bind:value={resendEmail} placeholder="Your email address"
-            class="flex-1 py-2 px-3 border border-border rounded bg-bg-input text-text text-[13px] outline-none focus:border-primary" />
-          <button onclick={handleResend} disabled={resendLoading || !resendEmail}
-            class="px-3 py-2 border-none rounded bg-bg-input border border-border text-[13px] text-muted transition-all hover:text-text hover:border-primary disabled:opacity-50">
-            Resend
-          </button>
-        </div>
+  <main class="flex flex-1 items-center justify-center px-5 pb-16 pt-6 sm:px-8">
+    <div class="w-full max-w-[400px]">
+      <div class="mb-6 text-center">
+        <h1 class="text-2xl font-semibold tracking-[-0.02em] text-fg">{mode === 'login' ? 'Sign in to cpmesh' : 'Create your account'}</h1>
+        <p class="mt-1.5 text-sm text-muted">{mode === 'login' ? 'Your clipboard, on every device you own.' : 'Free, open source, end-to-end encrypted.'}</p>
       </div>
-    {:else}
-      <form onsubmit={handleRegister}>
-        <label class="flex flex-col gap-1.5 mb-3">
-          <span class="text-[13px] text-muted font-medium">Full Name <span class="text-danger">*</span></span>
-          <input type="text" bind:value={regFullName} required minlength="2" maxlength="100" autocomplete="name"
-            class="py-[11px] px-3.5 border rounded bg-bg-input text-text text-sm outline-none transition-all duration-150 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)] {regErrors.fullName ? 'border-danger' : 'border-border'}" />
-          {#if regErrors.fullName}<span class="text-[11px] text-danger">{regErrors.fullName}</span>{/if}
-        </label>
 
-        <label class="flex flex-col gap-1.5 mb-3">
-          <span class="text-[13px] text-muted font-medium">Email <span class="text-danger">*</span></span>
-          <input type="email" bind:value={regEmail} required autocomplete="email"
-            class="py-[11px] px-3.5 border rounded bg-bg-input text-text text-sm outline-none transition-all duration-150 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)] {regErrors.email ? 'border-danger' : 'border-border'}" />
-          {#if regErrors.email}<span class="text-[11px] text-danger">{regErrors.email}</span>{/if}
-        </label>
-
-        <label class="flex flex-col gap-1.5 mb-3">
-          <span class="text-[13px] text-muted font-medium">Username <span class="text-danger">*</span></span>
-          <input type="text" bind:value={regUsername} required minlength="3" maxlength="50" autocomplete="username"
-            class="py-[11px] px-3.5 border rounded bg-bg-input text-text text-sm outline-none transition-all duration-150 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)] {regErrors.username ? 'border-danger' : 'border-border'}" />
-          {#if regErrors.username}<span class="text-[11px] text-danger">{regErrors.username}</span>{/if}
-        </label>
-
-        <div class="flex gap-3 mb-3">
-          <label class="flex flex-col gap-1.5 flex-1">
-            <span class="text-[13px] text-muted font-medium">Country</span>
-            <input type="text" bind:value={regCountry} autocomplete="country-name" placeholder="Optional"
-              class="py-[11px] px-3.5 border border-border rounded bg-bg-input text-text text-sm outline-none transition-all duration-150 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)]" />
-          </label>
-          <label class="flex flex-col gap-1.5 flex-1">
-            <span class="text-[13px] text-muted font-medium">Mobile</span>
-            <input type="tel" bind:value={regMobile} autocomplete="tel" placeholder="Optional"
-              class="py-[11px] px-3.5 border rounded bg-bg-input text-text text-sm outline-none transition-all duration-150 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)] {regErrors.mobile ? 'border-danger' : 'border-border'}" />
-            {#if regErrors.mobile}<span class="text-[11px] text-danger">{regErrors.mobile}</span>{/if}
-          </label>
+      <div class="rounded-lg border border-border bg-surface p-6 shadow-sm sm:p-7">
+        <div class="mb-6 flex border-b border-border" role="tablist" aria-label="Authentication mode">
+          <button type="button" role="tab" aria-selected={mode === 'login'} class="-mb-px flex-1 border-b-2 pb-2.5 text-sm font-medium transition-colors {mode === 'login' ? 'border-ink text-fg' : 'border-transparent text-muted hover:text-fg'}" onclick={() => switchMode('login')}>Sign in</button>
+          <button type="button" role="tab" aria-selected={mode === 'register'} class="-mb-px flex-1 border-b-2 pb-2.5 text-sm font-medium transition-colors {mode === 'register' ? 'border-ink text-fg' : 'border-transparent text-muted hover:text-fg'}" onclick={() => switchMode('register')}>Create account</button>
         </div>
 
-        <label class="flex flex-col gap-1.5 mb-1">
-          <span class="text-[13px] text-muted font-medium">Password <span class="text-danger">*</span></span>
-          <input type="password" bind:value={regPassword} required minlength="8" maxlength="128" autocomplete="new-password"
-            class="py-[11px] px-3.5 border rounded bg-bg-input text-text text-sm outline-none transition-all duration-150 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)] {regErrors.password ? 'border-danger' : 'border-border'}" />
-          {#if regErrors.password}<span class="text-[11px] text-danger">{regErrors.password}</span>{/if}
-        </label>
-        {#if regPassword}
-          <div class="flex items-center gap-2 mb-3">
-            <div class="flex-1 h-1.5 bg-bg-input rounded-full overflow-hidden">
-              <div class="h-full rounded-full transition-all duration-300" style="width: {passwordStrength.width}; background: {passwordStrength.color}"></div>
-            </div>
-            <span class="text-[11px] font-medium" style="color: {passwordStrength.color}">{passwordStrength.label}</span>
-          </div>
+        <div class="flex flex-col gap-3">
+          {#if error}<Alert tone="danger" dismissible ondismiss={() => (error = '')}>{error}</Alert>{/if}
+          {#if success}<Alert tone="success" dismissible ondismiss={() => (success = '')}>{success}</Alert>{/if}
+        </div>
+
+        {#if mode === 'login'}
+          <form onsubmit={handleLogin} class="mt-4 flex flex-col gap-4">
+            <Field label="Username or email" bind:value={loginIdentifier} required autocomplete="username" placeholder="you@example.com" />
+            <Field label="Password" type="password" bind:value={loginPassword} required minlength={8} autocomplete="current-password" placeholder="••••••••" />
+            <Button type="submit" size="lg" {loading} class="mt-1 w-full">Sign in</Button>
+          </form>
         {:else}
-          <div class="mb-3"></div>
+          <form onsubmit={handleRegister} class="mt-4 flex flex-col gap-4" novalidate>
+            <Field label="Full name" bind:value={regFullName} required autocomplete="name" error={regErrors.fullName} />
+            <Field label="Email" type="email" bind:value={regEmail} required autocomplete="email" error={regErrors.email} />
+            <Field label="Username" bind:value={regUsername} required autocomplete="username" error={regErrors.username} hint="3–50 characters, shown to your other devices" />
+            <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <Field label="Country" bind:value={regCountry} optional autocomplete="country-name" />
+              <Field label="Mobile" type="tel" bind:value={regMobile} optional autocomplete="tel" error={regErrors.mobile} />
+            </div>
+            <div class="flex flex-col gap-2">
+              <Field label="Password" type="password" bind:value={regPassword} required minlength={8} maxlength={128} autocomplete="new-password" error={regErrors.password} />
+              {#if regPassword}
+                <div class="flex items-center gap-3 px-0.5">
+                  <div class="flex flex-1 gap-1" aria-hidden="true">
+                    {#each Array(5) as _, i (i)}
+                      <span class="h-1 flex-1 rounded-full transition-colors duration-200 {i < strength.score ? strength.tone : 'bg-surface-3'}"></span>
+                    {/each}
+                  </div>
+                  <span class="w-16 text-right text-xs text-muted">{strength.label}</span>
+                </div>
+              {/if}
+            </div>
+            <Field label="Confirm password" type="password" bind:value={regPasswordConfirm} required autocomplete="new-password" error={regErrors.passwordConfirm} />
+            <Button type="submit" size="lg" {loading} class="mt-1 w-full">Create account</Button>
+            <p class="text-center text-xs leading-relaxed text-dim">We only use your email to verify the account and for security notices.</p>
+          </form>
         {/if}
 
-        <label class="flex flex-col gap-1.5 mb-4">
-          <span class="text-[13px] text-muted font-medium">Confirm Password <span class="text-danger">*</span></span>
-          <input type="password" bind:value={regPasswordConfirm} required autocomplete="new-password"
-            class="py-[11px] px-3.5 border rounded bg-bg-input text-text text-sm outline-none transition-all duration-150 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)] {regErrors.passwordConfirm ? 'border-danger' : 'border-border'}" />
-          {#if regErrors.passwordConfirm}<span class="text-[11px] text-danger">{regErrors.passwordConfirm}</span>{/if}
-        </label>
+        {#if socialEnabled}
+          <div class="my-5 flex items-center gap-3">
+            <div class="h-px flex-1 bg-border"></div>
+            <span class="text-xs text-dim">or</span>
+            <div class="h-px flex-1 bg-border"></div>
+          </div>
+          <Button href="/api/auth/social/login" variant="secondary" size="lg" icon="globe" class="w-full">
+            Continue with {socialProvider ? socialProvider.charAt(0).toUpperCase() + socialProvider.slice(1) : 'SSO'}
+          </Button>
+        {/if}
 
-        <button type="submit" class="w-full py-3 border-none rounded bg-primary text-white text-sm font-semibold transition-all duration-200 flex items-center justify-center gap-2 hover:not-disabled:bg-primary-hover hover:not-disabled:shadow-primary disabled:opacity-60" disabled={loading}>
-          {#if loading}
-            <span class="inline-block w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-[spin_0.6s_linear_infinite]"></span>
-          {:else}
-            Create Account
-          {/if}
-        </button>
-      </form>
+        {#if mode === 'login'}
+          <div class="mt-6 border-t border-border pt-4">
+            <button type="button" class="flex w-full items-center justify-between text-[13px] text-muted transition-colors hover:text-fg" aria-expanded={resendOpen} onclick={() => (resendOpen = !resendOpen)}>
+              Didn't receive the verification email?
+              <Icon name="chevron-down" size={14} class="transition-transform duration-200 {resendOpen ? 'rotate-180' : ''}" />
+            </button>
+            {#if resendOpen}
+              <form onsubmit={handleResend} class="mt-3 flex gap-2">
+                <Field type="email" bind:value={resendEmail} placeholder="Your email address" class="flex-1" required />
+                <Button type="submit" variant="secondary" loading={resendLoading} disabled={!resendEmail}>Resend</Button>
+              </form>
+            {/if}
+          </div>
+        {/if}
+      </div>
 
-      {#if socialEnabled}
-        <div class="flex items-center gap-3 my-4">
-          <div class="flex-1 h-px bg-border"></div>
-          <span class="text-[12px] text-muted uppercase tracking-wider">or</span>
-          <div class="flex-1 h-px bg-border"></div>
-        </div>
-        <a href="/api/auth/social/login" class="w-full py-3 border border-border rounded bg-bg-input text-text text-sm font-medium transition-all duration-200 flex items-center justify-center gap-2 hover:bg-bg-hover hover:border-border-hover no-underline">
-          <Icon name="network" size={16} />
-          Sign up with {socialProvider || 'Social Login'}
-        </a>
-      {/if}
-    {/if}
-
-    <div class="text-center mt-5">
-      <a href="#/" class="inline-flex items-center gap-1.5 text-[13px] text-muted no-underline transition-colors duration-150 hover:text-text hover:no-underline">
-        <Icon name="arrow-left" size={14} /> Back to home
-      </a>
+      <p class="mt-6 text-center text-xs text-dim">
+        End-to-end encrypted · Open source · <a href="https://github.com/cjs0h/cpmesh" target="_blank" rel="noopener" class="underline underline-offset-4 hover:text-fg">Self-host it</a>
+      </p>
     </div>
-  </div>
+  </main>
 </div>
