@@ -21,13 +21,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: [18, 20, 22]
+        # The published server supports Node 18.19+ (package.json engines), so every
+        # version builds and runs the stdio smoke test; Vitest 5 itself needs Node 22.12+.
+        node: [18, 20, 22, 24]
     defaults:
       run:
         working-directory: mcp/cpmesh-mcp
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -35,6 +37,7 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+        if: matrix.node >= 22
       - run: npm run build
       - run: node scripts/smoke.mjs
 
@@ -45,7 +48,8 @@ jobs:
       run:
         working-directory: mcp/cpmesh-mcp
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
       - name: Regenerate vectors from the desktop Rust crypto
         run: |
           cd vector-gen
