@@ -23,10 +23,13 @@
   import AdminReleases from './pages/admin/Releases.svelte';
   import NotFound from './pages/NotFound.svelte';
   import AuthCallback from './pages/AuthCallback.svelte';
+  import Mcp from './pages/Mcp.svelte';
+  import Agents from './pages/Agents.svelte';
 
   const publicRoutes = {
     '/': Home,
     '/login': Login,
+    '/mcp': Mcp,
     '/auth/callback': AuthCallback,
     // Deep links into the app while signed out land on the sign-in screen.
     '*': Login,
@@ -37,6 +40,7 @@
     '/clipboard': Clipboard,
     '/devices': Devices,
     '/settings': Settings,
+    '/mcp': Agents,
     '/admin/users': AdminUsers,
     '/admin/plans': AdminPlans,
     '/admin/downloads': AdminDownloads,
