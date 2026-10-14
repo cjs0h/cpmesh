@@ -5,11 +5,13 @@ on:
     branches: [main, master]
     paths:
       - "desktop-tauri/**"
+      - "scripts/release/**"
       - ".github/workflows/desktop.yml"
   pull_request:
     branches: [main, master]
     paths:
       - "desktop-tauri/**"
+      - "scripts/release/**"
       - ".github/workflows/desktop.yml"
 
 env:
@@ -32,6 +34,9 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm test
+      - name: Release script tests
+        working-directory: .
+        run: node --test "scripts/release/*.test.mjs"
 
   rust-lint:
     name: Rust format and clippy

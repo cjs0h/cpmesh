@@ -94,7 +94,7 @@ cargo build --release -p cpmesh-server
 
 ### 5. Install the desktop app
 
-Download the latest release from the [Releases page](https://github.com/cjs0h/cpmesh/releases) or build from source:
+Download the latest release from the [Releases page](https://github.com/cjs0h/cpmesh/releases) or the Downloads section on [cpmesh.com](https://cpmesh.com) (installers for Windows, macOS, Linux and Android are published by the Release workflow, see [Releasing](CONTRIBUTING.md#releasing)), or build from source:
 
 ```bash
 # Requires Rust 1.94+, Node.js 22.17+ (24 LTS recommended), and Tauri CLI
