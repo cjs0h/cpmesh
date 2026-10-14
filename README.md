@@ -133,11 +133,14 @@ Add it to any stdio MCP client (Claude Desktop, Cursor, ZCode, ...):
     "cpmesh": {
       "command": "npx",
       "args": ["-y", "cpmesh-mcp"],
-      "env": { "CPMESH_SERVER_URL": "https://your-cpmesh-server" }
+      "env": { "CPMESH_SERVER_URL": "https://cpmesh.com" }
     }
   }
 }
 ```
+
+`https://cpmesh.com` is the hosted service; point `CPMESH_SERVER_URL` at your own
+server if you self-host.
 
 On first use the agent asks for your credentials, then walks you through the
 8-digit device-approval pairing (you confirm the code on an already-approved

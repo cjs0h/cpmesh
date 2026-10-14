@@ -24,12 +24,15 @@ MCP client):
       "command": "npx",
       "args": ["-y", "cpmesh-mcp"],
       "env": {
-        "CPMESH_SERVER_URL": "https://cpmesh.example.com"
+        "CPMESH_SERVER_URL": "https://cpmesh.com"
       }
     }
   }
 }
 ```
+
+`https://cpmesh.com` is the hosted cpmesh service; if you self-host, use your
+own server's URL instead.
 
 See [SKILL.md](./SKILL.md) for the full agent skill: first-run pairing, tool
 usage patterns, and security notes. Agents can also fetch those instructions
@@ -39,7 +42,7 @@ at runtime via the `cpmesh_skill` MCP prompt.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CPMESH_SERVER_URL` | — | Server base URL (can also be passed to the `cpmesh_login` tool) |
+| `CPMESH_SERVER_URL` | — | Server base URL, e.g. `https://cpmesh.com` (can also be passed to the `cpmesh_login` tool) |
 | `CPMESH_USERNAME` | — | With `CPMESH_PASSWORD`, auto-login at startup |
 | `CPMESH_PASSWORD` | — | See above |
 | `CPMESH_HOME` | `~/.cpmesh/mcp` | Directory for device key, keyring, session, key pins |
@@ -64,7 +67,8 @@ Plus the `cpmesh_skill` prompt with install/usage instructions.
 
 ## First-run flow
 
-1. Agent calls `cpmesh_login` (user's server URL + credentials).
+1. Agent calls `cpmesh_login` (server URL — `https://cpmesh.com` unless the
+   user self-hosts — and the user's credentials).
 2. Device registers as **pending**; an 8-digit code is derived via ECDH with
    the approver's public key.
 3. The user confirms the code on an already-approved device (anti-MITM).
@@ -80,7 +84,9 @@ State lives in `CPMESH_HOME` (default `~/.cpmesh/mcp`, files `0600` on Unix):
 
 - `device.key` — device ECDH private key (same PEM format as the desktop app)
 - `keyring.enc` — encrypted group-key keyring (same file format as the desktop app)
-- `session.json` — server URL, device identity, JWT tokens
+- `session.json` — server URL, device identity, JWT tokens. Refresh tokens are
+  single-use: each refresh rotates them and writes the new pair back here, so
+  several MCP processes can share one state directory.
 - `pinned_keys.json` — TOFU pins of peer device keys; a changed peer key is
   treated as a possible MITM and refused
 

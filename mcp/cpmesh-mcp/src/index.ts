@@ -61,7 +61,7 @@ const loginSchema = {
     .string()
     .optional()
     .describe(
-      "cpmesh server base URL, e.g. https://cpmesh.example.com. " +
+      "cpmesh server base URL: https://cpmesh.com for the hosted service, or the user's self-hosted server. " +
         "Optional if CPMESH_SERVER_URL is set in the server environment.",
     ),
   username: z.string().describe("cpmesh account username"),
@@ -377,7 +377,7 @@ function loadSkillText(): string {
   return [
     "# cpmesh skill",
     "",
-    "1. Install: add {\"mcpServers\":{\"cpmesh\":{\"command\":\"npx\",\"args\":[\"-y\",\"cpmesh-mcp\"],\"env\":{\"CPMESH_SERVER_URL\":\"https://your-server\"}}}} to your MCP client config.",
+    "1. Install: add {\"mcpServers\":{\"cpmesh\":{\"command\":\"npx\",\"args\":[\"-y\",\"cpmesh-mcp\"],\"env\":{\"CPMESH_SERVER_URL\":\"https://cpmesh.com\"}}}} to your MCP client config (self-hosted users put their own server URL).",
     "2. First run: call cpmesh_login (needs username+password), relay the 8-digit pairing code to the user, wait for them to confirm it on an approved device, then call cpmesh_wait_for_approval.",
     "3. Use cpmesh_push_clipboard to share text to the user's devices and cpmesh_get_clipboard / cpmesh_get_latest_clipboard / cpmesh_search_clipboard to read what they copied.",
   ].join("\n");

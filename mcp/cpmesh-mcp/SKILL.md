@@ -17,7 +17,8 @@ device with its own keys — the cpmesh server only ever sees ciphertext.
 
 ## Prerequisites
 
-- A running cpmesh server the user controls (self-hosted; URL like `https://cpmesh.example.com`).
+- A cpmesh account — on the hosted service at `https://cpmesh.com`, or on a
+  self-hosted cpmesh server.
 - The user's cpmesh username and password.
 - At least one already-approved cpmesh device (desktop app) — needed once, to
   approve this agent. If the account has NO devices yet, the MCP device
@@ -35,14 +36,15 @@ Cursor `.cursor/mcp.json`, or equivalent):
       "command": "npx",
       "args": ["-y", "cpmesh-mcp"],
       "env": {
-        "CPMESH_SERVER_URL": "https://cpmesh.example.com"
+        "CPMESH_SERVER_URL": "https://cpmesh.com"
       }
     }
   }
 }
 ```
 
-Requires Node.js ≥ 18. No other setup — `npx` fetches and runs the package.
+Self-hosted users put their own server's URL in `CPMESH_SERVER_URL`.
+Requires Node.js ≥ 18.19. No other setup — `npx` fetches and runs the package.
 Restart the client after editing the config. You can also ask the server for
 these instructions at any time via the `cpmesh_skill` prompt.
 
@@ -54,7 +56,8 @@ Optional environment variables:
 
 1. Call `cpmesh_status` — if it says not logged in, continue.
 2. Ask the user for their username and password, then call `cpmesh_login`
-   (pass `server_url` unless `CPMESH_SERVER_URL` is set).
+   (if `CPMESH_SERVER_URL` is not set, pass `server_url` — `https://cpmesh.com`
+   unless the user self-hosts).
 3. The response contains an **8-digit pairing code**. Tell the user:
    "Open the cpmesh app on one of your approved devices, start approving the
    new device **MCP Agent - \<hostname\>**, and confirm it shows code
