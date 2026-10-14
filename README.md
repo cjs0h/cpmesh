@@ -115,6 +115,38 @@ Open the desktop app, enter your server URL and the admin credentials from your 
 | Shared Proto | `crates/cpmesh-proto/` | Rust | Shared WebSocket message types and API request/response types |
 | Desktop App | `desktop-tauri/` | Rust, Tauri v2, SvelteKit 3 | Desktop client with tray integration and local device state |
 | Web Dashboard | `web/` | Svelte 5, TypeScript, Vite 8, Tailwind CSS 4 | Landing page, sign-in, device management, live clipboard history, and admin console |
+| MCP Server | `mcp/cpmesh-mcp/` | TypeScript, MCP SDK | Lets AI agents use cpmesh: share clipboard text, read history, manage devices |
+
+## AI agents (MCP)
+
+cpmesh ships an MCP server (`cpmesh-mcp`, published to npm) that lets AI agents
+share clipboard text with your devices, read and search clipboard history, and
+manage devices — with the same end-to-end encryption and device-approval
+pairing as the desktop app. The server acts as its own cpmesh device and keeps
+its keys locally; the relay only ever sees ciphertext.
+
+Add it to any stdio MCP client (Claude Desktop, Cursor, ZCode, ...):
+
+```json
+{
+  "mcpServers": {
+    "cpmesh": {
+      "command": "npx",
+      "args": ["-y", "cpmesh-mcp"],
+      "env": { "CPMESH_SERVER_URL": "https://your-cpmesh-server" }
+    }
+  }
+}
+```
+
+On first use the agent asks for your credentials, then walks you through the
+8-digit device-approval pairing (you confirm the code on an already-approved
+device). Full agent instructions live in
+[`mcp/cpmesh-mcp/SKILL.md`](mcp/cpmesh-mcp/SKILL.md) — install that file into
+your agent's skills directory (e.g. `~/.agents/skills/cpmesh/`), or let the
+agent pull them from the `cpmesh_skill` MCP prompt. See
+[`mcp/cpmesh-mcp/README.md`](mcp/cpmesh-mcp/README.md) for the complete tool
+reference.
 
 ## Testing
 
@@ -125,6 +157,7 @@ cargo test --workspace                       # server + shared proto (unit, rout
 cd desktop-tauri/src-tauri && cargo test     # desktop crypto, history, config and protocol tests
 cd web && npm test                           # web dashboard (Vitest)
 cd desktop-tauri && npm test                 # desktop frontend (Vitest)
+cd mcp/cpmesh-mcp && npm test                # MCP server crypto and API client (Vitest)
 ```
 
 The PostgreSQL-backed integration tests in `crates/cpmesh-server/tests/db.rs` run only when

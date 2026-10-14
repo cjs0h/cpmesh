@@ -1,0 +1,50 @@
+{
+  "name": "cpmesh-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that lets AI agents use cpmesh end-to-end-encrypted clipboard sync: share text to the user's devices, read and search clipboard history, manage devices.",
+  "type": "module",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cjs0h/cpmesh.git",
+    "directory": "mcp/cpmesh-mcp"
+  },
+  "bin": {
+    "cpmesh-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "SKILL.md",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18.19"
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "npm run typecheck && npm run build && npm run test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "@noble/curves": "^1.8.1",
+    "@noble/hashes": "^1.8.0",
+    "ws": "^8.18.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  },
+  "keywords": [
+    "mcp",
+    "cpmesh",
+    "clipboard",
+    "model-context-protocol",
+    "ai-agents"
+  ]
+}
