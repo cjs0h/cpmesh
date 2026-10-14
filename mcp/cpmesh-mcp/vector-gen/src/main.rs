@@ -20,18 +20,17 @@ mod crypto {
     pub mod exchange;
 }
 
-use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes256Gcm, Nonce};
+use aes_gcm::Aes256Gcm;
+use aes_gcm::aead::{Aead, KeyInit, Nonce};
 use base64::Engine;
+use p256::SecretKey;
 use p256::ecdh::diffie_hellman;
-use p256::elliptic_curve::sec1::ToEncodedPoint;
-use p256::{PublicKey, SecretKey};
 use serde_json::json;
 
-use crypto::encrypt::{
-    derive_key_from_group_key, derive_key_from_secret, derive_shared_key,
-};
-use crypto::keys::{derive_approval_code, KeyPair};
+use crypto::encrypt::{derive_key_from_group_key, derive_key_from_secret, derive_shared_key};
+use crypto::keys::{KeyPair, derive_approval_code, public_key_to_bytes};
+
+type GcmNonce = Nonce<Aes256Gcm>;
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
@@ -57,8 +56,8 @@ fn main() {
 
     let kp_a = KeyPair { private: priv_a.clone(), public: pub_a };
 
-    let pub_a_bytes = pub_a.to_encoded_point(false).as_bytes().to_vec();
-    let pub_b_bytes = pub_b.to_encoded_point(false).as_bytes().to_vec();
+    let pub_a_bytes = public_key_to_bytes(&pub_a);
+    let pub_b_bytes = public_key_to_bytes(&pub_b);
 
     // Raw ECDH shared secret (x-coordinate).
     let ecdh_x = diffie_hellman(priv_a.to_nonzero_scalar(), pub_b.as_affine())
@@ -91,7 +90,7 @@ fn main() {
     let nonce12: [u8; 12] = hex_bytes("303132333435363738393a3b").try_into().unwrap();
     let plaintext = b"Hello from cpmesh MCP golden vectors".to_vec();
     let cipher = Aes256Gcm::new_from_slice(&payload_key).unwrap();
-    let ct_tag = cipher.encrypt(&Nonce::from(nonce12), plaintext.as_ref()).unwrap();
+    let ct_tag = cipher.encrypt(&GcmNonce::from(nonce12), plaintext.as_ref()).unwrap();
 
     // Full clipboard payload layout: salt(16) || nonce(12) || ct || tag.
     let mut payload_full = Vec::with_capacity(16 + 12 + ct_tag.len());
@@ -103,7 +102,7 @@ fn main() {
     // (identical to what encrypt_group_key produces, with randomness pinned).
     let wrap_cipher = Aes256Gcm::new_from_slice(&shared_wrap_ab).unwrap();
     let ct_tag_wrap = wrap_cipher
-        .encrypt(&Nonce::from(nonce12), group_key.as_ref())
+        .encrypt(&GcmNonce::from(nonce12), group_key.as_ref())
         .unwrap();
     let mut gk_wrapped = Vec::with_capacity(12 + ct_tag_wrap.len());
     gk_wrapped.extend_from_slice(&nonce12);
@@ -132,7 +131,7 @@ fn main() {
     let kek = derive_key_from_secret(&priv_a_bytes, &keyring_salt, b"cpnet-keyring-v1").unwrap();
     let kek_cipher = Aes256Gcm::new_from_slice(&kek).unwrap();
     let keyring_ct = kek_cipher
-        .encrypt(&Nonce::from(nonce12), keyring_bytes.as_slice())
+        .encrypt(&GcmNonce::from(nonce12), keyring_bytes.as_slice())
         .unwrap();
     let mut keyring_file = Vec::with_capacity(16 + 12 + keyring_ct.len());
     keyring_file.extend_from_slice(&keyring_salt);
@@ -171,7 +170,3 @@ fn hex_bytes(s: &str) -> Vec<u8> {
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
         .collect()
 }
-
-// Silence unused warnings for PublicKey import used only in type position.
-#[allow(dead_code)]
-fn _assert_pubkey(_k: &PublicKey) {}
