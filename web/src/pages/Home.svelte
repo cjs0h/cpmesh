@@ -4,6 +4,7 @@
   import Logo from '../components/Logo.svelte';
   import SyncDemo from '../components/landing/SyncDemo.svelte';
   import Button from '../components/ui/Button.svelte';
+  import { agentSetups, DEFAULT_SERVER_URL } from '../lib/mcp';
 
   const GITHUB_URL = 'https://github.com/cjs0h/cpmesh';
 
@@ -80,6 +81,7 @@
   const navLinks = [
     { label: 'Features', id: 'features' },
     { label: 'Security', id: 'security' },
+    { label: 'AI agents', id: 'agents' },
     { label: 'Downloads', id: 'downloads' },
     { label: 'Pricing', id: 'pricing' },
   ];
@@ -144,6 +146,14 @@
     { icon: 'cloud', label: 'Relay', sub: 'ciphertext only' },
     { icon: 'key', label: 'Decrypt', sub: 'ECDH P-256' },
     { icon: 'smartphone', label: 'Your phone', sub: 'plaintext' },
+  ];
+
+  const agentNames = ['Claude Code', 'Claude Desktop', 'Cursor', 'VS Code', 'Copilot CLI', 'Codex', 'Gemini CLI', 'Windsurf', 'Cline', 'Zed', 'opencode'];
+  const agentCmd = agentSetups(DEFAULT_SERVER_URL)[0].blocks[0].code;
+  const agentAbilities = [
+    { icon: 'send', text: 'Sends commands, links and snippets straight to your phone or desktop clipboard' },
+    { icon: 'clipboard', text: 'Reads and searches what you copied, decrypted only on your machine' },
+    { icon: 'key', text: 'Joins as its own device, approved with an 8-digit code like any other' },
   ];
 
   const protocols = [
@@ -350,8 +360,65 @@ relay.send(ciphertext)  <span class="text-dim">// the relay only ever sees this<
       </div>
     </section>
 
+    <!-- ==================== AI AGENTS (MCP) ==================== -->
+    <section class="border-t border-border bg-bg-deep py-20 md:py-28" id="agents">
+      <div class="wrap">
+        {@render sectionHeader('AI agents', 'Your clipboard, inside your AI agent', 'The cpmesh MCP server connects Claude, Cursor, Copilot and any other MCP client to your clipboard, with the same end-to-end encryption.')}
+
+        <div class="mt-12 grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.15fr)]">
+          <div class="flex flex-col rounded-lg border border-border bg-surface p-6 md:p-8">
+            <ul class="space-y-4">
+              {#each agentAbilities as a (a.text)}
+                <li class="flex gap-3 text-[15px] leading-relaxed text-fg">
+                  <span class="mt-0.5 shrink-0 text-fg"><Icon name={a.icon} size={18} strokeWidth={1.75} /></span>
+                  {a.text}
+                </li>
+              {/each}
+            </ul>
+            <p class="mt-8 text-[13px] font-medium text-muted">Works with</p>
+            <ul class="mt-3 flex flex-wrap gap-1.5">
+              {#each agentNames as name (name)}
+                <li class="rounded-full border border-border px-2.5 py-0.5 text-[12px] text-muted">{name}</li>
+              {/each}
+              <li class="rounded-full border border-dashed border-border-strong px-2.5 py-0.5 text-[12px] text-dim">any MCP client</li>
+            </ul>
+            <div class="mt-8 pt-2 lg:mt-auto">
+              <Button href="#/mcp" iconRight="arrow-right">Set up your agent</Button>
+            </div>
+          </div>
+
+          <div class="flex flex-col gap-4">
+            <div class="overflow-hidden rounded-lg border border-border bg-surface">
+              <div class="flex items-center justify-between border-b border-border px-4 py-2.5">
+                <span class="font-mono text-xs text-muted">Claude Code · one command</span>
+                <button type="button" class="inline-flex items-center gap-1.5 text-xs transition-colors {copiedCmd === 'mcp' ? 'text-accent' : 'text-dim hover:text-fg'}" onclick={() => copyText(agentCmd, 'mcp')}>
+                  <Icon name={copiedCmd === 'mcp' ? 'check' : 'copy'} size={12} />
+                  {copiedCmd === 'mcp' ? 'Copied' : 'Copy'}
+                </button>
+              </div>
+              <pre class="whitespace-pre-wrap break-all px-4 py-3 font-mono text-[13px] leading-6 text-fg"><code><span class="select-none text-dim">$ </span>{agentCmd}</code></pre>
+            </div>
+
+            <div class="flex-1 overflow-hidden rounded-lg border border-border bg-surface">
+              <div class="border-b border-border px-4 py-2.5">
+                <span class="font-mono text-xs text-muted">Agent session</span>
+              </div>
+              <div class="space-y-3 px-4 py-4 text-[13px] leading-relaxed">
+                <p class="text-fg"><span class="select-none font-mono text-dim">&gt;&nbsp;</span>Send the deploy command to my phone</p>
+                <p class="font-mono text-[12px] text-dim">● cpmesh_push_clipboard</p>
+                <p class="text-muted">Done. <code class="font-mono text-[12px] text-fg">kubectl rollout restart deploy/api</code> is on your phone's clipboard, end-to-end encrypted.</p>
+                <p class="pt-1 text-fg"><span class="select-none font-mono text-dim">&gt;&nbsp;</span>What did I just copy on my laptop?</p>
+                <p class="font-mono text-[12px] text-dim">● cpmesh_get_latest_clipboard</p>
+                <p class="text-muted">A staging URL, copied from “MacBook Pro” a minute ago.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <!-- ==================== DOWNLOADS ==================== -->
-    <section class="border-t border-border bg-bg-deep py-20 md:py-28" id="downloads">
+    <section class="border-t border-border py-20 md:py-28" id="downloads">
       <div class="wrap">
         {@render sectionHeader('Downloads', 'Get the app for your platform', 'System-tray integration, background sync and automatic reconnection are included on every platform.')}
 
@@ -416,11 +483,11 @@ relay.send(ciphertext)  <span class="text-dim">// the relay only ever sees this<
     </section>
 
     <!-- ==================== PRICING ==================== -->
-    <section class="border-t border-border py-20 md:py-28" id="pricing">
+    <section class="border-t border-border bg-bg-deep py-20 md:py-28" id="pricing">
       <div class="wrap">
         {@render sectionHeader('Pricing', 'Free and open source', 'Dual licensed under MIT and Apache-2.0. Self-host for free with Docker — no limits, no telemetry.')}
 
-        <div class="cell-grid mt-12 grid-cols-1 md:grid-cols-2">
+        <div class="cell-grid mt-12 grid-cols-1 bg-surface md:grid-cols-2">
           <div class="px-6 py-8 md:px-8">
             <p class="text-[13px] font-medium text-muted">Self-hosted</p>
             <p class="mt-3 text-4xl font-semibold tracking-tight text-fg">Free</p>
@@ -448,7 +515,7 @@ relay.send(ciphertext)  <span class="text-dim">// the relay only ever sees this<
     </section>
 
     <!-- ==================== CTA ==================== -->
-    <section class="border-t border-border bg-bg-deep py-20 md:py-28">
+    <section class="border-t border-border py-20 md:py-28">
       <div class="wrap text-center">
         <h2 class="text-[clamp(2rem,4vw,3.25rem)] font-semibold leading-[1.05] tracking-[-0.04em] text-fg">Your clipboard belongs to you.</h2>
         <p class="mx-auto mt-5 max-w-xl text-base text-muted md:text-lg">Stop routing sensitive data through services that can read it. Get cpmesh running in under a minute.</p>
@@ -471,6 +538,7 @@ relay.send(ciphertext)  <span class="text-dim">// the relay only ever sees this<
         <a href={GITHUB_URL} target="_blank" rel="noopener" class="hover:text-fg">Source</a>
         <a href="{GITHUB_URL}/blob/main/LICENSE" target="_blank" rel="noopener" class="hover:text-fg">License</a>
         <a href="{GITHUB_URL}/blob/main/docs/self-hosting.md" target="_blank" rel="noopener" class="hover:text-fg">Docs</a>
+        <a href="#/mcp" class="hover:text-fg">AI agents</a>
         <a href="#/login" class="hover:text-fg">Sign in</a>
       </nav>
       <span class="text-dim">Built with Rust and Svelte</span>

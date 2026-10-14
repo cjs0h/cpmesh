@@ -1,0 +1,24 @@
+[package]
+name = "cpmesh-vector-gen"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Generates golden crypto vectors for the cpmesh-mcp TypeScript package by running the exact Rust crypto from the desktop client. Output: JSON on stdout."
+
+# Standalone workspace (the repo root workspace only includes crates/*).
+[workspace]
+
+# The desktop crypto modules are compiled here verbatim via #[path], so the
+# edition and these crate versions must match desktop-tauri/src-tauri/Cargo.toml.
+[dependencies]
+p256 = { version = "0.14", features = ["ecdh", "ecdsa", "getrandom"] }
+aes-gcm = "0.11"
+hkdf = "0.13"
+sha2 = "0.11"
+rand = "0.10"
+serde_json = "1"
+base64 = "0.23"
+pem = "4"
+thiserror = "2"
+zeroize = { version = "1", features = ["derive"] }

@@ -1,0 +1,58 @@
+name: MCP CI
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "mcp/cpmesh-mcp/**"
+      - "desktop-tauri/src-tauri/src/crypto/**"
+      - ".github/workflows/mcp.yml"
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "mcp/cpmesh-mcp/**"
+      - "desktop-tauri/src-tauri/src/crypto/**"
+      - ".github/workflows/mcp.yml"
+
+jobs:
+  test:
+    name: Test (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The published server supports Node 18.19+ (package.json engines), so every
+        # version builds and runs the stdio smoke test; Vitest 5 itself needs Node 22.12+.
+        node: [18, 20, 22, 24]
+    defaults:
+      run:
+        working-directory: mcp/cpmesh-mcp
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: mcp/cpmesh-mcp/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+        if: matrix.node >= 22
+      - run: npm run build
+      - run: node scripts/smoke.mjs
+
+  vectors:
+    name: Golden vectors up to date
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mcp/cpmesh-mcp
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Regenerate vectors from the desktop Rust crypto
+        run: |
+          cd vector-gen
+          cargo run --release > /tmp/vectors.json
+      - name: Compare with committed vectors
+        run: diff <(jq -S . /tmp/vectors.json) <(jq -S . test/vectors.json)

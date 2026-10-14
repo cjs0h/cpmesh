@@ -13,6 +13,7 @@ export const appRoutes: RouteMeta[] = [
   { path: '/', label: 'Overview', description: 'Your devices and recent clipboard activity at a glance.', icon: 'dashboard', hideTitle: true },
   { path: '/clipboard', label: 'Clipboard', description: 'Encrypted history of everything you have copied.', icon: 'clipboard' },
   { path: '/devices', label: 'Devices', description: 'Machines paired to your account and their live status.', icon: 'monitor' },
+  { path: '/mcp', label: 'AI agents', description: 'Connect Claude, Cursor, Copilot and other MCP clients to your encrypted clipboard.', icon: 'sparkles' },
   { path: '/settings', label: 'Settings', description: 'Account, plan and security preferences.', icon: 'settings' },
   { path: '/admin/users', label: 'Users', description: 'Everyone registered on this relay.', icon: 'users', admin: true },
   { path: '/admin/plans', label: 'Plans', description: 'Subscription tiers and their limits.', icon: 'star', admin: true },
