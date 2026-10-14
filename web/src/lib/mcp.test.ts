@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { agentSetups, cursorInstallLink, normalizeServerUrl, PLACEHOLDER_SERVER_URL, shellQuote, toolGroups } from './mcp';
+import { agentSetups, cursorInstallLink, normalizeServerUrl, DEFAULT_SERVER_URL, shellQuote, toolGroups } from './mcp';
 
 const URL_ = 'https://relay.example.org';
 
@@ -14,9 +14,10 @@ describe('normalizeServerUrl', () => {
   it('trims whitespace and trailing slashes', () => {
     expect(normalizeServerUrl('  https://a.b/// ')).toBe('https://a.b');
   });
-  it('falls back to the placeholder when empty', () => {
-    expect(normalizeServerUrl('')).toBe(PLACEHOLDER_SERVER_URL);
-    expect(normalizeServerUrl(undefined)).toBe(PLACEHOLDER_SERVER_URL);
+  it('falls back to the hosted cpmesh servers when empty', () => {
+    expect(DEFAULT_SERVER_URL).toBe('https://cpmesh.com');
+    expect(normalizeServerUrl('')).toBe(DEFAULT_SERVER_URL);
+    expect(normalizeServerUrl(undefined)).toBe(DEFAULT_SERVER_URL);
   });
 });
 

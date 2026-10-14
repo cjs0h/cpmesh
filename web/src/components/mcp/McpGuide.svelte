@@ -9,7 +9,7 @@
     MCP_PACKAGE,
     MCP_SOURCE_URL,
     normalizeServerUrl,
-    PLACEHOLDER_SERVER_URL,
+    DEFAULT_SERVER_URL,
     toolGroups,
   } from '../../lib/mcp';
 
@@ -20,8 +20,7 @@
    */
   let { inApp = false }: { inApp?: boolean } = $props();
 
-  // The relay that serves this site is the one the user signs in to.
-  let serverUrl = $state(typeof window !== 'undefined' ? window.location.origin : PLACEHOLDER_SERVER_URL);
+  let serverUrl = $state(DEFAULT_SERVER_URL);
   const setups = $derived(agentSetups(serverUrl));
   let selectedId = $state('claude-code');
   const selected = $derived(setups.find((s) => s.id === selectedId) ?? setups[0]);
@@ -56,7 +55,7 @@
 
   const prerequisites = [
     { icon: 'terminal', title: 'Node.js 18.19 or newer', desc: 'Your agent starts the server with npx. Nothing else to install.' },
-    { icon: 'user', title: 'A cpmesh account', desc: 'Your username and password on the server you use.' },
+    { icon: 'user', title: 'A cpmesh account', desc: 'Your cpmesh.com username and password, or an account on your own relay.' },
     { icon: 'laptop', title: 'One approved device', desc: 'The desktop or Android app, used once to approve the agent.' },
   ];
 
@@ -152,14 +151,14 @@
 
     <div class="rounded-lg border border-border bg-surface p-4 sm:p-5">
       <label for="mcp-server-url" class="text-[13px] font-medium text-fg">Your cpmesh server</label>
-      <p class="mt-1 text-[13px] text-muted">Use the URL you sign in to. If you self-host, enter your own relay's address.</p>
+      <p class="mt-1 text-[13px] text-muted">Snippets point to the hosted cpmesh servers at cpmesh.com. If you self-host, enter your own relay's address.</p>
       <input
         id="mcp-server-url"
         type="url"
         inputmode="url"
         autocomplete="off"
         spellcheck="false"
-        placeholder={PLACEHOLDER_SERVER_URL}
+        placeholder={DEFAULT_SERVER_URL}
         bind:value={serverUrl}
         class="mt-3 h-10 w-full rounded-md border border-border-strong bg-surface px-3 font-mono text-[13px] text-fg outline-none transition-colors placeholder:text-dim focus:border-ink"
       />

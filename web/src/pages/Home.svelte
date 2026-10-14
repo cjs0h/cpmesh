@@ -4,7 +4,7 @@
   import Logo from '../components/Logo.svelte';
   import SyncDemo from '../components/landing/SyncDemo.svelte';
   import Button from '../components/ui/Button.svelte';
-  import { agentSetups } from '../lib/mcp';
+  import { agentSetups, DEFAULT_SERVER_URL } from '../lib/mcp';
 
   const GITHUB_URL = 'https://github.com/cjs0h/cpmesh';
 
@@ -149,7 +149,7 @@
   ];
 
   const agentNames = ['Claude Code', 'Claude Desktop', 'Cursor', 'VS Code', 'Copilot CLI', 'Codex', 'Gemini CLI', 'Windsurf', 'Cline', 'Zed', 'opencode'];
-  const agentCmd = agentSetups(typeof window !== 'undefined' ? window.location.origin : '')[0].blocks[0].code;
+  const agentCmd = agentSetups(DEFAULT_SERVER_URL)[0].blocks[0].code;
   const agentAbilities = [
     { icon: 'send', text: 'Sends commands, links and snippets straight to your phone or desktop clipboard' },
     { icon: 'clipboard', text: 'Reads and searches what you copied, decrypted only on your machine' },

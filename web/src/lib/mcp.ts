@@ -8,7 +8,8 @@
 
 export const MCP_PACKAGE = 'cpmesh-mcp';
 export const MCP_SERVER_NAME = 'cpmesh';
-export const PLACEHOLDER_SERVER_URL = 'https://cpmesh.example.com';
+/** The hosted cpmesh relay. Self-hosters swap in their own URL. */
+export const DEFAULT_SERVER_URL = 'https://cpmesh.com';
 export const MCP_SOURCE_URL = 'https://github.com/cjs0h/cpmesh/tree/master/mcp/cpmesh-mcp';
 
 export type SnippetLang = 'bash' | 'json' | 'toml';
@@ -36,10 +37,10 @@ export interface AgentSetup {
   installLink?: { label: string; href: string };
 }
 
-/** Trim, drop trailing slashes and fall back to a placeholder when empty. */
+/** Trim, drop trailing slashes and fall back to the hosted relay when empty. */
 export function normalizeServerUrl(input: string | null | undefined): string {
   const trimmed = (input ?? '').trim().replace(/\/+$/, '');
-  return trimmed || PLACEHOLDER_SERVER_URL;
+  return trimmed || DEFAULT_SERVER_URL;
 }
 
 /** Quote a value for POSIX shells only when it needs it. */
