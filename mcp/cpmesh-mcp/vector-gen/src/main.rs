@@ -9,16 +9,16 @@
 //! Regenerate after changing the desktop crypto:
 //!   cargo run --release > ../test/vectors.json
 
-mod crypto {
-    // #[path] inside an inline module resolves relative to src/crypto/, hence
-    // five levels up to the repo root.
-    #[path = "../../../../../desktop-tauri/src-tauri/src/crypto/keys.rs"]
-    pub mod keys;
-    #[path = "../../../../../desktop-tauri/src-tauri/src/crypto/encrypt.rs"]
-    pub mod encrypt;
-    #[path = "../../../../../desktop-tauri/src-tauri/src/crypto/exchange.rs"]
-    pub mod exchange;
-}
+// The desktop client's crypto modules, compiled verbatim. They refer to each
+// other through `super::`, so they sit side by side at the crate root, where
+// #[path] resolves from src/. (An inline module would resolve from the
+// non-existent src/<module>/, which Linux refuses to traverse.)
+#[path = "../../../../desktop-tauri/src-tauri/src/crypto/keys.rs"]
+mod keys;
+#[path = "../../../../desktop-tauri/src-tauri/src/crypto/encrypt.rs"]
+mod encrypt;
+#[path = "../../../../desktop-tauri/src-tauri/src/crypto/exchange.rs"]
+mod exchange;
 
 use aes_gcm::Aes256Gcm;
 use aes_gcm::aead::{Aead, KeyInit, Nonce};
@@ -27,8 +27,8 @@ use p256::SecretKey;
 use p256::ecdh::diffie_hellman;
 use serde_json::json;
 
-use crypto::encrypt::{derive_key_from_group_key, derive_key_from_secret, derive_shared_key};
-use crypto::keys::{KeyPair, derive_approval_code, public_key_to_bytes};
+use encrypt::{derive_key_from_group_key, derive_key_from_secret, derive_shared_key};
+use keys::{KeyPair, derive_approval_code, public_key_to_bytes};
 
 type GcmNonce = Nonce<Aes256Gcm>;
 
