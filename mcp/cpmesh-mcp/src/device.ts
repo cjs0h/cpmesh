@@ -12,6 +12,7 @@ import { hostname } from "node:os";
 import {
   ApiError,
   CpmeshApi,
+  SESSION_EXPIRED_MESSAGE,
   SessionExpiredError,
 } from "./api.js";
 import {
@@ -33,10 +34,12 @@ import {
 import type {
   ApprovalStatusResponse,
   ClipboardEntry,
+  ClipboardPushPayload,
   DeviceInfo,
   PlainEntry,
+  RegisterDeviceRequest,
 } from "./protocol.js";
-import { WsClient } from "./ws.js";
+import { WsClient, WsError } from "./ws.js";
 
 const FINGERPRINT_SALT = "cpnet-device-fp-v1";
 
@@ -92,6 +95,24 @@ export class CpmeshDevice {
     return createHash("sha256").update(input, "utf8").digest("hex");
   }
 
+  /** The fingerprint registered at login (sessions without one predate storing it). */
+  private fingerprintOf(session: Session): string {
+    return session.fingerprint ?? this.fingerprintFor(session.user_id);
+  }
+
+  private registrationFor(
+    keypair: KeyPair,
+    name: string,
+    fingerprint: string,
+  ): RegisterDeviceRequest {
+    return {
+      name,
+      public_key: Buffer.from(keypair.publicKeyBytes()).toString("base64"),
+      public_key_sig: Buffer.from(keypair.signPublicKey()).toString("base64"),
+      fingerprint,
+    };
+  }
+
   // === Onboarding ===
 
   async login(
@@ -110,18 +131,16 @@ export class CpmeshDevice {
     const deviceName = this.deviceName();
     const api = new CpmeshApi(serverUrl);
     const auth = await api.login(username, password, deviceName);
+    api.setTokens(auth.access_token, auth.refresh_token);
     const userId = auth.user_id ?? "";
     const fingerprint = this.fingerprintFor(userId);
 
     const paths = statePaths();
     const keypair = KeyPair.loadOrGenerate(paths.deviceKey);
 
-    const reg = await api.registerDevice({
-      name: deviceName,
-      public_key: Buffer.from(keypair.publicKeyBytes()).toString("base64"),
-      public_key_sig: Buffer.from(keypair.signPublicKey()).toString("base64"),
-      fingerprint,
-    });
+    const reg = await api.registerDevice(
+      this.registrationFor(keypair, deviceName, fingerprint),
+    );
 
     const deviceId = reg.device.id;
     const deviceStatus = reg.device.status;
@@ -138,8 +157,9 @@ export class CpmeshDevice {
       device_id: deviceId,
       device_name: deviceName,
       device_status: deviceStatus,
+      fingerprint,
       access_token: api.access ?? "",
-      refresh_token: auth.refresh_token,
+      refresh_token: api.refresh ?? auth.refresh_token,
       created_at: new Date().toISOString(),
     };
     saveSession(session);
@@ -252,14 +272,42 @@ export class CpmeshDevice {
         "Call cpmesh_login with the user's server URL and credentials (or set CPMESH_SERVER_URL / CPMESH_USERNAME / CPMESH_PASSWORD).",
       );
     }
-    const api = this.buildApi(session);
     const keypair = KeyPair.loadOrGenerate(statePaths().deviceKey);
+    const api = this.buildApi(session, keypair);
     return { api, keypair, session };
   }
 
-  private buildApi(session: Session): CpmeshApi {
+  /**
+   * API client for a stored session. Refreshed tokens are persisted to the
+   * session file (shared with other MCP processes using the same state
+   * directory) and re-bound to this device: the server issues refreshed access
+   * tokens without a device, and re-registering with the same key and
+   * fingerprint is a plain reconnect that returns a device-bound token.
+   */
+  private buildApi(session: Session, keypair: KeyPair): CpmeshApi {
     const api = new CpmeshApi(session.server_url);
     api.setTokens(session.access_token, session.refresh_token);
+    const sameDevice = (s: Session | null): s is Session =>
+      s?.device_id === session.device_id;
+    api.tokenStore = {
+      load: () => {
+        const s = loadSession();
+        return sameDevice(s) ? { access: s.access_token, refresh: s.refresh_token } : null;
+      },
+      save: (access, refresh) => {
+        const s = loadSession();
+        if (sameDevice(s)) saveSession({ ...s, access_token: access, refresh_token: refresh });
+      },
+    };
+    api.rebind = async (a) => {
+      const reg = await a.registerDevice(
+        this.registrationFor(keypair, session.device_name, this.fingerprintOf(session)),
+        { retryOnExpiry: false },
+      );
+      if (reg.device.id !== session.device_id) {
+        throw new Error("the server registered a different device while re-binding the session");
+      }
+    };
     return api;
   }
 
@@ -299,7 +347,7 @@ export class CpmeshDevice {
       await this.setupGroupKey(api, keyring, keypair, session.device_id);
     }
 
-    const fingerprint = this.fingerprintFor(session.user_id);
+    const fingerprint = this.fingerprintOf(session);
     this.cached = { session, api, keypair, keyring, fingerprint };
     return this.cached;
   }
@@ -422,7 +470,8 @@ export class CpmeshDevice {
     key_version: number;
     size: number;
   }> {
-    const { session, api, keypair, keyring, fingerprint } = await this.ensureReady();
+    const state = await this.ensureReady();
+    const { keypair, keyring } = state;
 
     const data = new TextEncoder().encode(text);
     const { data: encrypted, keyVersion } = keyring.encryptPayload(data);
@@ -434,17 +483,12 @@ export class CpmeshDevice {
     const metaEncrypted = keyring.encryptPayload(new TextEncoder().encode(meta)).data;
 
     try {
-      await this.ws.pushClipboard(
-        session.server_url,
-        api.access ?? "",
-        fingerprint,
-        {
-          content_type: "text",
-          encrypted_data: Buffer.from(encrypted).toString("base64"),
-          metadata: Buffer.from(metaEncrypted).toString("base64"),
-          key_version: keyVersion,
-        },
-      );
+      await this.wsPush(state, {
+        content_type: "text",
+        encrypted_data: Buffer.from(encrypted).toString("base64"),
+        metadata: Buffer.from(metaEncrypted).toString("base64"),
+        key_version: keyVersion,
+      });
     } catch (e) {
       // If another device rotated the group key, our version may be stale.
       const msg = e instanceof Error ? e.message : String(e);
@@ -462,23 +506,36 @@ export class CpmeshDevice {
     text: string,
     _keypair: KeyPair,
   ): Promise<{ sent: boolean; key_version: number; size: number }> {
-    const { session, api, keyring, fingerprint } = await this.ensureReady();
+    const state = await this.ensureReady();
+    const { keyring } = state;
     const data = new TextEncoder().encode(text);
     const { data: encrypted, keyVersion } = keyring.encryptPayload(data);
     const meta = JSON.stringify({ mime_type: "text/plain", size: data.length });
     const metaEncrypted = keyring.encryptPayload(new TextEncoder().encode(meta)).data;
-    await this.ws.pushClipboard(
-      session.server_url,
-      api.access ?? "",
-      fingerprint,
-      {
-        content_type: "text",
-        encrypted_data: Buffer.from(encrypted).toString("base64"),
-        metadata: Buffer.from(metaEncrypted).toString("base64"),
-        key_version: keyVersion,
-      },
-    );
+    await this.wsPush(state, {
+      content_type: "text",
+      encrypted_data: Buffer.from(encrypted).toString("base64"),
+      metadata: Buffer.from(metaEncrypted).toString("base64"),
+      key_version: keyVersion,
+    });
     return { sent: true, key_version: keyVersion, size: data.length };
+  }
+
+  /**
+   * Pushes over the WebSocket. An expired access token makes the server reject
+   * the upgrade with 401, so refresh the session once and retry.
+   */
+  private async wsPush(state: ReadyState, payload: ClipboardPushPayload): Promise<void> {
+    const { session, api, fingerprint } = state;
+    try {
+      await this.ws.pushClipboard(session.server_url, api.access ?? "", fingerprint, payload);
+    } catch (e) {
+      if (!(e instanceof WsError) || !/\b401\b/.test(e.message)) throw e;
+      if (!(await api.refreshSession(api.access))) {
+        throw new SessionExpiredError(SESSION_EXPIRED_MESSAGE);
+      }
+      await this.ws.pushClipboard(session.server_url, api.access ?? "", fingerprint, payload);
+    }
   }
 
   async getClipboard(
@@ -611,8 +668,8 @@ export class CpmeshDevice {
           "Call cpmesh_login with the user's server URL and credentials (or set CPMESH_SERVER_URL / CPMESH_USERNAME / CPMESH_PASSWORD environment variables).",
       };
     }
-    const api = this.buildApi(session);
     const keypair = KeyPair.loadOrGenerate(statePaths().deviceKey);
+    const api = this.buildApi(session, keypair);
     const paths = statePaths();
 
     let approval: ApprovalStatusResponse | string;

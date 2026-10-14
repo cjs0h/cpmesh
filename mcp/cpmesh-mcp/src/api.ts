@@ -27,10 +27,28 @@ export class ApiError extends Error {
 /** Thrown when the session can no longer be refreshed — user must log in again. */
 export class SessionExpiredError extends Error {}
 
+export const SESSION_EXPIRED_MESSAGE =
+  "session expired — call cpmesh_login again (tokens could not be refreshed)";
+
+/** Where the token pair is persisted, shared with any other process using the same session. */
+export interface TokenStore {
+  load(): { access: string; refresh: string } | null;
+  save(access: string, refresh: string): void;
+}
+
 export class CpmeshApi {
   private baseUrl: string;
   private accessToken: string | null = null;
   private refreshToken: string | null = null;
+  private refreshing: Promise<boolean> | null = null;
+
+  /** Persists rotated tokens; also consulted before refreshing (see refreshSession). */
+  tokenStore: TokenStore | null = null;
+  /**
+   * Re-binds a just-refreshed access token to this device. The server issues
+   * refreshed access tokens without a device, and device endpoints reject those.
+   */
+  rebind: ((api: CpmeshApi) => Promise<void>) | null = null;
 
   constructor(baseUrl: string) {
     this.baseUrl = baseUrl.replace(/\/+$/, "");
@@ -43,6 +61,10 @@ export class CpmeshApi {
 
   get access(): string | null {
     return this.accessToken;
+  }
+
+  get refresh(): string | null {
+    return this.refreshToken;
   }
 
   // === Core request plumbing ===
@@ -59,8 +81,9 @@ export class CpmeshApi {
     const { method = "GET", body, auth = true, refreshed = false } = opts;
     const headers: Record<string, string> = {};
     if (body !== undefined) headers["Content-Type"] = "application/json";
-    if (auth && this.accessToken) {
-      headers.Authorization = `Bearer ${this.accessToken}`;
+    const sentToken = auth ? this.accessToken : null;
+    if (sentToken) {
+      headers.Authorization = `Bearer ${sentToken}`;
     }
 
     const res = await fetch(`${this.baseUrl}${path}`, {
@@ -70,11 +93,9 @@ export class CpmeshApi {
     });
 
     if (res.status === 401 && auth && !refreshed) {
-      const ok = await this.tryRefresh();
+      const ok = await this.refreshSession(sentToken);
       if (ok) return this.request<T>(path, { ...opts, refreshed: true });
-      throw new SessionExpiredError(
-        "session expired — call cpmesh_login again (tokens could not be refreshed)",
-      );
+      throw new SessionExpiredError(SESSION_EXPIRED_MESSAGE);
     }
 
     if (!res.ok) {
@@ -86,8 +107,30 @@ export class CpmeshApi {
     return (text ? JSON.parse(text) : undefined) as T;
   }
 
-  private async tryRefresh(): Promise<boolean> {
+  /**
+   * Gets a working access token after `rejectedAccess` was refused. Refresh
+   * tokens are single-use: the server revokes the presented one, and seeing it
+   * again counts as token theft and revokes every session of the user. So
+   * concurrent callers share one refresh, and a pair already rotated by another
+   * process sharing the session is adopted instead of refreshing again.
+   */
+  refreshSession(rejectedAccess: string | null = this.accessToken): Promise<boolean> {
+    this.refreshing ??= this.doRefresh(rejectedAccess).finally(() => {
+      this.refreshing = null;
+    });
+    return this.refreshing;
+  }
+
+  private async doRefresh(rejectedAccess: string | null): Promise<boolean> {
+    const stored = this.tokenStore?.load();
+    if (stored?.refresh && stored.refresh !== this.refreshToken) {
+      this.accessToken = stored.access || null;
+      this.refreshToken = stored.refresh;
+    }
+    if (this.accessToken && this.accessToken !== rejectedAccess) return true;
     if (!this.refreshToken) return false;
+
+    let data: { access_token: string; refresh_token?: string };
     try {
       const res = await fetch(`${this.baseUrl}/api/auth/refresh`, {
         method: "POST",
@@ -95,13 +138,26 @@ export class CpmeshApi {
         body: JSON.stringify({ refresh_token: this.refreshToken }),
       });
       if (!res.ok) return false;
-      const data = (await res.json()) as { access_token: string };
-      // Keep the existing refresh token, mirroring the web client.
-      this.accessToken = data.access_token;
-      return true;
+      data = (await res.json()) as typeof data;
     } catch {
       return false;
     }
+
+    this.refreshToken = data.refresh_token ?? this.refreshToken;
+    // Persist the rotated refresh token at once; an unbound access token is
+    // never persisted, so a failed re-bind is retried by the next refresh.
+    this.tokenStore?.save(this.rebind ? "" : data.access_token, this.refreshToken);
+    this.accessToken = data.access_token;
+    if (this.rebind) {
+      try {
+        await this.rebind(this);
+      } catch {
+        this.accessToken = null;
+        return false;
+      }
+      this.tokenStore?.save(this.accessToken ?? "", this.refreshToken);
+    }
+    return true;
   }
 
   // === Auth ===
@@ -120,10 +176,12 @@ export class CpmeshApi {
 
   async registerDevice(
     req: RegisterDeviceRequest,
+    opts: { retryOnExpiry?: boolean } = {},
   ): Promise<RegisterDeviceResponse> {
     const resp = await this.request<RegisterDeviceResponse>("/api/devices", {
       method: "POST",
       body: req,
+      refreshed: opts.retryOnExpiry === false,
     });
     // The server returns a device-bound access token.
     this.accessToken = resp.access_token;

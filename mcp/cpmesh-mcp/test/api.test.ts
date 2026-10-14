@@ -98,4 +98,93 @@ describe("CpmeshApi", () => {
     api.setTokens("t", "r");
     expect(await api.getGroupKey()).toBeNull();
   });
+
+  it("rotates the refresh token, re-binds the new access token and persists the pair", async () => {
+    const calls = mockFetch((url, init) => {
+      if (url.endsWith("/api/auth/refresh")) {
+        return { status: 200, body: { access_token: "unbound", refresh_token: "rt2" } };
+      }
+      const auth = (init?.headers as Record<string, string>).Authorization;
+      if (url.endsWith("/api/devices") && init?.method === "POST") {
+        return auth === "Bearer unbound"
+          ? { status: 200, body: { device: { id: "d1", status: "approved", is_reregistration: false }, access_token: "bound" } }
+          : { status: 401, body: { error: "expired" } };
+      }
+      return auth === "Bearer bound" ? { status: 200, body: [] } : { status: 401, body: { error: "expired" } };
+    });
+    const saved: [string, string][] = [];
+    const api = new CpmeshApi("https://srv");
+    api.setTokens("stale", "rt1");
+    api.tokenStore = { load: () => null, save: (a, r) => void saved.push([a, r]) };
+    api.rebind = async (a) => {
+      await a.registerDevice(
+        { name: "MCP", public_key: "cHVi", public_key_sig: "c2ln", fingerprint: "fp" },
+        { retryOnExpiry: false },
+      );
+    };
+
+    await expect(api.getDevices()).resolves.toEqual([]);
+    const refreshCall = calls.find((c) => c.url.endsWith("/api/auth/refresh"))!;
+    expect(JSON.parse(refreshCall.init!.body as string)).toEqual({ refresh_token: "rt1" });
+    // The unbound access token is never persisted.
+    expect(saved).toEqual([["", "rt2"], ["bound", "rt2"]]);
+    expect(api.access).toBe("bound");
+    expect(api.refresh).toBe("rt2");
+  });
+
+  it("shares one refresh between concurrent requests", async () => {
+    let refreshCalls = 0;
+    mockFetch((url, init) => {
+      if (url.endsWith("/api/auth/refresh")) {
+        refreshCalls++;
+        return { status: 200, body: { access_token: "fresh", refresh_token: "rt2" } };
+      }
+      const auth = (init?.headers as Record<string, string>).Authorization;
+      return auth === "Bearer fresh"
+        ? { status: 200, body: { entries: [], has_more: false } }
+        : { status: 401, body: { error: "expired" } };
+    });
+    const api = new CpmeshApi("https://srv");
+    api.setTokens("stale", "rt1");
+    await Promise.all([api.getClipboardHistory(10, 0), api.getClipboardHistory(10, 10)]);
+    expect(refreshCalls).toBe(1);
+    expect(api.refresh).toBe("rt2");
+  });
+
+  it("adopts tokens another process already rotated instead of reusing the spent refresh token", async () => {
+    let refreshCalls = 0;
+    mockFetch((url, init) => {
+      if (url.endsWith("/api/auth/refresh")) {
+        refreshCalls++;
+        return { status: 401, body: { error: "session compromised, all sessions revoked" } };
+      }
+      const auth = (init?.headers as Record<string, string>).Authorization;
+      return auth === "Bearer theirs" ? { status: 200, body: [] } : { status: 401, body: { error: "expired" } };
+    });
+    const api = new CpmeshApi("https://srv");
+    api.setTokens("mine", "rt-spent");
+    api.tokenStore = { load: () => ({ access: "theirs", refresh: "rt-rotated" }), save: vi.fn() };
+    await expect(api.getDevices()).resolves.toEqual([]);
+    expect(refreshCalls).toBe(0);
+    expect(api.refresh).toBe("rt-rotated");
+  });
+
+  it("keeps the rotated refresh token when re-binding fails and drops the unbound access token", async () => {
+    mockFetch((url) =>
+      url.endsWith("/api/auth/refresh")
+        ? { status: 200, body: { access_token: "unbound", refresh_token: "rt2" } }
+        : { status: 401, body: { error: "expired" } },
+    );
+    const saved: [string, string][] = [];
+    const api = new CpmeshApi("https://srv");
+    api.setTokens("stale", "rt1");
+    api.tokenStore = { load: () => null, save: (a, r) => void saved.push([a, r]) };
+    api.rebind = async () => {
+      throw new Error("offline");
+    };
+    await expect(api.getDevices()).rejects.toThrow(SessionExpiredError);
+    expect(saved).toEqual([["", "rt2"]]);
+    expect(api.refresh).toBe("rt2");
+    expect(api.access).toBeNull();
+  });
 });

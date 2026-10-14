@@ -20,6 +20,8 @@ export interface Session {
   device_id: string;
   device_name: string;
   device_status: DeviceStatus;
+  /** Device fingerprint registered at login; reused when re-binding refreshed tokens. */
+  fingerprint?: string;
   access_token: string;
   refresh_token: string;
   created_at: string;
