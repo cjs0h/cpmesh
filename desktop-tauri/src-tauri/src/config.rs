@@ -156,6 +156,26 @@ impl TokenStore {
     }
 }
 
+impl crate::api::client::TokenPersistence for TokenStore {
+    fn save(&self, access: &str, refresh: &str) {
+        if let Err(e) = self.save_tokens(access, refresh) {
+            log::warn!("Failed to save refreshed tokens: {e}");
+        }
+    }
+
+    fn load(&self) -> Option<(String, String)> {
+        let access = self.load_access_token().ok().flatten()?;
+        let refresh = self.load_refresh_token().ok().flatten()?;
+        Some((access, refresh))
+    }
+
+    fn clear(&self) {
+        if let Err(e) = TokenStore::clear(self) {
+            log::warn!("Failed to clear tokens: {e}");
+        }
+    }
+}
+
 /// Returns the platform config directory for cpmesh.
 pub fn config_dir() -> PathBuf {
     dirs::config_dir()

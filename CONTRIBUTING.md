@@ -178,6 +178,9 @@ To bump the version in the repository too, run `node scripts/release/set-version
 | Linux x64 (built on Ubuntu 22.04) | `cpmesh-<version>-linux-amd64.deb`, `cpmesh-<version>-linux-amd64.AppImage` |
 | Android (arm64, armv7, x86_64) | `cpmesh-<version>-android.apk` |
 
+Each desktop installer is accompanied by `<installer>.sig`, the signature the in-app updater checks (see
+[Signing updates](#signing-updates)).
+
 The release stays a draft until every build succeeds; re-running failed jobs replaces the installers. Once it
 is published, `scripts/release/publish-website.mjs` signs in to the server's admin API and creates a download
 link for each installer plus a current app release for each platform the update check reports
@@ -186,10 +189,37 @@ Re-publishing a version is safe, and the script refuses to replace a newer versi
 `--force`. Use `--dry-run` to preview what a release JSON (from `gh release view <tag> --json tagName,url,isDraft,assets`)
 would publish. The release scripts have tests: `node --test "scripts/release/*.test.mjs"`.
 
+### Signing updates
+
+The desktop apps install an update only when its signature verifies against the public key compiled into them
+from `desktop-tauri/src-tauri/updater-key.pub`, the version it was signed for is newer than the running app, and it
+was built for their platform. A compromised server therefore cannot push its own installer or an older release. The
+Release workflow signs every installer with `scripts/release/sign-installers.sh` and uploads each signature next to
+its installer as `<installer>.sig`.
+
+To set up signing once:
+
+1. Generate a key pair, protected by a strong password:
+
+   ```bash
+   cd desktop-tauri
+   npx tauri signer generate -w ~/.tauri/cpmesh-updater.key
+   ```
+
+2. Add the contents of `~/.tauri/cpmesh-updater.key` as the `TAURI_SIGNING_PRIVATE_KEY` secret and its password as
+   `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
+3. Copy `~/.tauri/cpmesh-updater.key.pub` to `desktop-tauri/src-tauri/updater-key.pub` and commit it.
+
+Keep the private key and its password backed up: apps only install updates signed with the key they were built
+with, so without it users have to download new versions by hand. While `updater-key.pub` is empty, installers are
+not signed and the apps do not install updates automatically. Once it is committed, a release fails if the private
+key secret is missing, and every signature is checked against the public key before it is uploaded.
+
 ### Secrets and variables
 
 | Name | Needed for | Purpose |
 | --- | --- | --- |
+| `TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | In-app updates | Signs the desktop installers (see [Signing updates](#signing-updates)) |
 | `CPMESH_ADMIN_USERNAME`, `CPMESH_ADMIN_PASSWORD` | Website update | Admin account on the server the release is registered with |
 | `CPMESH_URL` (variable) | Optional | Server to update, `https://cpmesh.com` by default |
 | `ANDROID_KEYSTORE_BASE64` | Android | The release keystore, base64 encoded |

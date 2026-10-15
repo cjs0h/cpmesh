@@ -14,8 +14,37 @@ use crate::crypto::keys::{KeyPair, derive_approval_code};
 use crate::history::History;
 use crate::proto::models::*;
 use crate::state::AppState;
-use crate::ws::connection::{WsConnection, WsEvent};
+use crate::ws::connection::{TokenProvider, WsConnection, WsEvent};
 use base64::Engine as _;
+
+/// An API client for `server_url` that keeps rotated tokens in secure storage.
+pub(crate) fn api_client(server_url: &str, config_dir: &std::path::Path) -> ApiClient {
+    ApiClient::new(server_url).with_persistence(Arc::new(TokenStore::new(config_dir)))
+}
+
+/// An API client resuming the session stored in secure storage for `device_id`.
+pub(crate) fn restore_api_client(
+    server_url: &str,
+    config_dir: &std::path::Path,
+    device_id: &str,
+) -> ApiClient {
+    let mut api = api_client(server_url, config_dir);
+    let store = TokenStore::new(config_dir);
+    api.set_tokens(
+        store.load_access_token().ok().flatten().unwrap_or_default(),
+        store
+            .load_refresh_token()
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+    );
+    api.set_device_id(Some(device_id.to_string()));
+    api
+}
+
+/// Shown when the session can no longer be refreshed.
+const SESSION_EXPIRED: &str =
+    "Your session has expired. Sign out, then sign in again to resume syncing.";
 
 /// Shared application state managed by Tauri.
 pub struct AppContext {
@@ -36,26 +65,13 @@ pub struct AppContext {
 impl AppContext {
     pub fn new(cfg_dir: PathBuf) -> Self {
         let config = AppConfig::load(&cfg_dir).unwrap_or_default();
-        let mut api = ApiClient::new(&config.server_url);
-        let state = if config.is_configured() {
-            // Load tokens from secure storage
-            let token_store = TokenStore::new(&cfg_dir);
-            let access = token_store
-                .load_access_token()
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            let refresh = token_store
-                .load_refresh_token()
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            if !access.is_empty() && !refresh.is_empty() {
-                api.set_tokens(access, refresh);
-            }
-            AppState::Disconnected
+        let (api, state) = if config.is_configured() {
+            (
+                restore_api_client(&config.server_url, &cfg_dir, &config.device_id),
+                AppState::Disconnected,
+            )
         } else {
-            AppState::NotConfigured
+            (ApiClient::new(&config.server_url), AppState::NotConfigured)
         };
 
         AppContext {
@@ -177,7 +193,7 @@ pub async fn setup_and_login(
     }
 
     let mut api = ctx.api.lock().await;
-    *api = ApiClient::new(&server_url);
+    *api = api_client(&server_url, &ctx.config_dir);
 
     // Register or login
     if is_register {
@@ -236,8 +252,8 @@ pub async fn setup_and_login(
     let token_store = TokenStore::new(&ctx.config_dir);
     token_store
         .save_tokens(
-            api.access_token().unwrap_or_default(),
-            api.refresh_token().unwrap_or_default(),
+            &api.access_token().unwrap_or_default(),
+            &api.refresh_token().unwrap_or_default(),
         )
         .map_err(|e| format!("Token save failed: {e}"))?;
 
@@ -384,6 +400,9 @@ pub async fn connect(
     if !config.is_configured() {
         return Err("App not configured".into());
     }
+    if !ctx.api.lock().await.has_session() {
+        return Err(SESSION_EXPIRED.into());
+    }
 
     // Ensure exchange is ready and has group keys.
     // For newly approved devices, the exchange exists but has no keys
@@ -441,15 +460,19 @@ pub async fn connect(
     *ctx.state.write().await = AppState::Connecting;
     let _ = app_handle.emit("connection-state-changed", AppState::Connecting);
 
-    // Create WebSocket connection (load token from secure storage)
-    let token_store = TokenStore::new(&ctx.config_dir);
-    let ws_token = token_store
-        .load_access_token()
-        .ok()
-        .flatten()
-        .unwrap_or_default();
+    // Create the WebSocket connection; each attempt gets a current token from the API client
+    let token_handle = app_handle.clone();
+    let token_provider: TokenProvider = Arc::new(move |force_refresh| {
+        let handle = token_handle.clone();
+        Box::pin(async move {
+            let ctx = handle.state::<AppContext>();
+            let api = ctx.api.lock().await;
+            api.connection_token(force_refresh).await
+        })
+    });
     let fingerprint = crate::fingerprint::generate_device_fingerprint(&config.user_id).ok();
-    let (ws_conn, mut event_rx) = WsConnection::new(&config.server_url, &ws_token, fingerprint);
+    let (ws_conn, mut event_rx) =
+        WsConnection::new(&config.server_url, token_provider, fingerprint);
     let ws_conn = Arc::new(ws_conn);
 
     // Store connection
@@ -706,6 +729,21 @@ pub async fn connect(
                         Err(e) => {
                             error!("Failed to re-fetch group key: {e}");
                         }
+                    }
+                }
+                WsEvent::SessionExpired => {
+                    let ctx: tauri::State<'_, AppContext> = handle.state::<AppContext>();
+                    ctx.ws.lock().await.take();
+                    *ctx.state.write().await = AppState::Disconnected;
+                    let _ = handle.emit("connection-state-changed", AppState::Disconnected);
+                    if ctx.config.read().await.notifications_enabled {
+                        use tauri_plugin_notification::NotificationExt;
+                        let _ = handle
+                            .notification()
+                            .builder()
+                            .title("cpmesh")
+                            .body(SESSION_EXPIRED)
+                            .show();
                     }
                 }
                 WsEvent::Error(msg) => {
@@ -1517,14 +1555,8 @@ pub async fn update_config(
             return Err("Server URL must start with https:// or http://".into());
         }
         config.server_url = v.clone();
-        // Update the API client base URL
-        let mut api = ctx.api.lock().await;
-        *api = ApiClient::new(&v);
-        // Reload tokens from secure storage
-        let ts = TokenStore::new(&ctx.config_dir);
-        let access = ts.load_access_token().ok().flatten().unwrap_or_default();
-        let refresh = ts.load_refresh_token().ok().flatten().unwrap_or_default();
-        api.set_tokens(access, refresh);
+        // Point the API client at the new URL, keeping the stored session
+        *ctx.api.lock().await = restore_api_client(&v, &ctx.config_dir, &config.device_id);
     }
     if let Some(v) = auto_connect {
         config.auto_connect = v;
@@ -1574,6 +1606,9 @@ pub async fn logout(
     if let Some(ws) = ctx.ws.lock().await.take() {
         ws.close();
     }
+
+    // Forget the session in memory first, so no refresh can write it back to storage
+    *ctx.api.lock().await = ApiClient::new(&AppConfig::default().server_url);
 
     // Clear tokens from secure storage
     let token_store = TokenStore::new(&ctx.config_dir);
@@ -1651,52 +1686,44 @@ pub async fn check_update(ctx: State<'_, AppContext>) -> Result<Option<UpdateInf
     }
 }
 
+/// Largest installer the updater downloads.
+const MAX_INSTALLER_BYTES: usize = 512 * 1024 * 1024;
+/// Largest signature file the updater downloads.
+const MAX_SIGNATURE_BYTES: usize = 16 * 1024;
+
 #[tauri::command]
 pub async fn download_and_install_update(
     ctx: State<'_, AppContext>,
     download_url: String,
 ) -> Result<(), String> {
-    // Resolve relative URLs against the configured server URL
-    let full_url = if download_url.starts_with("http://") || download_url.starts_with("https://") {
-        download_url.clone()
-    } else {
-        let config = ctx.config.read().await;
-        let base = config.server_url.trim_end_matches('/');
-        format!("{}{}", base, download_url)
-    };
-
-    info!("Downloading update from: {full_url}");
-
-    // Download the file
+    let server_url = ctx.config.read().await.server_url.clone();
+    let installer_url = resolve_download_url(&server_url, &download_url)?;
     let client = reqwest::Client::new();
-    let resp = client
-        .get(&full_url)
-        .send()
+
+    info!("Downloading update from: {installer_url}");
+    let installer = download(&client, installer_url.clone(), MAX_INSTALLER_BYTES).await?;
+    let signature = download(&client, signature_url(&installer_url), MAX_SIGNATURE_BYTES)
         .await
-        .map_err(|e| format!("Download failed: {e}"))?;
+        .map_err(|e| format!("The update's signature could not be downloaded: {e}"))?;
 
-    if !resp.status().is_success() {
-        return Err(format!("Download failed with status: {}", resp.status()));
-    }
+    // Never launch an installer that does not verify against the key built into the app
+    let update = crate::updater::verify_update(
+        &installer,
+        &String::from_utf8_lossy(&signature),
+        env!("CARGO_PKG_VERSION"),
+        crate::updater::installer_platform(),
+    )
+    .map_err(|e| format!("The update was not installed: {e}"))?;
 
-    // Extract filename from URL path
-    let filename = full_url
-        .split('/')
-        .next_back()
-        .unwrap_or("cpmesh-update")
-        .to_string();
-
-    let temp_dir = std::env::temp_dir();
-    let file_path = temp_dir.join(&filename);
-
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("Failed to read download: {e}"))?;
-
-    std::fs::write(&file_path, &bytes).map_err(|e| format!("Failed to save file: {e}"))?;
-
-    info!("Update downloaded to: {}", file_path.display());
+    let dir = private_temp_dir().map_err(|e| format!("Failed to save the update: {e}"))?;
+    let file_path = dir.join(&update.file_name);
+    std::fs::write(&file_path, &installer)
+        .map_err(|e| format!("Failed to save the update: {e}"))?;
+    info!(
+        "Verified update v{} saved to: {}",
+        update.version,
+        file_path.display()
+    );
 
     // Launch the installer
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -1705,6 +1732,70 @@ pub async fn download_and_install_update(
     }
 
     Ok(())
+}
+
+/// Resolves an update download URL, which may be relative to the server, to http(s).
+fn resolve_download_url(server_url: &str, download_url: &str) -> Result<url::Url, String> {
+    let base = url::Url::parse(server_url).map_err(|e| format!("Invalid server URL: {e}"))?;
+    let resolved = base
+        .join(download_url)
+        .map_err(|e| format!("Invalid download URL: {e}"))?;
+    match resolved.scheme() {
+        "https" | "http" => Ok(resolved),
+        other => Err(format!("Unsupported download URL scheme: {other}")),
+    }
+}
+
+/// Each release installer has its signature next to it, at `<installer URL>.sig`.
+fn signature_url(installer_url: &url::Url) -> url::Url {
+    let mut url = installer_url.clone();
+    url.set_path(&format!("{}.sig", installer_url.path()));
+    url
+}
+
+/// Downloads `url` into memory, refusing bodies larger than `limit` bytes.
+async fn download(
+    client: &reqwest::Client,
+    url: url::Url,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    let mut resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("Download failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("Download failed with status: {}", resp.status()));
+    }
+    if resp.content_length().is_some_and(|len| len > limit as u64) {
+        return Err("Download is larger than expected".into());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("Failed to read download: {e}"))?
+    {
+        if body.len() + chunk.len() > limit {
+            return Err("Download is larger than expected".into());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// A new directory only this user can access, so the verified installer cannot be
+/// swapped before it is launched.
+fn private_temp_dir() -> std::io::Result<PathBuf> {
+    let dir = std::env::temp_dir().join(format!("cpmesh-update-{}", uuid::Uuid::new_v4()));
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&dir)?;
+    Ok(dir)
 }
 
 // =============================================================================
@@ -1770,7 +1861,7 @@ pub async fn setup_with_oauth_tokens(
     }
 
     let mut api = ctx.api.lock().await;
-    *api = ApiClient::new(&server_url);
+    *api = api_client(&server_url, &ctx.config_dir);
     api.set_tokens(access_token, refresh_token);
 
     // Get user info to obtain user_id for fingerprinting
@@ -1811,8 +1902,8 @@ pub async fn setup_with_oauth_tokens(
     let token_store = TokenStore::new(&ctx.config_dir);
     token_store
         .save_tokens(
-            api.access_token().unwrap_or_default(),
-            api.refresh_token().unwrap_or_default(),
+            &api.access_token().unwrap_or_default(),
+            &api.refresh_token().unwrap_or_default(),
         )
         .map_err(|e| format!("Token save failed: {e}"))?;
 
@@ -1913,6 +2004,64 @@ pub async fn exchange_oauth_code(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_urls_resolve_against_the_server_and_must_be_http() {
+        let url = resolve_download_url(
+            "https://cpmesh.example",
+            "https://github.com/cjs0h/cpmesh/releases/download/v1.2.3/cpmesh-1.2.3-macos-universal.dmg",
+        )
+        .unwrap();
+        assert_eq!(url.host_str(), Some("github.com"));
+
+        let url = resolve_download_url(
+            "https://cpmesh.example/",
+            "/api/downloads/cpmesh-1.2.3-linux-amd64.deb",
+        )
+        .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://cpmesh.example/api/downloads/cpmesh-1.2.3-linux-amd64.deb"
+        );
+
+        for bad in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "ftp://host/file",
+        ] {
+            assert!(
+                resolve_download_url("https://cpmesh.example", bad).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn signature_sits_next_to_the_installer() {
+        let installer = url::Url::parse(
+            "https://github.com/o/r/releases/download/v1.2.3/cpmesh-1.2.3-windows-amd64-setup.exe",
+        )
+        .unwrap();
+        assert_eq!(
+            signature_url(&installer).as_str(),
+            "https://github.com/o/r/releases/download/v1.2.3/cpmesh-1.2.3-windows-amd64-setup.exe.sig"
+        );
+    }
+
+    #[test]
+    fn update_directory_is_new_and_private() {
+        let a = private_temp_dir().unwrap();
+        let b = private_temp_dir().unwrap();
+        assert_ne!(a, b);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&a).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        std::fs::remove_dir(a).unwrap();
+        std::fs::remove_dir(b).unwrap();
+    }
     use chrono::TimeZone;
 
     fn plain(content_type: ContentType, data: &[u8], metadata: Metadata) -> PlainEntry {

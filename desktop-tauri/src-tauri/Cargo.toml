@@ -34,6 +34,8 @@ rand = "0.10"
 pem = "4"
 base64 = "0.23"
 zeroize = { version = "1", features = ["derive"] }
+# Verifies signed update installers
+minisign-verify = "0.3"
 
 # Async / Networking
 tokio = { version = "1", features = ["full"] }

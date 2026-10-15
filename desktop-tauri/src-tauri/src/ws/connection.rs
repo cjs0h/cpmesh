@@ -1,5 +1,7 @@
 use futures_util::{SinkExt, StreamExt};
 use log::{error, info, warn};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, mpsc};
@@ -17,6 +19,14 @@ type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 type WsSink = futures_util::stream::SplitSink<WsStream, Message>;
 type WsSource = futures_util::stream::SplitStream<WsStream>;
+
+/// Future returned by a [`TokenProvider`].
+pub type TokenFuture = Pin<Box<dyn Future<Output = Option<String>> + Send>>;
+
+/// Supplies the access token for each connection attempt. It is called with `true`
+/// after the server rejected the previous token, to force a refresh, and returns
+/// `None` once the session has ended.
+pub type TokenProvider = Arc<dyn Fn(bool) -> TokenFuture + Send + Sync>;
 type WsHandshakeRequest = tokio_tungstenite::tungstenite::http::Request<()>;
 
 /// Builds the WebSocket handshake request for `server_url`.
@@ -69,13 +79,15 @@ pub enum WsEvent {
     GroupKeyUpdated,
     Connected,
     Disconnected,
+    /// The session can no longer be refreshed; the connection has stopped.
+    SessionExpired,
     Error(String),
 }
 
 /// Manages the WebSocket connection to the cpmesh server.
 pub struct WsConnection {
     server_url: String,
-    access_token: String,
+    token_provider: TokenProvider,
     fingerprint: Option<String>,
     event_tx: mpsc::UnboundedSender<WsEvent>,
     outgoing_tx: mpsc::UnboundedSender<WsMessage>,
@@ -86,7 +98,7 @@ pub struct WsConnection {
 impl WsConnection {
     pub fn new(
         server_url: &str,
-        access_token: &str,
+        token_provider: TokenProvider,
         fingerprint: Option<String>,
     ) -> (Self, mpsc::UnboundedReceiver<WsEvent>) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -94,7 +106,7 @@ impl WsConnection {
 
         let conn = WsConnection {
             server_url: server_url.to_string(),
-            access_token: access_token.to_string(),
+            token_provider,
             fingerprint,
             event_tx,
             outgoing_tx,
@@ -131,9 +143,17 @@ impl WsConnection {
         let mut outgoing_rx = self.outgoing_rx.lock().await.take();
 
         let mut backoff_ms = INITIAL_BACKOFF_MS;
+        let mut force_refresh = false;
 
         loop {
-            match self.dial().await {
+            let Some(access_token) = (self.token_provider)(force_refresh).await else {
+                warn!("Session has ended; not reconnecting");
+                let _ = self.event_tx.send(WsEvent::SessionExpired);
+                return;
+            };
+            force_refresh = false;
+
+            match self.dial(&access_token).await {
                 Ok((mut write, mut read)) => {
                     backoff_ms = INITIAL_BACKOFF_MS;
                     let _ = self.event_tx.send(WsEvent::Connected);
@@ -207,6 +227,8 @@ impl WsConnection {
                     }
                 }
                 Err(e) => {
+                    // An expired or revoked token: refresh before the next attempt
+                    force_refresh = is_unauthorized(e.as_ref());
                     warn!("WebSocket connect failed: {e}");
                     let _ = self.event_tx.send(WsEvent::Error(e.to_string()));
                 }
@@ -227,12 +249,12 @@ impl WsConnection {
         self.shutdown.notify_waiters();
     }
 
-    async fn dial(&self) -> Result<(WsSink, WsSource), Box<dyn std::error::Error + Send + Sync>> {
-        let request = build_ws_request(
-            &self.server_url,
-            &self.access_token,
-            self.fingerprint.as_deref(),
-        )?;
+    async fn dial(
+        &self,
+        access_token: &str,
+    ) -> Result<(WsSink, WsSource), Box<dyn std::error::Error + Send + Sync>> {
+        let request =
+            build_ws_request(&self.server_url, access_token, self.fingerprint.as_deref())?;
 
         let (ws_stream, _) = tokio_tungstenite::connect_async(request).await?;
         Ok(ws_stream.split())
@@ -278,13 +300,26 @@ impl WsConnection {
     }
 }
 
+/// Whether a failed handshake was refused for authentication (HTTP 401).
+fn is_unauthorized(error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    use tokio_tungstenite::tungstenite::{Error, http::StatusCode};
+    matches!(
+        error.downcast_ref::<Error>(),
+        Some(Error::Http(response)) if response.status() == StatusCode::UNAUTHORIZED
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::sync::mpsc::error::TryRecvError;
 
+    fn fixed_token(token: &'static str) -> TokenProvider {
+        Arc::new(move |_| Box::pin(async move { Some(token.to_string()) }))
+    }
+
     fn conn() -> (WsConnection, mpsc::UnboundedReceiver<WsEvent>) {
-        WsConnection::new("https://cpmesh.example", "tok", None)
+        WsConnection::new("https://cpmesh.example", fixed_token("tok"), None)
     }
 
     #[test]
@@ -438,5 +473,90 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(err, "connection closed");
+    }
+
+    #[tokio::test]
+    // The handshake callback's signature is dictated by tungstenite
+    #[allow(clippy::result_large_err)]
+    async fn rejected_token_is_refreshed_before_reconnecting() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+        use tokio_tungstenite::tungstenite::http;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let seen_tx = seen_tx.clone();
+                tokio::spawn(async move {
+                    let check =
+                        move |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
+                            let auth = req
+                                .headers()
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or_default()
+                                .to_string();
+                            let accepted = auth == "Bearer fresh";
+                            let _ = seen_tx.send(auth);
+                            if accepted {
+                                Ok(resp)
+                            } else {
+                                Err(http::Response::builder()
+                                    .status(http::StatusCode::UNAUTHORIZED)
+                                    .body(None)
+                                    .unwrap())
+                            }
+                        };
+                    if let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(stream, check).await {
+                        while let Some(Ok(_)) = ws.next().await {}
+                    }
+                });
+            }
+        });
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let provider: TokenProvider = Arc::new(move |force_refresh| {
+            recorded.lock().unwrap().push(force_refresh);
+            let token = if force_refresh { "fresh" } else { "stale" };
+            Box::pin(async move { Some(token.to_string()) })
+        });
+        let (conn, mut events) = WsConnection::new(&url, provider, None);
+        let conn = Arc::new(conn);
+        let task = tokio::spawn(conn.clone().connect_with_reconnect());
+
+        let connected = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = events.recv().await {
+                if matches!(event, WsEvent::Connected) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .expect("connects after refreshing the token");
+        assert!(connected);
+        assert_eq!(seen_rx.recv().await.unwrap(), "Bearer stale");
+        assert_eq!(seen_rx.recv().await.unwrap(), "Bearer fresh");
+        assert_eq!(*calls.lock().unwrap(), vec![false, true]);
+
+        conn.close();
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn ended_session_stops_reconnecting() {
+        let provider: TokenProvider = Arc::new(|_| Box::pin(async { None }));
+        let (conn, mut events) = WsConnection::new("http://127.0.0.1:9", provider, None);
+        let task = tokio::spawn(Arc::new(conn).connect_with_reconnect());
+
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the reconnect loop stops")
+            .unwrap();
+        assert!(matches!(events.recv().await, Some(WsEvent::SessionExpired)));
     }
 }

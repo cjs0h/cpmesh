@@ -7,6 +7,7 @@ mod history;
 mod proto;
 mod secure_storage;
 mod state;
+mod updater;
 mod ws;
 
 use commands::AppContext;
@@ -364,16 +365,12 @@ pub fn run() {
                     if let Ok(kp) = crypto::keys::KeyPair::load_or_generate(&key_path) {
                         let mut exchange = crypto::exchange::KeyExchange::new(kp);
 
-                        // Restore tokens to API client from secure storage
-                        {
-                            let mut api = ctx.api.lock().await;
-                            *api = api::client::ApiClient::new(&cfg.server_url);
-                            let ts = config::TokenStore::new(&ctx.config_dir);
-                            let access = ts.load_access_token().ok().flatten().unwrap_or_default();
-                            let refresh =
-                                ts.load_refresh_token().ok().flatten().unwrap_or_default();
-                            api.set_tokens(access, refresh);
-                        }
+                        // Restore the stored session
+                        *ctx.api.lock().await = commands::restore_api_client(
+                            &cfg.server_url,
+                            &ctx.config_dir,
+                            &cfg.device_id,
+                        );
 
                         // Try to setup group key
                         {
