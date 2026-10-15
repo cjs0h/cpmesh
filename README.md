@@ -18,6 +18,7 @@ cpmesh is a self-hosted clipboard sync tool with end-to-end encryption. It lets 
 - **Real-time sync** — WebSocket push delivery. Copy on one device, paste on another in under a second.
 - **Cross-platform** — Desktop app (Tauri) for Windows, macOS, and Linux, plus a web dashboard.
 - **Self-hosted** — Run the relay server on your own infrastructure. Single binary + PostgreSQL. Docker Compose ready.
+- **Two-factor authentication** — Every sign-in is confirmed with an authenticator app code (TOTP) or a passkey, with recovery codes as a fallback.
 
 ## Architecture
 
@@ -105,7 +106,13 @@ npx tauri build
 
 ### 6. Log in and connect
 
-Open the desktop app, enter your server URL and the admin credentials from your `.env`, and click Connect. The app runs in your system tray, so closing the window hides it instead of quitting.
+Sign in to the web dashboard (`http://localhost:39271`) with the admin credentials from your `.env`. Every account needs
+two-factor authentication, so the first sign-in walks you through setting up an authenticator app or a passkey and shows
+your recovery codes (see [Two-factor authentication](#two-factor-authentication)).
+
+Then open the desktop app, enter your server URL and click Connect: sign in with your password and the code from your
+authenticator app, or choose **Sign in with browser** to use a passkey or SSO. The app runs in your system tray, so
+closing the window hides it instead of quitting.
 
 ## Components
 
@@ -114,7 +121,7 @@ Open the desktop app, enter your server URL and the admin credentials from your 
 | Server | `crates/cpmesh-server/` | Rust, Axum, SQLx, PostgreSQL | REST API, WebSocket relay, and web dashboard host |
 | Shared Proto | `crates/cpmesh-proto/` | Rust | Shared WebSocket message types and API request/response types |
 | Desktop App | `desktop-tauri/` | Rust, Tauri v2, SvelteKit 3 | Desktop client with tray integration and local device state |
-| Web Dashboard | `web/` | Svelte 5, TypeScript, Vite 8, Tailwind CSS 4 | Landing page, sign-in, device management, live clipboard history, and admin console |
+| Web Dashboard | `web/` | Svelte 5, TypeScript, Vite 8, Tailwind CSS 4 | Landing page, sign-in with two-factor authentication, device management, live clipboard history, and admin console |
 | MCP Server | `mcp/cpmesh-mcp/` | TypeScript, MCP SDK | Lets AI agents use cpmesh: share clipboard text, read history, manage devices |
 
 ## AI agents (MCP)
@@ -142,14 +149,69 @@ Add it to any stdio MCP client (Claude Desktop, Cursor, ZCode, ...):
 `https://cpmesh.com` is the hosted service; point `CPMESH_SERVER_URL` at your own
 server if you self-host.
 
-On first use the agent asks for your credentials, then walks you through the
-8-digit device-approval pairing (you confirm the code on an already-approved
+On first use the agent asks for your credentials and the 6-digit code from your
+authenticator app (or a recovery code; the MCP server cannot use passkeys, so add
+an authenticator app under **Settings → Two-factor authentication** if a passkey
+is your only second factor), then walks you through the 8-digit device-approval
+pairing (you confirm the code on an already-approved
 device). Full agent instructions live in
 [`mcp/cpmesh-mcp/SKILL.md`](mcp/cpmesh-mcp/SKILL.md) — install that file into
 your agent's skills directory (e.g. `~/.agents/skills/cpmesh/`), or let the
 agent pull them from the `cpmesh_skill` MCP prompt. See
 [`mcp/cpmesh-mcp/README.md`](mcp/cpmesh-mcp/README.md) for the complete tool
 reference.
+
+## Two-factor authentication
+
+Signing in takes a password (or SSO) plus a second factor:
+
+- **Authenticator app (TOTP)** — any RFC 6238 app (1Password, Google Authenticator, Aegis, ...). Works everywhere:
+  the web dashboard, the desktop app and the MCP server.
+- **Passkey** — a WebAuthn credential (Touch ID, Windows Hello, a security key, a synced passkey). Passkeys belong to
+  the site's domain, so they are used in the browser; the desktop app's **Sign in with browser** button hands a browser
+  sign-in back to the app.
+- **Recovery codes** — ten single-use codes shown when the first factor is set up. Store them somewhere safe.
+
+`MFA_REQUIRED=all` (the default) requires a second factor for every account: an account without one sets it up during
+its next sign-in. When SMTP is configured, a password sign-in must first confirm a code emailed to the account, so a
+leaked password alone cannot enroll someone else's authenticator. `MFA_REQUIRED=staff` limits the requirement to staff
+accounts and lets everyone else opt in. Sessions that existed before two-factor authentication keep working; members
+manage their factors under **Settings → Two-factor authentication**.
+
+After 10 wrong codes in a row the account's second factor locks for 15 minutes. Adding or removing a factor, and
+sensitive admin actions, need a recent sign-in: the dashboard asks you to confirm your second factor again.
+Administrators can reset a member's two-factor authentication (for a lost phone); the member sets it up again at their
+next sign-in and gets an email about it.
+
+## Admin console
+
+Staff accounts see the admin console in the web dashboard. It requires a session confirmed with a second factor, and
+what each person can do depends on their role:
+
+| Role | Can |
+|------|-----|
+| Viewer | See users, statistics, the audit log, plans, releases and settings |
+| Support | Viewer, plus verify emails, change plans, suspend and reinstate members, and sign them out everywhere |
+| Admin | Support, plus delete users, reset two-factor authentication, manage plans, downloads, releases, settings and API tokens |
+| Owner | Admin, plus change roles and act on other staff accounts |
+
+The `INITIAL_ADMIN` account (and anyone who was an admin before roles existed) is an owner. The server always keeps at
+least one owner. Every change made in the console is recorded in the audit log, which also shows sign-ins and security
+changes per user.
+
+**Settings** can override `REGISTRATION_OPEN` and show an announcement banner at runtime. **API tokens** let automation
+publish releases without an interactive sign-in: a token (scope `releases:write`) only works on the downloads and
+releases endpoints, acts as the staff member who created it, and can expire or be revoked. The Release workflow uses
+one (see [Releasing](CONTRIBUTING.md#releasing)).
+
+The downloads page and the apps' update check are what users install from, so protect them:
+
+- set `UPDATER_PUBLIC_KEY` to the contents of `desktop-tauri/src-tauri/updater-key.pub`, and installers uploaded to the
+  server must carry a valid signature from the release key;
+- set `DOWNLOAD_URL_PREFIXES` (for example `https://github.com/cjs0h/cpmesh/releases/download/`), and download links and
+  releases can only point there or at files uploaded to the server.
+
+On a public deployment, consider also putting `/api/admin/` behind an access proxy or VPN.
 
 ## Testing
 
@@ -160,7 +222,7 @@ cargo test --workspace                       # server + shared proto (unit, rout
 cd desktop-tauri/src-tauri && cargo test     # desktop crypto, history, config and protocol tests
 cd web && npm test                           # web dashboard (Vitest)
 cd desktop-tauri && npm test                 # desktop frontend (Vitest)
-cd mcp/cpmesh-mcp && npm test                # MCP server crypto and API client (Vitest)
+cd mcp/cpmesh-mcp && npm test                # MCP server crypto, API client and two-factor sign-in (Vitest)
 ```
 
 The PostgreSQL-backed integration tests in `crates/cpmesh-server/tests/db.rs` run only when
@@ -201,6 +263,11 @@ JWT signing uses explicit RS256 key material in every environment. `JWT_PUBLIC_K
 | `OIDC_CALLBACK_URL` | `""` | OIDC callback URL |
 | `TRUST_PROXY_HEADERS` | `0` | Trust forwarded proxy headers for scheme and host detection |
 | `GROUP_KEY_ROTATION_INTERVAL_HOURS` | `24` | Automatic group key rotation interval |
+| `MFA_REQUIRED` | `all` | Who must use two-factor authentication: `all` accounts, or only `staff` (the admin console always requires it) |
+| `WEBAUTHN_RP_ID` | host of `BASE_URL` | Passkey relying party ID (a domain); passkeys are unavailable when neither is set |
+| `WEBAUTHN_ORIGINS` | `""` | Extra origins (comma-separated) passkey ceremonies may run on, besides the `BASE_URL` origin |
+| `UPDATER_PUBLIC_KEY` | `""` | Contents of the apps' `updater-key.pub`; when set, uploaded installers need a valid signature |
+| `DOWNLOAD_URL_PREFIXES` | `""` | Comma-separated URL prefixes download links and releases may use (empty = any http(s) URL) |
 
 ## Content types
 

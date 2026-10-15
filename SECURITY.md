@@ -30,3 +30,5 @@ Instead, please report vulnerabilities by emailing the maintainers or using GitH
 ## Security Considerations
 
 cpmesh handles encrypted clipboard data. The server is designed as a relay that only sees ciphertext. If you find any scenario where plaintext clipboard data could be exposed to the server or other unauthorized parties, this is a critical security issue and should be reported immediately.
+
+Accounts are protected by two-factor authentication, and the admin console needs a session confirmed with it. Any way to sign in, or to act in the admin console, without the account's second factor (or beyond the permissions of a role) is a security issue too.
