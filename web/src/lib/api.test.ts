@@ -81,7 +81,7 @@ describe('api()', () => {
     setTokens('expired', 'refresh-1');
     fetchMock()
       .mockResolvedValueOnce(jsonResponse(401, { error: 'invalid or expired token' }))
-      .mockResolvedValueOnce(jsonResponse(200, { access_token: 'fresh' }))
+      .mockResolvedValueOnce(jsonResponse(200, { access_token: 'fresh', refresh_token: 'refresh-2' }))
       .mockResolvedValueOnce(jsonResponse(200, { id: 'me' }));
 
     const result = await api('/api/me');
@@ -94,9 +94,10 @@ describe('api()', () => {
     expect(JSON.parse(refreshInit.body)).toEqual({ refresh_token: 'refresh-1' });
     const [, retryInit] = fetchMock().mock.calls[2];
     expect(retryInit.headers.Authorization).toBe('Bearer fresh');
-    // New access token is persisted; the refresh token is kept as-is
+    // Refresh tokens are single-use: the rotated one replaces the spent one, which the
+    // server would treat as stolen if it were presented again
     expect(getAccessToken()).toBe('fresh');
-    expect(getRefreshToken()).toBe('refresh-1');
+    expect(getRefreshToken()).toBe('refresh-2');
   });
 
   it('clears the session and redirects to login when the refresh fails', async () => {
@@ -171,5 +172,73 @@ describe('api()', () => {
     await expect(second).resolves.toEqual({ url: '/api/b' });
     const refreshCalls = fetchMock().mock.calls.filter(([url]) => url === '/api/auth/refresh');
     expect(refreshCalls).toHaveLength(1);
+  });
+
+  it('takes turns with other tabs through a Web Lock while refreshing', async () => {
+    const request = vi.fn((_name: string, callback: () => Promise<boolean>) => callback());
+    vi.stubGlobal('navigator', { locks: { request } });
+    setTokens('expired', 'refresh-1');
+    fetchMock()
+      .mockResolvedValueOnce(jsonResponse(401, { error: 'invalid or expired token' }))
+      .mockResolvedValueOnce(jsonResponse(200, { access_token: 'fresh', refresh_token: 'refresh-2' }))
+      .mockResolvedValueOnce(jsonResponse(200, { id: 'me' }));
+
+    await expect(api('/api/me')).resolves.toEqual({ id: 'me' });
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(request.mock.calls[0][0]).toBe('cpmesh-token-refresh');
+  });
+
+  it('uses tokens another tab already refreshed instead of refreshing again', async () => {
+    setTokens('expired', 'refresh-1');
+    fetchMock()
+      .mockImplementationOnce(async () => {
+        // Another tab rotates the shared tokens while this request is in flight
+        setTokens('from-other-tab', 'refresh-2');
+        return jsonResponse(401, { error: 'invalid or expired token' });
+      })
+      .mockResolvedValueOnce(jsonResponse(200, { id: 'me' }));
+
+    await expect(api('/api/me')).resolves.toEqual({ id: 'me' });
+
+    expect(fetch).toHaveBeenCalledTimes(2);
+    const [, retryInit] = fetchMock().mock.calls[1];
+    expect(retryInit.headers.Authorization).toBe('Bearer from-other-tab');
+    expect(getRefreshToken()).toBe('refresh-2');
+  });
+
+  it('adopts the tokens another tab saves when the server reports a concurrent refresh', async () => {
+    setTokens('expired', 'refresh-1');
+    fetchMock()
+      .mockResolvedValueOnce(jsonResponse(401, { error: 'invalid or expired token' }))
+      .mockImplementationOnce(async () => {
+        // The other tab's refresh won the race and saves its pair shortly after
+        setTimeout(() => setTokens('from-other-tab', 'refresh-2'), 150);
+        return jsonResponse(409, { error: 'refresh token already used' });
+      })
+      .mockResolvedValueOnce(jsonResponse(200, { id: 'me' }));
+
+    await expect(api('/api/me')).resolves.toEqual({ id: 'me' });
+
+    const [, retryInit] = fetchMock().mock.calls[2];
+    expect(retryInit.headers.Authorization).toBe('Bearer from-other-tab');
+  });
+
+  it('expires the session when no tab saves the rotated tokens', async () => {
+    vi.useFakeTimers();
+    try {
+      setTokens('expired', 'refresh-1');
+      fetchMock()
+        .mockResolvedValueOnce(jsonResponse(401, { error: 'invalid or expired token' }))
+        .mockResolvedValueOnce(jsonResponse(409, { error: 'refresh token already used' }));
+
+      const failed = expect(api('/api/me')).rejects.toThrow('Session expired');
+      await vi.advanceTimersByTimeAsync(3_100);
+      await failed;
+      // The spent token is never presented again
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(getRefreshToken()).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
