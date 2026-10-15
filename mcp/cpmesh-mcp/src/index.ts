@@ -9,7 +9,8 @@
  * Environment variables:
  *   CPMESH_SERVER_URL  — server base URL (can also be passed to cpmesh_login)
  *   CPMESH_USERNAME    — optional; enables auto-login at startup
- *   CPMESH_PASSWORD    — optional; enables auto-login at startup
+ *   CPMESH_PASSWORD    — optional; enables auto-login at startup (with two-factor
+ *                        authentication, the agent still asks the user for the code)
  *   CPMESH_HOME        — state directory (default ~/.cpmesh/mcp)
  */
 
@@ -19,6 +20,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { CpmeshDevice, DeviceNotReadyError } from "./device.js";
+import { sameAccount } from "./signin.js";
 import { loadSession } from "./state.js";
 
 const VERSION = "0.1.0";
@@ -64,8 +66,28 @@ const loginSchema = {
       "cpmesh server base URL: https://cpmesh.com for the hosted service, or the user's self-hosted server. " +
         "Optional if CPMESH_SERVER_URL is set in the server environment.",
     ),
-  username: z.string().describe("cpmesh account username"),
-  password: z.string().describe("cpmesh account password"),
+  username: z
+    .string()
+    .optional()
+    .describe(
+      "cpmesh account username. Optional when CPMESH_USERNAME is set, or when finishing a sign-in " +
+        "that is waiting for a two-factor code.",
+    ),
+  password: z
+    .string()
+    .optional()
+    .describe(
+      "cpmesh account password. Not needed when finishing a sign-in that is waiting for a two-factor " +
+        "code (for 10 minutes after cpmesh_login asked for it), or when CPMESH_PASSWORD is set for this account.",
+    ),
+  code: z
+    .string()
+    .max(64)
+    .optional()
+    .describe(
+      "Two-factor authentication code: the current 6-digit code from the user's authenticator app, or one " +
+        'of their recovery codes. Pass it after cpmesh_login answered status "mfa_required". Never store or log it.',
+    ),
 };
 
 const waitForApprovalSchema = {
@@ -140,14 +162,20 @@ server.registerTool(
     description:
       "Logs into the cpmesh server and registers this MCP server as a new device under the " +
       "user's account. Ask the user for their server URL, username and password before calling. " +
+      'With two-factor authentication the response has status "mfa_required": ask the user for the ' +
+      "current 6-digit code from their authenticator app (or a recovery code), then call cpmesh_login " +
+      "again with code (the password can be left out for 10 minutes). " +
       "Unless this is the account's first device, the device starts PENDING: the response " +
       "includes an 8-digit pairing code that the user must confirm on one of their approved " +
       "cpmesh devices. After they confirm, call cpmesh_wait_for_approval.",
     inputSchema: loginSchema,
   },
-  async ({ server_url, username, password }) => {
+  async ({ server_url, username, password, code }) => {
     try {
-      const url = server_url ?? process.env.CPMESH_SERVER_URL;
+      // Left-out values continue the sign-in waiting for a two-factor code, else come from the environment
+      const env = process.env;
+      const waiting = device.waitingSignIn(server_url, username);
+      const url = server_url ?? waiting?.serverUrl ?? env.CPMESH_SERVER_URL;
       if (!url) {
         return failure(
           new Error(
@@ -155,7 +183,25 @@ server.registerTool(
           ),
         );
       }
-      const res = await device.login(url, username, password);
+      const user = username ?? waiting?.username ?? env.CPMESH_USERNAME;
+      if (!user) {
+        return failure(
+          new Error("No username: pass username or set CPMESH_USERNAME in the MCP server environment."),
+        );
+      }
+      const envAccount =
+        env.CPMESH_SERVER_URL !== undefined &&
+        env.CPMESH_USERNAME !== undefined &&
+        sameAccount(
+          { serverUrl: url, username: user },
+          { serverUrl: env.CPMESH_SERVER_URL, username: env.CPMESH_USERNAME },
+        );
+      const res = await device.login(
+        url,
+        user,
+        password ?? (envAccount ? env.CPMESH_PASSWORD : undefined),
+        code,
+      );
       return result(res, res.message);
     } catch (error) {
       return failure(error);
@@ -378,7 +424,7 @@ function loadSkillText(): string {
     "# cpmesh skill",
     "",
     "1. Install: add {\"mcpServers\":{\"cpmesh\":{\"command\":\"npx\",\"args\":[\"-y\",\"cpmesh-mcp\"],\"env\":{\"CPMESH_SERVER_URL\":\"https://cpmesh.com\"}}}} to your MCP client config (self-hosted users put their own server URL).",
-    "2. First run: call cpmesh_login (needs username+password), relay the 8-digit pairing code to the user, wait for them to confirm it on an approved device, then call cpmesh_wait_for_approval.",
+    "2. First run: call cpmesh_login (needs username+password). If it answers status mfa_required, ask the user for the current 6-digit code from their authenticator app (or a recovery code) and call cpmesh_login again with code — never store the code. Then relay the 8-digit pairing code to the user, wait for them to confirm it on an approved device, and call cpmesh_wait_for_approval.",
     "3. Use cpmesh_push_clipboard to share text to the user's devices and cpmesh_get_clipboard / cpmesh_get_latest_clipboard / cpmesh_search_clipboard to read what they copied.",
   ].join("\n");
 }

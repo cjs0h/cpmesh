@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
  * Protocol smoke test: spawns the built server (dist/index.js) and exercises
- * the MCP surface over stdio — initialize, tools/list, prompts/list, a
- * cpmesh_status call (expects a graceful not-logged-in error), and the
- * cpmesh_skill prompt.
+ * the MCP surface over stdio — initialize, tools/list (including the login
+ * tool's two-factor code parameter), prompts/list, a cpmesh_status call
+ * (expects a graceful not-logged-in error), and the cpmesh_skill prompt.
  *
  * Usage: node scripts/smoke.mjs   (run after `npm run build`)
  * Exits non-zero on any failure.
@@ -89,6 +89,13 @@ try {
   check(
     "all 11 tools registered",
     expected.every((n) => toolNames.includes(n)),
+  );
+
+  const loginInput = (tools.result?.tools ?? []).find((t) => t.name === "cpmesh_login")?.inputSchema;
+  check(
+    "cpmesh_login takes an optional two-factor code and password",
+    loginInput?.properties?.code?.type === "string" &&
+      !(loginInput.required ?? []).some((name) => name === "code" || name === "password"),
   );
 
   const prompts = await request("prompts/list", {});

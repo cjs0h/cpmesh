@@ -39,6 +39,7 @@ import type {
   PlainEntry,
   RegisterDeviceRequest,
 } from "./protocol.js";
+import { SignInFlow, type Account } from "./signin.js";
 import { WsClient, WsError } from "./ws.js";
 
 const FINGERPRINT_SALT = "cpnet-device-fp-v1";
@@ -80,6 +81,8 @@ export interface ClipboardItem {
 export class CpmeshDevice {
   readonly ws = new WsClient();
   private cached: ReadyState | null = null;
+  /** Keeps a sign-in that waits for its two-factor code (in memory only). */
+  private readonly signIns = new SignInFlow();
 
   deviceName(): string {
     return `MCP Agent - ${hostname()}`;
@@ -115,13 +118,25 @@ export class CpmeshDevice {
 
   // === Onboarding ===
 
+  /** The account whose sign-in waits for a two-factor code (see {@link SignInFlow.waiting}). */
+  waitingSignIn(serverUrl?: string, username?: string): Account | null {
+    return this.signIns.waiting(serverUrl, username);
+  }
+
+  /**
+   * Signs in and registers this device. With two-factor authentication the first
+   * call (password, no code) resolves `mfa_required`; a later call with the code
+   * finishes the sign-in, with or without the password.
+   */
   async login(
     serverUrl: string,
     username: string,
-    password: string,
+    password?: string,
+    mfaCode?: string,
   ): Promise<{
     status: string;
     approval_code?: string;
+    methods?: string[];
     message: string;
   }> {
     if (!/^https?:\/\//i.test(serverUrl)) {
@@ -130,10 +145,25 @@ export class CpmeshDevice {
 
     const deviceName = this.deviceName();
     const api = new CpmeshApi(serverUrl);
-    const auth = await api.login(username, password, deviceName);
+    const signedIn = await this.signIns.signIn(api, {
+      serverUrl,
+      username,
+      password,
+      code: mfaCode,
+      deviceName,
+    });
+    if (signedIn.status === "mfa_required") {
+      return { status: "mfa_required", methods: signedIn.methods, message: signedIn.message };
+    }
+    const { auth } = signedIn;
     api.setTokens(auth.access_token, auth.refresh_token);
-    const userId = auth.user_id ?? "";
+    // Tokens from the second-factor step come without the user ID
+    const userId = auth.user_id ?? (await api.getMe()).id;
     const fingerprint = this.fingerprintFor(userId);
+    const recoveryNote =
+      signedIn.recoveryCodesRemaining === undefined
+        ? ""
+        : `Signed in with a recovery code (${signedIn.recoveryCodesRemaining} left). `;
 
     const paths = statePaths();
     const keypair = KeyPair.loadOrGenerate(paths.deviceKey);
@@ -168,7 +198,7 @@ export class CpmeshDevice {
     if (deviceStatus === "approved") {
       return {
         status: "approved",
-        message: `Logged in and approved. Device "${deviceName}" is ready to sync.`,
+        message: `${recoveryNote}Logged in and approved. Device "${deviceName}" is ready to sync.`,
       };
     }
 
@@ -179,7 +209,7 @@ export class CpmeshDevice {
       status: "pending",
       approval_code: code,
       message:
-        `Logged in. Device "${deviceName}" is PENDING approval. ` +
+        `${recoveryNote}Logged in. Device "${deviceName}" is PENDING approval. ` +
         (code
           ? `Pairing code: ${code}. Ask the user to confirm this code on one of their approved cpmesh devices, then call cpmesh_wait_for_approval.`
           : `Ask the user to start the approval for this device from an approved cpmesh device, then call cpmesh_wait_for_approval.`),
@@ -260,6 +290,14 @@ export class CpmeshDevice {
 
   // === Readiness ===
 
+  private twoFactorNextStep(): string | null {
+    const waiting = this.signIns.waiting();
+    return waiting
+      ? `The sign-in as "${waiting.username}" is waiting for its two-factor code: ask the user for the current ` +
+          "6-digit code from their authenticator app (or a recovery code) and call cpmesh_login with it."
+      : null;
+  }
+
   private async requireSession(): Promise<{
     api: CpmeshApi;
     keypair: KeyPair;
@@ -269,7 +307,8 @@ export class CpmeshDevice {
     if (!session) {
       throw new DeviceNotReadyError(
         "cpmesh is not logged in",
-        "Call cpmesh_login with the user's server URL and credentials (or set CPMESH_SERVER_URL / CPMESH_USERNAME / CPMESH_PASSWORD).",
+        this.twoFactorNextStep() ??
+          "Call cpmesh_login with the user's server URL and credentials (or set CPMESH_SERVER_URL / CPMESH_USERNAME / CPMESH_PASSWORD).",
       );
     }
     const keypair = KeyPair.loadOrGenerate(statePaths().deviceKey);
@@ -662,9 +701,12 @@ export class CpmeshDevice {
   async status(): Promise<Record<string, unknown>> {
     const session = loadSession();
     if (!session) {
+      const twoFactor = this.twoFactorNextStep();
       return {
         logged_in: false,
+        ...(twoFactor && { two_factor_code_needed: true }),
         next_step:
+          twoFactor ??
           "Call cpmesh_login with the user's server URL and credentials (or set CPMESH_SERVER_URL / CPMESH_USERNAME / CPMESH_PASSWORD environment variables).",
       };
     }
@@ -730,6 +772,7 @@ export class CpmeshDevice {
   async logout(): Promise<string> {
     this.ws.close();
     this.cached = null;
+    this.signIns.clear();
     clearAllState();
     return "Logged out. Local keys, keyring and session were wiped.";
   }

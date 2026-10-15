@@ -3,7 +3,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiError, CpmeshApi, SessionExpiredError } from "../src/api.js";
+import { ApiError, CpmeshApi, MfaRequiredError, SessionExpiredError } from "../src/api.js";
 
 function mockFetch(handler: (url: string, init?: RequestInit) => { status: number; body: unknown }) {
   const calls: { url: string; init?: RequestInit }[] = [];
@@ -62,6 +62,66 @@ describe("CpmeshApi", () => {
     const api = new CpmeshApi("https://srv");
     await expect(api.login("x", "y", "z")).rejects.toThrow(ApiError);
     await expect(api.login("x", "y", "z")).rejects.toThrow("invalid credentials");
+  });
+
+  it("reports a second factor after the password as MfaRequiredError with the challenge", async () => {
+    mockFetch(() => ({
+      status: 403,
+      body: {
+        error: "Two-factor authentication is required: enter the code from your authenticator app or use a passkey.",
+        code: "mfa_required",
+        mfa_token: "ticket-1",
+        stage: "verify",
+        methods: ["totp", "webauthn", "recovery"],
+        email_code_required: false,
+        email_hint: null,
+        passkeys_available: true,
+      },
+    }));
+    const api = new CpmeshApi("https://srv");
+    const error = await api.login("alice", "pw", "MCP").catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(MfaRequiredError);
+    expect(error).toMatchObject({
+      status: 403,
+      code: "mfa_required",
+      challenge: { mfa_token: "ticket-1", stage: "verify", methods: ["totp", "webauthn", "recovery"] },
+    });
+  });
+
+  it("keeps the code of structured errors", async () => {
+    mockFetch(() => ({
+      status: 403,
+      body: { error: "This account is suspended. Contact your administrator.", code: "account_suspended" },
+    }));
+    const error = await new CpmeshApi("https://srv").login("alice", "pw", "MCP").catch((e: unknown) => e);
+    expect(error).not.toBeInstanceOf(MfaRequiredError);
+    expect(error).toMatchObject({ status: 403, code: "account_suspended", message: "This account is suspended. Contact your administrator." });
+  });
+
+  it("verifyMfa sends the sign-in ticket instead of the session and never refreshes it", async () => {
+    const calls = mockFetch((url, init) => {
+      if (!url.endsWith("/api/mfa/verify")) return { status: 500, body: { error: "unexpected" } };
+      const { code } = JSON.parse(init!.body as string) as { code: string };
+      return code === "123456"
+        ? { status: 200, body: { access_token: "at", refresh_token: "rt" } }
+        : { status: 401, body: { error: "invalid authentication code" } };
+    });
+    const api = new CpmeshApi("https://srv");
+    api.setTokens("session-access", "session-refresh");
+
+    await expect(api.verifyMfa("ticket-1", "totp", "000000")).rejects.toMatchObject({
+      status: 401,
+      message: "invalid authentication code",
+    });
+    await expect(api.verifyMfa("ticket-1", "totp", "123456")).resolves.toEqual({
+      access_token: "at",
+      refresh_token: "rt",
+    });
+
+    expect(calls.map((c) => c.url)).toEqual(["https://srv/api/mfa/verify", "https://srv/api/mfa/verify"]);
+    expect((calls[0]!.init!.headers as Record<string, string>).Authorization).toBe("Bearer ticket-1");
+    expect(JSON.parse(calls[1]!.init!.body as string)).toEqual({ method: "totp", code: "123456" });
+    expect(api.access).toBe("session-access");
   });
 
   it("refreshes the access token once on 401 and retries", async () => {

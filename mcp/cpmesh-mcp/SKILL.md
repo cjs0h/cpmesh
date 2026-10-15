@@ -20,6 +20,10 @@ device with its own keys — the cpmesh server only ever sees ciphertext.
 - A cpmesh account — on the hosted service at `https://cpmesh.com`, or on a
   self-hosted cpmesh server.
 - The user's cpmesh username and password.
+- Two-factor authentication: the user's authenticator app (for a 6-digit
+  code) or one of their recovery codes. Passkeys cannot be used here — an
+  account that only has a passkey must first add an authenticator app on the
+  web dashboard (**Settings → Two-factor authentication**).
 - At least one already-approved cpmesh device (desktop app) — needed once, to
   approve this agent. If the account has NO devices yet, the MCP device
   auto-approves as the first device instead.
@@ -49,7 +53,7 @@ Restart the client after editing the config. You can also ask the server for
 these instructions at any time via the `cpmesh_skill` prompt.
 
 Optional environment variables:
-- `CPMESH_USERNAME` / `CPMESH_PASSWORD` — auto-login at startup (otherwise login happens through the `cpmesh_login` tool).
+- `CPMESH_USERNAME` / `CPMESH_PASSWORD` — auto-login at startup (otherwise login happens through the `cpmesh_login` tool). The two-factor code still comes from the user: `cpmesh_status` says when it is needed.
 - `CPMESH_HOME` — where keys/tokens are stored (default `~/.cpmesh/mcp`).
 
 ## 2. First-run pairing (once per account)
@@ -58,11 +62,28 @@ Optional environment variables:
 2. Ask the user for their username and password, then call `cpmesh_login`
    (if `CPMESH_SERVER_URL` is not set, pass `server_url` — `https://cpmesh.com`
    unless the user self-hosts).
-3. The response contains an **8-digit pairing code**. Tell the user:
+3. **Two-factor authentication.** If the response has status `mfa_required`,
+   ask the user: "Please enter the current 6-digit code from your
+   authenticator app (or one of your recovery codes)." Then call
+   `cpmesh_login` again with the same `server_url` and `username` plus
+   `code` — the password can be left out for 10 minutes. Ask for the code
+   right before you call: authenticator codes change every 30 seconds.
+   - "The code was not accepted": ask for a new code and call again.
+   - The sign-in expired (after 10 minutes): call `cpmesh_login` with the
+     password and a new code.
+   - Not set up yet: ask the user to sign in on the web dashboard
+     (`<server>/#/login`) and set up an authenticator app, then log in again
+     with the password and the 6-digit code.
+   - Passkey only: the user adds an authenticator app on the web dashboard
+     (**Settings → Two-factor authentication**), or uses a recovery code if
+     asked for one.
+   - "Too many failed attempts": wait the time the message gives, then log in
+     again with the password and a new code.
+4. The response contains an **8-digit pairing code**. Tell the user:
    "Open the cpmesh app on one of your approved devices, start approving the
    new device **MCP Agent - \<hostname\>**, and confirm it shows code
    **XXXXXXXX**."
-4. After the user confirms, call `cpmesh_wait_for_approval`. On approval the
+5. After the user confirms, call `cpmesh_wait_for_approval`. On approval the
    group key is synced automatically and all clipboard tools become usable.
 
 Login persists across restarts (tokens + keys live in `~/.cpmesh/mcp`).
@@ -87,5 +108,8 @@ Login persists across restarts (tokens + keys live in `~/.cpmesh/mcp`).
   P-256). The relay server only stores ciphertext.
 - Never print or log the user's password, tokens, or the contents of
   `~/.cpmesh/mcp`.
+- Two-factor codes and recovery codes are for one sign-in only: pass them to
+  `cpmesh_login` and never store, repeat, or log them. Never ask the user for
+  their authenticator secret or QR code.
 - Device approval requires a human comparing the 8-digit code — this is the
   anti-MITM guarantee. Never try to bypass it.

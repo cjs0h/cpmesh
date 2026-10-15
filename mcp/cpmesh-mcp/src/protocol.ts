@@ -52,6 +52,25 @@ export interface AuthResponse {
   user_id?: string;
 }
 
+/**
+ * The 403 `mfa_required` answer to a correct password: a sign-in ticket for the
+ * /api/mfa endpoints (valid 10 minutes, single use).
+ */
+export interface MfaChallenge {
+  mfa_token: string;
+  /** "enroll": the account has no second factor yet and must set one up first. */
+  stage: "verify" | "enroll";
+  /** verify: the methods the account has ("totp", "webauthn", "recovery"). */
+  methods: string[];
+}
+
+export interface MfaVerifyResponse {
+  access_token: string;
+  refresh_token: string;
+  /** Present when a recovery code was used. */
+  recovery_codes_remaining?: number;
+}
+
 export interface RegisterDeviceRequest {
   name: string;
   public_key: string; // base64 SEC1 uncompressed

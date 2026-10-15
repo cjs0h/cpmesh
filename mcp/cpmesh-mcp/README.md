@@ -43,7 +43,7 @@ at runtime via the `cpmesh_skill` MCP prompt.
 | Variable | Default | Purpose |
 |---|---|---|
 | `CPMESH_SERVER_URL` | — | Server base URL, e.g. `https://cpmesh.com` (can also be passed to the `cpmesh_login` tool) |
-| `CPMESH_USERNAME` | — | With `CPMESH_PASSWORD`, auto-login at startup |
+| `CPMESH_USERNAME` | — | With `CPMESH_PASSWORD`, auto-login at startup (the agent still asks the user for the two-factor code) |
 | `CPMESH_PASSWORD` | — | See above |
 | `CPMESH_HOME` | `~/.cpmesh/mcp` | Directory for device key, keyring, session, key pins |
 
@@ -52,7 +52,7 @@ at runtime via the `cpmesh_skill` MCP prompt.
 | Tool | What it does |
 |---|---|
 | `cpmesh_status` | Login/approval state, pairing code if pending, group-key version, and the exact next step |
-| `cpmesh_login` | Log in + register this agent as a device; returns the 8-digit pairing code |
+| `cpmesh_login` | Log in (with the two-factor code when asked) + register this agent as a device; returns the 8-digit pairing code |
 | `cpmesh_wait_for_approval` | Poll until the user approves the device; syncs the group key on approval |
 | `cpmesh_push_clipboard` | E2E-encrypt text and push it to all the user's devices |
 | `cpmesh_get_clipboard` | Decrypted clipboard history (newest first, paginated) |
@@ -69,14 +69,46 @@ Plus the `cpmesh_skill` prompt with install/usage instructions.
 
 1. Agent calls `cpmesh_login` (server URL — `https://cpmesh.com` unless the
    user self-hosts — and the user's credentials).
-2. Device registers as **pending**; an 8-digit code is derived via ECDH with
+2. The account uses two-factor authentication, so the response has status
+   `mfa_required`: the agent asks the user for the current 6-digit code from
+   their authenticator app (or a recovery code) and calls `cpmesh_login` again
+   with `code` (see [Two-factor authentication](#two-factor-authentication)).
+3. Device registers as **pending**; an 8-digit code is derived via ECDH with
    the approver's public key.
-3. The user confirms the code on an already-approved device (anti-MITM).
-4. Agent calls `cpmesh_wait_for_approval` → group key is unwrapped and cached;
+4. The user confirms the code on an already-approved device (anti-MITM).
+5. Agent calls `cpmesh_wait_for_approval` → group key is unwrapped and cached;
    clipboard tools go live.
 
 If the account has no devices yet, the MCP device becomes the first device:
 it is auto-approved and creates group key v1.
+
+## Two-factor authentication
+
+cpmesh accounts sign in with a second factor (a self-hosted server can require
+it for staff accounts only). After a correct password the server returns a
+sign-in ticket instead of tokens, valid for 10 minutes and usable once;
+`cpmesh_login` keeps it in memory and answers `status: "mfa_required"`.
+Calling `cpmesh_login` again with `code` finishes the sign-in — without the
+password while the ticket is valid; once it has expired, the password is
+needed again together with a new code. The code can also be passed with the
+password in a single call.
+
+- **Codes:** a 6-digit code from an authenticator app (spaces are ignored), or
+  one of the account's recovery codes (e.g. `abcd-efgh-ijkl-mnop`; each works
+  once).
+- **Passkeys** only work in the browser, so the MCP server cannot use them.
+  Accounts whose only second factor is a passkey add an authenticator app on
+  the web dashboard (**Settings → Two-factor authentication**); until then
+  they can sign in with a recovery code.
+- **Accounts without two-factor authentication yet** set it up first by
+  signing in on the web dashboard (`<server>/#/login`).
+- After 10 wrong codes in a row, two-factor sign-in is locked for 15 minutes.
+  Suspended accounts cannot sign in.
+
+With `CPMESH_USERNAME` / `CPMESH_PASSWORD`, the startup auto-login stops at the
+second factor: `cpmesh_status` then tells the agent to ask the user for the
+code, and `cpmesh_login` with just `code` finishes the sign-in (it signs in
+with the configured password again if the ticket has expired).
 
 ## Local state & security
 
@@ -89,6 +121,9 @@ State lives in `CPMESH_HOME` (default `~/.cpmesh/mcp`, files `0600` on Unix):
   several MCP processes can share one state directory.
 - `pinned_keys.json` — TOFU pins of peer device keys; a changed peer key is
   treated as a possible MITM and refused
+
+Two-factor codes and sign-in tickets are never written to disk or logged; a
+ticket waiting for its code lives in memory only.
 
 Peer public keys are verified via their ECDSA self-signatures, matching the
 desktop client. Group-key rotation (every 24h by default) is handled
@@ -122,14 +157,16 @@ vectors always reflect the real implementation.
 ### End-to-end test against a real server
 
 With a local cpmesh server running (e.g. `docker compose up` from the repo
-root):
+root), and an account whose two-factor authentication is set up on the web
+dashboard:
 
 ```bash
-node scripts/e2e-smoke.mjs https://localhost:39271 user password
+node scripts/e2e-smoke.mjs https://localhost:39271 user password 123456
 ```
 
-It logs in as a first device (auto-approved), pushes a clip, and reads it
-back decrypted.
+The last argument is the current code from the authenticator app (or a
+recovery code). It logs in as a first device (auto-approved), pushes a clip,
+and reads it back decrypted.
 
 ## License
 

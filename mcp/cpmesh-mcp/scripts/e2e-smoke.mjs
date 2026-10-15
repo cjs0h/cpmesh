@@ -11,8 +11,11 @@
  * an account with existing approved devices the registration stays pending —
  * the script then exits and tells you to finish pairing interactively.
  *
+ * Accounts with two-factor authentication also need the current 6-digit code
+ * from the authenticator app (or a recovery code) as the fourth argument.
+ *
  * Usage (run after `npm run build`):
- *   CPMESH_HOME=$(mktemp -d) node scripts/e2e-smoke.mjs <server-url> <username> <password>
+ *   CPMESH_HOME=$(mktemp -d) node scripts/e2e-smoke.mjs <server-url> <username> <password> [code]
  */
 
 import { spawn } from "node:child_process";
@@ -20,9 +23,9 @@ import { fileURLToPath } from "node:url";
 import { join, dirname } from "node:path";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const [serverUrl, username, password] = process.argv.slice(2);
+const [serverUrl, username, password, code] = process.argv.slice(2);
 if (!serverUrl || !username || !password) {
-  console.error("Usage: node scripts/e2e-smoke.mjs <server-url> <username> <password>");
+  console.error("Usage: node scripts/e2e-smoke.mjs <server-url> <username> <password> [code]");
   process.exit(1);
 }
 
@@ -86,11 +89,25 @@ try {
     server_url: serverUrl,
     username,
     password,
+    ...(code && { code }),
   });
+  if (login.result?.isError) {
+    console.error(`\n${textOf(login)}\n`);
+    proc.kill();
+    process.exit(1);
+  }
   const loginData = JSON.parse(
     textOf(login).slice(textOf(login).indexOf("{")),
     {},
   );
+  if (loginData.status === "mfa_required") {
+    console.error(
+      "\nThe account uses two-factor authentication: re-run with the current 6-digit code " +
+        "from the authenticator app (or a recovery code) as the fourth argument.\n",
+    );
+    proc.kill();
+    process.exit(1);
+  }
   check("login", loginData.status === "approved" || loginData.status === "pending",
     loginData.message?.slice(0, 100));
 
