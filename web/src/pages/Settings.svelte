@@ -13,6 +13,7 @@
   import Field from '../components/ui/Field.svelte';
   import CopyButton from '../components/ui/CopyButton.svelte';
   import Alert from '../components/ui/Alert.svelte';
+  import TwoFactorSettings from '../components/mfa/TwoFactorSettings.svelte';
 
   interface SubscriptionInfo {
     plan_id: string | null;
@@ -44,6 +45,7 @@
 
   const displayName = $derived(userState.fullName || userState.username);
   const isLocal = $derived(userState.authProvider === 'local');
+  const roleLabel = $derived(userState.role === 'user' ? 'Member' : titleCase(userState.role));
   const deviceUsage = $derived.by(() => {
     const max = subscription?.max_devices ?? null;
     const used = devicesState.list.length;
@@ -105,7 +107,7 @@
         <div class="min-w-0 flex-1">
           <div class="flex flex-wrap items-center gap-2">
             <h3 class="text-lg font-semibold tracking-tight text-fg">{displayName}</h3>
-            {#if userState.isAdmin}<Badge tone="cyan" uppercase>admin</Badge>{/if}
+            {#if userState.isAdmin}<Badge tone="cyan" uppercase>{userState.role}</Badge>{/if}
             {#if userState.emailVerified}
               <Badge tone="mint" icon="check">Verified</Badge>
             {:else if userState.email}
@@ -130,7 +132,7 @@
         </div>
         <div class="rounded-md border border-border bg-bg-deep px-4 py-3">
           <dt class="text-xs text-muted">Role</dt>
-          <dd class="mt-1 text-sm font-medium text-fg">{userState.isAdmin ? 'Administrator' : 'Member'}</dd>
+          <dd class="mt-1 text-sm font-medium text-fg">{roleLabel}</dd>
         </div>
       </dl>
     </Card>
@@ -167,6 +169,8 @@
         </form>
       {/if}
     </Card>
+
+    <TwoFactorSettings />
   </div>
 
   <div class="flex flex-col gap-6">

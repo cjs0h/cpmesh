@@ -66,6 +66,44 @@ async function waitForRotation(spent: string): Promise<boolean> {
   return false;
 }
 
+/** An error response from the API. `code` is set for errors clients act on
+ * (e.g. `reauth_required`, `mfa_required`); `data` is the full JSON body. */
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code?: string;
+  readonly data: Record<string, any>;
+
+  constructor(message: string, status: number, data: Record<string, any> = {}) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.code = typeof data.code === 'string' ? data.code : undefined;
+    this.data = data;
+  }
+}
+
+/** Asks the user to confirm it's them (second factor or password) and stores the
+ * refreshed session; resolves `false` when they cancel. */
+export type ReauthHandler = () => Promise<boolean>;
+
+let reauthHandler: ReauthHandler | null = null;
+
+/** Registers the dialog used when the server answers `reauth_required`. */
+export function setReauthHandler(handler: ReauthHandler | null) {
+  reauthHandler = handler;
+}
+
+/** Asks the user to confirm it's them through the registered handler; false without one or when they cancel. */
+export async function requestReauth(): Promise<boolean> {
+  return reauthHandler ? reauthHandler() : false;
+}
+
+async function readError(res: Response): Promise<ApiError> {
+  const data = await res.json().catch(() => ({ error: res.statusText }));
+  const body = data && typeof data === 'object' ? data : {};
+  return new ApiError(body.error || res.statusText || 'Request failed', res.status, body);
+}
+
 export async function api<T = any>(path: string, options: RequestInit = {}): Promise<T> {
   const token = getAccessToken();
   const headers: Record<string, string> = {
@@ -95,9 +133,39 @@ export async function api<T = any>(path: string, options: RequestInit = {}): Pro
   if (res.status === 204) return undefined as T;
 
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error(err.error || 'Request failed');
+    let err = await readError(res);
+    // Sensitive actions need a recent confirmation: ask for it, then retry once
+    if (err.code === 'reauth_required' && reauthHandler && (await reauthHandler())) {
+      headers['Authorization'] = `Bearer ${getAccessToken()}`;
+      res = await fetch(path, { ...options, headers });
+      if (res.status === 204) return undefined as T;
+      if (res.ok) return res.json();
+      err = await readError(res);
+    }
+    throw err;
   }
 
+  return res.json();
+}
+
+/**
+ * A request authenticated with `token` (or nothing) instead of the stored session:
+ * the sign-in ticket while a second factor is pending, or a session that is handed
+ * to the desktop app and never stored. No refresh or step-up; failures throw `ApiError`.
+ */
+export async function apiWithToken<T = any>(path: string, token: string | null, options: RequestInit = {}): Promise<T> {
+  const headers: Record<string, string> = {
+    ...Object.fromEntries(new Headers(options.headers).entries()),
+  };
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+  if (options.body && typeof options.body === 'string') {
+    headers['Content-Type'] = 'application/json';
+  }
+
+  const res = await fetch(path, { ...options, headers });
+  if (res.status === 204) return undefined as T;
+  if (!res.ok) throw await readError(res);
   return res.json();
 }

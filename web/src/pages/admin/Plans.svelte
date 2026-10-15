@@ -1,22 +1,35 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { userState } from '../../lib/stores/user.svelte';
-  import { adminState, fetchAdminPlans, adminCreatePlan, adminUpdatePlan, adminDeletePlan, type SubscriptionPlan } from '../../lib/stores/admin.svelte';
+  import { can, userState } from '../../lib/stores/user.svelte';
+  import {
+    adminState,
+    fetchAdminPlans,
+    adminCreatePlan,
+    adminUpdatePlan,
+    adminDeletePlan,
+    errorMessage,
+    isMfaRequired,
+    planPrice,
+    type SubscriptionPlan,
+  } from '../../lib/stores/admin.svelte';
   import { toast } from '../../lib/stores/toast.svelte';
   import { push } from 'svelte-spa-router';
   import { titleCase } from '../../lib/format';
   import Icon from '../../components/Icon.svelte';
   import Badge from '../../components/ui/Badge.svelte';
   import Button from '../../components/ui/Button.svelte';
-  import Card from '../../components/ui/Card.svelte';
   import ConfirmAction from '../../components/ui/ConfirmAction.svelte';
   import Dialog from '../../components/ui/Dialog.svelte';
   import Field from '../../components/ui/Field.svelte';
   import Select from '../../components/ui/Select.svelte';
+  import Skeleton from '../../components/ui/Skeleton.svelte';
   import Switch from '../../components/ui/Switch.svelte';
   import EmptyState from '../../components/ui/EmptyState.svelte';
   import Alert from '../../components/ui/Alert.svelte';
+  import AdminGate from '../../components/admin/AdminGate.svelte';
 
+  let loaded = $state(false);
+  let loadError = $state('');
   let dialogOpen = $state(false);
   let editing = $state<SubscriptionPlan | null>(null);
   let error = $state('');
@@ -38,9 +51,20 @@
       push('/');
       return;
     }
-    fetchAdminPlans();
+    load();
   });
 
+  async function load() {
+    try {
+      await fetchAdminPlans();
+      loaded = true;
+      loadError = '';
+    } catch (err) {
+      if (!isMfaRequired(err)) loadError = errorMessage(err);
+    }
+  }
+
+  const canEdit = $derived(can('manage_content'));
   const sorted = $derived([...adminState.plans].sort((a, b) => a.sort_order - b.sort_order || a.name.localeCompare(b.name)));
 
   function startCreate() {
@@ -63,7 +87,7 @@
     editing = plan;
     formName = plan.name;
     formDescription = plan.description;
-    formPrice = plan.price;
+    formPrice = planPrice(plan.price);
     formCurrency = plan.currency;
     formBillingPeriod = plan.billing_period;
     formMaxDevices = plan.max_devices;
@@ -104,8 +128,8 @@
         toast.success('Plan created', `${data.name} is ready to assign.`);
       }
       dialogOpen = false;
-    } catch (err: any) {
-      error = err.message;
+    } catch (err) {
+      if (!isMfaRequired(err)) error = errorMessage(err);
     } finally {
       saving = false;
     }
@@ -115,76 +139,94 @@
     try {
       await adminDeletePlan(plan.id);
       toast.success('Plan deleted', `${plan.name} was removed.`);
-    } catch (err: any) {
-      toast.error('Could not delete plan', err.message);
+    } catch (err) {
+      if (!isMfaRequired(err)) toast.error('Could not delete plan', errorMessage(err));
     }
   }
 
   function price(plan: SubscriptionPlan): string {
-    if (plan.price === 0) return 'Free';
-    return `${plan.currency} ${plan.price.toFixed(2)}`;
+    const amount = planPrice(plan.price);
+    if (amount === 0) return 'Free';
+    return `${plan.currency} ${amount.toFixed(2)}`;
   }
 </script>
 
-<div class="mb-4 flex flex-wrap items-center justify-between gap-3">
-  <div class="flex items-center gap-2">
-    <Badge tone="neutral">{adminState.plans.length} plans</Badge>
-    <Badge tone="mint">{adminState.plans.filter((p) => p.is_active).length} active</Badge>
+<AdminGate onunlock={load}>
+  <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
+    <div class="flex items-center gap-2">
+      <Badge tone="neutral">{adminState.plans.length} plans</Badge>
+      <Badge tone="mint">{adminState.plans.filter((p) => p.is_active).length} active</Badge>
+    </div>
+    {#if canEdit}<Button icon="plus" size="sm" onclick={startCreate}>New plan</Button>{/if}
   </div>
-  <Button icon="plus" size="sm" onclick={startCreate}>New plan</Button>
-</div>
 
-{#if sorted.length === 0}
-  <EmptyState icon="star" title="No plans yet" description="Plans define how many devices and clipboard entries a user can have. Create one, then assign it from the Users page.">
-    <Button icon="plus" size="sm" onclick={startCreate}>Create the first plan</Button>
-  </EmptyState>
-{:else}
-  <div class="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-    {#each sorted as plan (plan.id)}
-      <article class="group relative flex flex-col rounded-lg border border-border bg-surface p-5 transition-[border-color,box-shadow] duration-150 hover:border-border-strong hover:shadow-sm {plan.is_active ? '' : 'opacity-70'}">
-        <div class="flex items-start justify-between gap-3">
-          <div class="min-w-0">
-            <div class="flex items-center gap-2">
-              <h3 class="truncate text-base font-semibold tracking-tight text-fg">{plan.name}</h3>
-              {#if !plan.is_active}<Badge tone="neutral">Inactive</Badge>{/if}
+  {#if loadError}
+    <Alert tone="danger" title="Could not load plans" class="mb-4">
+      {loadError}
+      <Button variant="link" class="ml-1" onclick={load}>Try again</Button>
+    </Alert>
+  {/if}
+
+  {#if !loaded}
+    <div class="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3" aria-busy="true">
+      {#each Array(3) as _, i (i)}
+        <div class="rounded-lg border border-border bg-surface p-5"><Skeleton class="mb-3 h-4 w-1/3" /><Skeleton class="mb-5 h-8 w-1/2" /><Skeleton class="h-12 w-full" /></div>
+      {/each}
+    </div>
+  {:else if sorted.length === 0}
+    <EmptyState icon="star" title="No plans yet" description="Plans define how many devices and clipboard entries a user can have. Create one, then assign it from a user’s page.">
+      {#if canEdit}<Button icon="plus" size="sm" onclick={startCreate}>Create the first plan</Button>{/if}
+    </EmptyState>
+  {:else}
+    <div class="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+      {#each sorted as plan (plan.id)}
+        <article class="group relative flex flex-col rounded-lg border border-border bg-surface p-5 transition-[border-color,box-shadow] duration-150 hover:border-border-strong hover:shadow-sm {plan.is_active ? '' : 'opacity-70'}">
+          <div class="flex items-start justify-between gap-3">
+            <div class="min-w-0">
+              <div class="flex items-center gap-2">
+                <h3 class="truncate text-base font-semibold tracking-tight text-fg">{plan.name}</h3>
+                {#if !plan.is_active}<Badge tone="neutral">Inactive</Badge>{/if}
+              </div>
+              {#if plan.description}<p class="mt-0.5 line-clamp-2 text-[13px] text-muted">{plan.description}</p>{/if}
             </div>
-            {#if plan.description}<p class="mt-0.5 line-clamp-2 text-[13px] text-muted">{plan.description}</p>{/if}
+            <span class="font-mono text-[11px] text-dim">#{plan.sort_order}</span>
           </div>
-          <span class="font-mono text-[11px] text-dim">#{plan.sort_order}</span>
-        </div>
 
-        <div class="mt-4 flex items-baseline gap-1.5">
-          <span class="text-3xl font-semibold tracking-tight text-fg">{price(plan)}</span>
-          {#if plan.price > 0}<span class="text-[12.5px] text-dim">/ {plan.billing_period === 'lifetime' ? 'once' : plan.billing_period.replace('ly', '')}</span>{/if}
-        </div>
-
-        <dl class="mt-5 grid grid-cols-2 gap-2 text-[13px]">
-          <div class="rounded-md border border-border bg-bg-deep px-3 py-2">
-            <dt class="flex items-center gap-1 text-xs text-muted"><Icon name="monitor" size={11} /> Devices</dt>
-            <dd class="mt-0.5 font-medium text-fg">{plan.max_devices}</dd>
+          <div class="mt-4 flex items-baseline gap-1.5">
+            <span class="text-3xl font-semibold tracking-tight text-fg">{price(plan)}</span>
+            {#if plan.price > 0}<span class="text-[12.5px] text-dim">/ {plan.billing_period === 'lifetime' ? 'once' : plan.billing_period.replace('ly', '')}</span>{/if}
           </div>
-          <div class="rounded-md border border-border bg-bg-deep px-3 py-2">
-            <dt class="flex items-center gap-1 text-xs text-muted"><Icon name="history" size={11} /> History</dt>
-            <dd class="mt-0.5 font-medium text-fg">{plan.max_clipboard_history.toLocaleString()}</dd>
-          </div>
-        </dl>
 
-        <div class="mt-3 flex flex-wrap gap-1.5">
-          {#if plan.allowed_file_types.length === 0}
-            <Badge tone="cyan" icon="check">All content types</Badge>
-          {:else}
-            {#each plan.allowed_file_types as t (t)}<Badge tone="neutral">{titleCase(t)}</Badge>{/each}
+          <dl class="mt-5 grid grid-cols-2 gap-2 text-[13px]">
+            <div class="rounded-md border border-border bg-bg-deep px-3 py-2">
+              <dt class="flex items-center gap-1 text-xs text-muted"><Icon name="monitor" size={11} /> Devices</dt>
+              <dd class="mt-0.5 font-medium text-fg">{plan.max_devices}</dd>
+            </div>
+            <div class="rounded-md border border-border bg-bg-deep px-3 py-2">
+              <dt class="flex items-center gap-1 text-xs text-muted"><Icon name="history" size={11} /> History</dt>
+              <dd class="mt-0.5 font-medium text-fg">{plan.max_clipboard_history.toLocaleString()}</dd>
+            </div>
+          </dl>
+
+          <div class="mt-3 flex flex-wrap gap-1.5">
+            {#if plan.allowed_file_types.length === 0}
+              <Badge tone="cyan" icon="check">All content types</Badge>
+            {:else}
+              {#each plan.allowed_file_types as t (t)}<Badge tone="neutral">{titleCase(t)}</Badge>{/each}
+            {/if}
+          </div>
+
+          {#if canEdit}
+            <div class="mt-auto flex items-center justify-between pt-5">
+              <Button variant="outline" size="xs" icon="edit" onclick={() => startEdit(plan)}>Edit</Button>
+              <ConfirmAction size="xs" label="Delete" confirmLabel="Delete" prompt="Delete plan?" onconfirm={() => handleDelete(plan)} />
+            </div>
           {/if}
-        </div>
-
-        <div class="mt-auto flex items-center justify-between pt-5">
-          <Button variant="outline" size="xs" icon="edit" onclick={() => startEdit(plan)}>Edit</Button>
-          <ConfirmAction size="xs" label="Delete" confirmLabel="Delete" prompt="Delete plan?" onconfirm={() => handleDelete(plan)} />
-        </div>
-      </article>
-    {/each}
-  </div>
-{/if}
+        </article>
+      {/each}
+    </div>
+  {/if}
+</AdminGate>
 
 <Dialog bind:open={dialogOpen} title={editing ? `Edit ${editing.name}` : 'New plan'} description="Limits apply immediately to every user on this plan." size="lg">
   <form id="plan-form" class="grid grid-cols-1 gap-4 sm:grid-cols-2" onsubmit={handleSave}>

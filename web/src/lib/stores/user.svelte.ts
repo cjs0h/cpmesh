@@ -1,6 +1,19 @@
 import { api } from '../api';
 import { clearTokens } from '../auth';
 
+export type Role = 'user' | 'viewer' | 'support' | 'admin' | 'owner';
+
+/** Admin console permissions granted by the user's role (see the server's rbac.rs). */
+export type Permission =
+  | 'view'
+  | 'manage_users'
+  | 'delete_users'
+  | 'reset_mfa'
+  | 'manage_content'
+  | 'manage_settings'
+  | 'manage_api_tokens'
+  | 'manage_staff';
+
 interface UserState {
   id: string;
   username: string;
@@ -9,7 +22,12 @@ interface UserState {
   avatarUrl: string;
   emailVerified: boolean;
   authProvider: string;
+  /** Staff (any role but "user"): can open the admin console. */
   isAdmin: boolean;
+  role: Role;
+  permissions: Permission[];
+  /** Two-factor authentication: set up, required for this account, and whether this session was confirmed with it. */
+  mfa: { enabled: boolean; required: boolean; sessionVerified: boolean };
   loaded: boolean;
 }
 
@@ -22,8 +40,16 @@ export const userState: UserState = $state({
   emailVerified: false,
   authProvider: 'local',
   isAdmin: false,
+  role: 'user',
+  permissions: [],
+  mfa: { enabled: false, required: false, sessionVerified: false },
   loaded: false,
 });
+
+/** Whether the signed-in user's role grants `permission`. */
+export function can(permission: Permission): boolean {
+  return userState.permissions.includes(permission);
+}
 
 export async function fetchCurrentUser() {
   try {
@@ -36,6 +62,9 @@ export async function fetchCurrentUser() {
       email_verified: boolean;
       auth_provider: string;
       is_admin: boolean;
+      role?: Role;
+      permissions?: Permission[];
+      mfa?: { enabled: boolean; required: boolean; session_verified: boolean };
     }>('/api/me');
     userState.id = data.id;
     userState.username = data.username;
@@ -45,6 +74,13 @@ export async function fetchCurrentUser() {
     userState.emailVerified = data.email_verified;
     userState.authProvider = data.auth_provider || 'local';
     userState.isAdmin = data.is_admin;
+    userState.role = data.role ?? (data.is_admin ? 'owner' : 'user');
+    userState.permissions = data.permissions ?? [];
+    userState.mfa = {
+      enabled: data.mfa?.enabled ?? false,
+      required: data.mfa?.required ?? false,
+      sessionVerified: data.mfa?.session_verified ?? false,
+    };
     userState.loaded = true;
   } catch {
     userState.loaded = true;
@@ -61,5 +97,8 @@ export function resetUserState() {
   userState.emailVerified = false;
   userState.authProvider = 'local';
   userState.isAdmin = false;
+  userState.role = 'user';
+  userState.permissions = [];
+  userState.mfa = { enabled: false, required: false, sessionVerified: false };
   userState.loaded = false;
 }

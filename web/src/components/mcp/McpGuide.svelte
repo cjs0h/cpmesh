@@ -55,12 +55,12 @@
 
   const prerequisites = [
     { icon: 'terminal', title: 'Node.js 18.19 or newer', desc: 'Your agent starts the server with npx. Nothing else to install.' },
-    { icon: 'user', title: 'A cpmesh account', desc: 'Your cpmesh.com username and password, or an account on your own relay.' },
+    { icon: 'user', title: 'A cpmesh account', desc: 'Your cpmesh.com username and password with an authenticator app for two-factor sign-in, or an account on your own relay.' },
     { icon: 'laptop', title: 'One approved device', desc: 'The desktop or Android app, used once to approve the agent.' },
   ];
 
   const pairing = [
-    { title: 'Ask your agent to connect', desc: 'Say "Connect to cpmesh". The agent calls cpmesh_status, then asks for your username and password and calls cpmesh_login.' },
+    { title: 'Ask your agent to connect', desc: 'Say "Connect to cpmesh". The agent calls cpmesh_status, then asks for your username, password and the 6-digit code from your authenticator app, and calls cpmesh_login.' },
     { title: 'Get the pairing code', desc: 'The agent registers as a new device named "MCP Agent - <hostname>" and shows you an 8-digit pairing code.' },
     { title: 'Approve on a device you trust', desc: 'Open the cpmesh app on an approved device, go to Devices, approve the new agent and check that the code matches.' },
     { title: 'Start using it', desc: 'The agent calls cpmesh_wait_for_approval, receives the encryption key and is ready. Sign-in persists across restarts.' },
@@ -78,6 +78,7 @@
     { q: 'npx is not found on Windows', a: 'Some clients cannot start npx directly. Use "command": "cmd" with "args": ["/c", "npx", "-y", "cpmesh-mcp"].' },
     { q: 'Not sure what state it is in', a: 'Ask the agent to run cpmesh_status. It always replies with the next step to take.' },
     { q: 'I have no devices yet', a: 'The agent becomes your first device. It is approved automatically and creates your encryption key.' },
+    { q: 'The agent says two-factor authentication must be set up', a: 'Sign in to the web dashboard once and set up an authenticator app under Settings → Two-factor authentication. Agents cannot use passkeys, so add an authenticator app even if you also use a passkey.' },
   ];
 </script>
 
