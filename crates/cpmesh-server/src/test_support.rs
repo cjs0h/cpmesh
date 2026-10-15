@@ -106,6 +106,19 @@ pub async fn test_state(config: Config) -> Arc<AppState> {
 
 /// Like [`test_state`] but with custom per-route rate limits (requests per minute).
 pub async fn test_state_with(config: Config, rate_limits: HashMap<&str, u32>) -> Arc<AppState> {
+    build_test_state(config, rate_limits, test_auth_service()).await
+}
+
+/// Like [`test_state`] but with a custom [`AuthService`].
+pub async fn test_state_with_auth(config: Config, auth: AuthService) -> Arc<AppState> {
+    build_test_state(config, HashMap::new(), auth).await
+}
+
+async fn build_test_state(
+    config: Config,
+    rate_limits: HashMap<&str, u32>,
+    auth: AuthService,
+) -> Arc<AppState> {
     let pool = sqlx::PgPool::connect_lazy("postgres://cpmesh:cpmesh@127.0.0.1:1/cpmesh_unused")
         .expect("lazy pool");
     // A closed pool rejects acquisition without connecting (and without sqlx's
@@ -125,7 +138,7 @@ pub async fn test_state_with(config: Config, rate_limits: HashMap<&str, u32>) ->
         config,
         hub: Hub::new(),
         pii,
-        auth: test_auth_service(),
+        auth,
         email: EmailService::disabled(),
         pkce_store: PkceCodeStore::new(),
         rate_limiters: RateLimiters {

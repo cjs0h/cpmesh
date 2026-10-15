@@ -1271,33 +1271,46 @@ async fn audit_log_filters_and_ordering() {
     .await;
 }
 
+/// RS256 key material for an `AuthService` under test: (private PEM, public keys JSON).
+fn test_jwt_keys() -> (String, String) {
+    use aws_lc_rs::encoding::AsDer;
+    use aws_lc_rs::rsa::{KeyPair, KeySize};
+    use aws_lc_rs::signature::KeyPair as _;
+    use base64::Engine;
+
+    let to_pem = |label: &str, der: &[u8]| {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+        let lines: Vec<&str> = b64
+            .as_bytes()
+            .chunks(64)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        format!(
+            "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
+            lines.join("\n")
+        )
+    };
+    let key_pair = KeyPair::generate(KeySize::Rsa2048).unwrap();
+    let private_pem = to_pem("PRIVATE KEY", key_pair.as_der().unwrap().as_ref());
+    let public_pem = to_pem(
+        "PUBLIC KEY",
+        key_pair.public_key().as_der().unwrap().as_ref(),
+    );
+    let public_json = serde_json::json!([{ "kid": "k1", "pem": public_pem }]).to_string();
+    (private_pem, public_json)
+}
+
 #[tokio::test]
 async fn auth_service_persists_revocations_to_the_database() {
     with_db(|db| async move {
-        use aws_lc_rs::encoding::AsDer;
-        use aws_lc_rs::rsa::{KeyPair, KeySize};
-        use aws_lc_rs::signature::KeyPair as _;
-        use base64::Engine;
-        use cpmesh_server::routes::auth_service::{AuthService, RefreshResult};
+        use cpmesh_server::routes::auth_service::{AuthService, RefreshResult, RefreshTokenUse};
 
-        let to_pem = |label: &str, der: &[u8]| {
-            let b64 = base64::engine::general_purpose::STANDARD.encode(der);
-            let lines: Vec<&str> = b64
-                .as_bytes()
-                .chunks(64)
-                .map(|c| std::str::from_utf8(c).unwrap())
-                .collect();
-            format!("-----BEGIN {label}-----\n{}\n-----END {label}-----\n", lines.join("\n"))
-        };
-        let key_pair = KeyPair::generate(KeySize::Rsa2048).unwrap();
-        let private_pem = to_pem("PRIVATE KEY", key_pair.as_der().unwrap().as_ref());
-        let public_pem = to_pem("PUBLIC KEY", key_pair.public_key().as_der().unwrap().as_ref());
-        let public_json = serde_json::json!([{ "kid": "k1", "pem": public_pem }]).to_string();
-
+        let (private_pem, public_json) = test_jwt_keys();
         let user = make_user(&db, "trent", None).await;
-        let svc = AuthService::new("k1", &private_pem, &public_json, Some(db.pool.clone())).unwrap();
+        let svc =
+            AuthService::new("k1", &private_pem, &public_json, Some(db.pool.clone())).unwrap();
 
-        let refresh = svc.generate_refresh_token(user.id).unwrap();
+        let refresh = svc.generate_refresh_token(user.id, None).unwrap();
         let (_, jti, exp) = match svc.validate_refresh_token(&refresh) {
             RefreshResult::Ok(c, jti, exp) => (c, jti, exp),
             _ => panic!("fresh token rejected"),
@@ -1313,13 +1326,305 @@ async fn auth_service_persists_revocations_to_the_database() {
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        assert!(persisted, "revoked token should be persisted to revoked_tokens");
+        assert!(
+            persisted,
+            "revoked token should be persisted to revoked_tokens"
+        );
 
         // A fresh service instance (e.g. after a restart) learns about it from the database
-        let restarted = AuthService::new("k1", &private_pem, &public_json, Some(db.pool.clone())).unwrap();
+        let restarted = AuthService::new("k1", &private_pem, &public_json, Some(db.pool.clone()))
+            .unwrap()
+            .with_refresh_reuse_grace(std::time::Duration::ZERO);
         assert!(restarted.check_revoked_db_async(&jti).await);
-        assert!(matches!(restarted.validate_refresh_token(&refresh), RefreshResult::Reused(u) if u == user.id));
+        assert_eq!(
+            restarted
+                .consume_refresh_token(&jti, user.id, exp)
+                .await
+                .unwrap(),
+            RefreshTokenUse::Reused
+        );
         assert!(!restarted.check_revoked_db_async("unknown-jti").await);
     })
     .await;
+}
+
+#[tokio::test]
+async fn refresh_tokens_are_single_use_across_instances() {
+    with_db(|db| async move {
+        use cpmesh_server::routes::auth_service::{AuthService, RefreshResult, RefreshTokenUse};
+
+        let (private_pem, public_json) = test_jwt_keys();
+        let user = make_user(&db, "ursula", None).await;
+        // Two server instances sharing one database
+        let a = Arc::new(
+            AuthService::new("k1", &private_pem, &public_json, Some(db.pool.clone())).unwrap(),
+        );
+        let b = Arc::new(
+            AuthService::new("k1", &private_pem, &public_json, Some(db.pool.clone())).unwrap(),
+        );
+
+        let refresh = a.generate_refresh_token(user.id, None).unwrap();
+        let RefreshResult::Ok(_, jti, exp) = a.validate_refresh_token(&refresh) else {
+            panic!("fresh token rejected");
+        };
+
+        // Many simultaneous refreshes with the same token: exactly one may win
+        let attempts: Vec<_> = (0..8)
+            .map(|i| {
+                let svc = if i % 2 == 0 { a.clone() } else { b.clone() };
+                let jti = jti.clone();
+                let user_id = user.id;
+                tokio::spawn(
+                    async move { svc.consume_refresh_token(&jti, user_id, exp).await.unwrap() },
+                )
+            })
+            .collect();
+        let mut outcomes = Vec::new();
+        for attempt in attempts {
+            outcomes.push(attempt.await.unwrap());
+        }
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| **o == RefreshTokenUse::First)
+                .count(),
+            1,
+            "{outcomes:?}"
+        );
+        assert!(
+            outcomes.iter().all(|o| *o != RefreshTokenUse::Reused),
+            "a race between a client's own requests is not theft: {outcomes:?}"
+        );
+
+        // Once the grace window has passed, presenting the token again is theft
+        let later = AuthService::new("k1", &private_pem, &public_json, Some(db.pool.clone()))
+            .unwrap()
+            .with_refresh_reuse_grace(std::time::Duration::ZERO);
+        assert_eq!(
+            later
+                .consume_refresh_token(&jti, user.id, exp)
+                .await
+                .unwrap(),
+            RefreshTokenUse::Reused
+        );
+    })
+    .await;
+}
+
+// ---- Router flows that need a real database ---------------------------------
+
+mod router {
+    use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use axum::http::{Request, StatusCode, header};
+    use cpmesh_server::config::Config;
+    use cpmesh_server::email::EmailService;
+    use cpmesh_server::routes::auth::PkceCodeStore;
+    use cpmesh_server::routes::auth_service::{AuthService, RefreshResult};
+    use cpmesh_server::routes::middleware::build_rate_limiter;
+    use cpmesh_server::ws::Hub;
+    use cpmesh_server::{AppState, RateLimiters};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    fn app(db: &Db) -> (Router, Arc<AppState>) {
+        let (private_pem, public_json) = test_jwt_keys();
+        let mut config = Config::from_lookup(|_| None);
+        config.jwt_active_kid = "k1".into();
+        let state = Arc::new(AppState {
+            db: Db {
+                pool: db.pool.clone(),
+            },
+            config,
+            hub: Hub::new(),
+            pii: None,
+            auth: AuthService::new("k1", &private_pem, &public_json, Some(db.pool.clone()))
+                .unwrap(),
+            email: EmailService::disabled(),
+            pkce_store: PkceCodeStore::new(),
+            rate_limiters: RateLimiters {
+                login: build_rate_limiter(1000),
+                register: build_rate_limiter(1000),
+                refresh: build_rate_limiter(1000),
+            },
+        });
+        (cpmesh_server::routes::build_router(state.clone()), state)
+    }
+
+    fn request(method: &str, uri: &str) -> axum::http::request::Builder {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .extension(ConnectInfo::<std::net::SocketAddr>(
+                "203.0.113.10:4242".parse().unwrap(),
+            ))
+    }
+
+    fn ws_upgrade(uri: &str) -> axum::http::request::Builder {
+        request("GET", uri)
+            .header(header::CONNECTION, "upgrade")
+            .header(header::UPGRADE, "websocket")
+            .header(header::SEC_WEBSOCKET_VERSION, "13")
+            .header(header::SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==")
+    }
+
+    async fn call(app: &Router, req: Request<Body>) -> (StatusCode, serde_json::Value) {
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    fn bearer(token: &str) -> String {
+        format!("Bearer {token}")
+    }
+
+    #[tokio::test]
+    async fn browser_session_connects_with_a_single_use_ticket() {
+        with_db(|db| async move {
+            let (app, state) = app(&db);
+            let user = make_user(&db, "wendy", None).await;
+            // Web dashboard sessions are not bound to a device
+            let token = state.auth.generate_access_token(user.id, None).unwrap();
+
+            let (status, body) = call(
+                &app,
+                request("POST", "/api/ws/ticket")
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let ticket = body["ticket"].as_str().unwrap().to_string();
+
+            // Ticket alone (no Authorization header) gets through authentication to
+            // the upgrade itself, which the in-process transport cannot perform.
+            let (status, _) = call(
+                &app,
+                ws_upgrade(&format!("/ws?ticket={ticket}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UPGRADE_REQUIRED);
+
+            let (status, body) = call(
+                &app,
+                ws_upgrade(&format!("/ws?ticket={ticket}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(body["error"], "invalid or expired ticket");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn devices_connect_with_a_bearer_token_once_approved() {
+        with_db(|db| async move {
+            let (app, state) = app(&db);
+            let user = make_user(&db, "xavier", None).await;
+            let approved = make_device(&db, &user, "laptop", "approved").await;
+            let pending = make_device(&db, &user, "phone", "pending").await;
+
+            let token = state
+                .auth
+                .generate_access_token(user.id, Some(approved.id))
+                .unwrap();
+            let (status, _) = call(
+                &app,
+                ws_upgrade("/ws")
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UPGRADE_REQUIRED);
+
+            let token = state
+                .auth
+                .generate_access_token(user.id, Some(pending.id))
+                .unwrap();
+            let (status, body) = call(
+                &app,
+                ws_upgrade("/ws")
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn refresh_binds_a_session_to_one_of_the_users_devices() {
+        with_db(|db| async move {
+            let (app, state) = app(&db);
+            let user = make_user(&db, "yvonne", None).await;
+            let other = make_user(&db, "zack", None).await;
+            let device = make_device(&db, &user, "laptop", "approved").await;
+            let foreign = make_device(&db, &other, "desk", "approved").await;
+            let revoked = make_device(&db, &user, "old", "revoked").await;
+
+            let refresh_with = |token: String, device_id: uuid::Uuid| {
+                request("POST", "/api/auth/refresh")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"refresh_token": token, "device_id": device_id})
+                            .to_string(),
+                    ))
+                    .unwrap()
+            };
+
+            // Someone else's device, or a revoked one, is refused
+            for device_id in [foreign.id, revoked.id] {
+                let token = state.auth.generate_refresh_token(user.id, None).unwrap();
+                let (status, body) = call(&app, refresh_with(token, device_id)).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+            }
+
+            let token = state.auth.generate_refresh_token(user.id, None).unwrap();
+            let (status, body) = call(&app, refresh_with(token, device.id)).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let access = state
+                .auth
+                .validate_access_token(body["access_token"].as_str().unwrap())
+                .unwrap();
+            assert_eq!(access.device_id, Some(device.id));
+            // The rotated refresh token stays bound to the device
+            let RefreshResult::Ok(claims, _, _) = state
+                .auth
+                .validate_refresh_token(body["refresh_token"].as_str().unwrap())
+            else {
+                panic!("rotated refresh token rejected");
+            };
+            assert_eq!(claims.device_id, Some(device.id));
+
+            // Removing the device ends its session
+            db.delete_device(device.id, user.id).await.unwrap();
+            let next = body["refresh_token"].as_str().unwrap().to_string();
+            let (status, body) = call(
+                &app,
+                request("POST", "/api/auth/refresh")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"refresh_token": next}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        })
+        .await;
+    }
 }

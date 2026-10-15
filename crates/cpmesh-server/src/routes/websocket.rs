@@ -1,10 +1,11 @@
 use axum::{
     extract::{
-        ConnectInfo, Extension, Query, State, WebSocketUpgrade,
+        ConnectInfo, Extension, Query, Request, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::StatusCode,
-    response::Response,
+    middleware::Next,
+    response::{IntoResponse, Response},
 };
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
@@ -13,23 +14,68 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, mpsc};
 use tracing::warn;
 
-use super::middleware::{AuthClaims, extract_client_ip, json_error, json_response};
+use super::middleware::{
+    AuthClaims, authenticate, check_session, extract_client_ip, json_error, json_response,
+    require_approved_device,
+};
 use crate::AppState;
 use crate::ws::Client;
 use cpmesh_proto::models::*;
+
+/// How long a WebSocket ticket can be redeemed after it is issued.
+const TICKET_TTL: Duration = Duration::from_secs(10);
+
+/// Most WebSocket connections (devices and browser tabs) one user may hold.
+const MAX_CONNECTIONS_PER_USER: usize = 10;
 
 // WS ticket store (short-lived, single-use)
 static TICKETS: LazyLock<Mutex<HashMap<String, WsTicket>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 struct WsTicket {
-    user_id: uuid::Uuid,
-    device_id: uuid::Uuid,
-    expires: std::time::Instant,
+    claims: AuthClaims,
+    expires: Instant,
     client_ip: IpAddr,
+}
+
+/// Issues a single-use ticket that authenticates one WebSocket upgrade from
+/// `client_ip` within [`TICKET_TTL`]. Browsers cannot set an Authorization header on
+/// a WebSocket, so they present a ticket in the query string instead of their JWT.
+pub(crate) async fn issue_ticket(claims: AuthClaims, client_ip: IpAddr) -> String {
+    let mut ticket_bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut ticket_bytes);
+    let ticket: String = ticket_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+
+    let now = Instant::now();
+    let mut tickets = TICKETS.lock().await;
+    // Drop tickets that were never redeemed so they cannot accumulate
+    tickets.retain(|_, t| t.expires > now);
+    tickets.insert(
+        ticket.clone(),
+        WsTicket {
+            claims,
+            expires: now + TICKET_TTL,
+            client_ip,
+        },
+    );
+    ticket
+}
+
+/// Consumes a ticket, returning the session it was issued to.
+async fn redeem_ticket(ticket: &str, client_ip: IpAddr) -> Option<AuthClaims> {
+    let t = TICKETS.lock().await.remove(ticket)?;
+    if Instant::now() > t.expires {
+        return None;
+    }
+    if t.client_ip != client_ip {
+        warn!("WS ticket presented from a different address than it was issued to");
+        return None;
+    }
+    Some(t.claims)
 }
 
 pub async fn handle_ws_ticket(
@@ -38,45 +84,9 @@ pub async fn handle_ws_ticket(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    let device_id = match claims.device_id {
-        Some(d) => d,
-        None => return json_error("device context required", StatusCode::BAD_REQUEST),
-    };
-
     let client_ip = extract_client_ip(&headers, &addr, state.config.trust_proxy_headers);
-
-    let mut ticket_bytes = [0u8; 32];
-    rand::rng().fill_bytes(&mut ticket_bytes);
-    let ticket: String = ticket_bytes.iter().map(|b| format!("{:02x}", b)).collect();
-
-    let mut tickets = TICKETS.lock().await;
-    tickets.insert(
-        ticket.clone(),
-        WsTicket {
-            user_id: claims.user_id,
-            device_id,
-            expires: std::time::Instant::now() + std::time::Duration::from_secs(10),
-            client_ip,
-        },
-    );
-
+    let ticket = issue_ticket(claims, client_ip).await;
     json_response(StatusCode::OK, json!({"ticket": ticket}))
-}
-
-async fn validate_ticket(ticket: &str, client_ip: IpAddr) -> Option<(uuid::Uuid, uuid::Uuid)> {
-    let mut tickets = TICKETS.lock().await;
-    let t = tickets.remove(ticket)?;
-    if std::time::Instant::now() > t.expires {
-        return None;
-    }
-    if t.client_ip != client_ip {
-        warn!(
-            "WS ticket IP mismatch: expected {}, got {}",
-            t.client_ip, client_ip
-        );
-        return None;
-    }
-    Some((t.user_id, t.device_id))
 }
 
 #[derive(serde::Deserialize)]
@@ -84,102 +94,138 @@ pub struct WsQuery {
     pub ticket: Option<String>,
 }
 
+/// Authenticates WebSocket upgrades. Desktop and MCP clients send their access token
+/// in the Authorization header; browsers present a ticket from `POST /api/ws/ticket`
+/// in the query string. Sessions bound to a device need that device to be approved.
+pub async fn ws_auth_middleware(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Query(query): Query<WsQuery>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let claims = if let Some(ticket) = query.ticket {
+        let client_ip = extract_client_ip(req.headers(), &addr, state.config.trust_proxy_headers);
+        let Some(claims) = redeem_ticket(&ticket, client_ip).await else {
+            return json_error("invalid or expired ticket", StatusCode::UNAUTHORIZED);
+        };
+        // The account may have been deleted or signed out everywhere since issuance
+        if let Err(rejection) = check_session(&state, &claims).await {
+            return rejection.into_response();
+        }
+        claims
+    } else {
+        match authenticate(&state, req.headers()).await {
+            Ok(claims) => claims,
+            Err(rejection) => return rejection.into_response(),
+        }
+    };
+
+    if let Err(rejection) = require_approved_device(&state, &claims).await {
+        return rejection.into_response();
+    }
+
+    req.extensions_mut().insert(claims);
+    next.run(req).await
+}
+
+/// The party on the other end of a WebSocket.
+enum Peer {
+    Device {
+        id: uuid::Uuid,
+        name: String,
+    },
+    /// A browser session (the web dashboard), which has no device or keys.
+    Browser,
+}
+
 pub async fn handle_ws_upgrade(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<AuthClaims>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
-    Query(query): Query<WsQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let client_ip = extract_client_ip(&headers, &addr, state.config.trust_proxy_headers);
+    let user_id = claims.user_id;
 
-    let (user_id, device_id) = if let Some(ref ticket) = query.ticket {
-        match validate_ticket(ticket, client_ip).await {
-            Some((uid, did)) => (uid, did),
-            None => return json_error("invalid or expired ticket", StatusCode::UNAUTHORIZED),
-        }
-    } else {
-        let did = match claims.device_id {
-            Some(d) => d,
-            None => return json_error("missing device context", StatusCode::BAD_REQUEST),
-        };
-        (claims.user_id, did)
-    };
-
-    // Enforce per-user connection limit
-    if state.hub.user_connection_count(&user_id.to_string()).await >= 10 {
+    if state.hub.user_connection_count(&user_id.to_string()).await >= MAX_CONNECTIONS_PER_USER {
         return json_error(
             "too many concurrent connections",
             StatusCode::TOO_MANY_REQUESTS,
         );
     }
 
-    let device_name = state
-        .db
-        .get_device_by_id(device_id)
-        .await
-        .map(|d| d.name)
-        .unwrap_or_default();
+    let peer = match claims.device_id {
+        Some(device_id) => {
+            let name = state
+                .db
+                .get_device_by_id(device_id)
+                .await
+                .map(|d| d.name)
+                .unwrap_or_default();
 
-    // Opportunistic fingerprint backfill for devices that predate fingerprinting
-    if let Some(fp) = headers
-        .get("x-device-fingerprint")
-        .and_then(|v| v.to_str().ok())
-    {
-        let _ = state
-            .db
-            .set_device_fingerprint(device_id, user_id, fp)
-            .await;
-    }
+            // Opportunistic fingerprint backfill for devices that predate fingerprinting
+            if let Some(fp) = headers
+                .get("x-device-fingerprint")
+                .and_then(|v| v.to_str().ok())
+            {
+                let _ = state
+                    .db
+                    .set_device_fingerprint(device_id, user_id, fp)
+                    .await;
+            }
+            Peer::Device {
+                id: device_id,
+                name,
+            }
+        }
+        None => Peer::Browser,
+    };
 
-    let state2 = state.clone();
-    ws.on_upgrade(move |socket| {
-        handle_ws_connection(socket, state2, user_id, device_id, device_name)
-    })
+    ws.on_upgrade(move |socket| handle_ws_connection(socket, state, user_id, peer))
 }
 
 async fn handle_ws_connection(
     socket: WebSocket,
     state: Arc<AppState>,
     user_id: uuid::Uuid,
-    device_id: uuid::Uuid,
-    device_name: String,
+    peer: Peer,
 ) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
-    let client = Client {
-        user_id: user_id.to_string(),
-        device_id: device_id.to_string(),
-        device_name: device_name.clone(),
-        tx,
+    let uid = user_id.to_string();
+    let conn_id = uuid::Uuid::new_v4();
+    // Browser tabs register under their own connection ID so several can coexist
+    let (hub_id, device_name, device_id) = match &peer {
+        Peer::Device { id, name } => (id.to_string(), name.clone(), Some(*id)),
+        Peer::Browser => (format!("web-{conn_id}"), String::new(), None),
     };
 
-    state.hub.register(client).await;
+    state
+        .hub
+        .register(Client {
+            user_id: uid.clone(),
+            device_id: hub_id.clone(),
+            device_name,
+            conn_id,
+            announce: device_id.is_some(),
+            tx: tx.clone(),
+        })
+        .await;
 
-    // Check if rotation is due and prompt if so
-    if let Ok(true) = state.db.is_rotation_due(user_id).await {
+    // Prompt a device to rotate the group key when rotation is due
+    if device_id.is_some()
+        && let Ok(true) = state.db.is_rotation_due(user_id).await
+    {
         let rotation_msg = serde_json::to_string(&WsMessage {
             msg_type: MSG_ROTATION_NEEDED.to_string(),
             payload: json!({"reason": "rotation_due"}),
         })
         .unwrap_or_default();
-
-        let clients = state.hub.clients.read().await;
-        if let Some(user_clients) = clients.get(&user_id.to_string())
-            && let Some(client) = user_clients.get(&device_id.to_string())
-        {
-            let _ = client.tx.send(rotation_msg);
-        }
+        let _ = tx.send(rotation_msg);
     }
 
-    let uid = user_id.to_string();
-    let did = device_id.to_string();
-    let dname = device_name.clone();
-
     // Write pump: forward messages from hub to WebSocket
-    let _state_write = state.clone();
     let write_handle = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if ws_tx.send(Message::Text(msg.into())).await.is_err() {
@@ -189,49 +235,40 @@ async fn handle_ws_connection(
     });
 
     // Read pump: handle messages from WebSocket
-    {
-        while let Some(Ok(msg)) = ws_rx.next().await {
-            match msg {
-                Message::Text(text) => {
-                    let text_ref: &str = &text;
-                    if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(text_ref) {
-                        match ws_msg.msg_type.as_str() {
-                            MSG_CLIPBOARD_PUSH => {
-                                if let Ok(payload) =
-                                    serde_json::from_value::<ClipboardPushPayload>(ws_msg.payload)
-                                {
-                                    handle_clipboard_push(&state, user_id, device_id, payload)
-                                        .await;
-                                }
-                            }
-                            MSG_PING => {
-                                // Respond with pong (handled via the tx channel)
-                                let pong = serde_json::to_string(&WsMessage {
-                                    msg_type: MSG_PONG.to_string(),
-                                    payload: json!({}),
-                                })
-                                .unwrap_or_default();
-
-                                // Find and send directly
-                                let clients = state.hub.clients.read().await;
-                                if let Some(user_clients) = clients.get(&uid)
-                                    && let Some(client) = user_clients.get(&did)
-                                {
-                                    let _ = client.tx.send(pong);
-                                }
-                            }
-                            _ => {}
+    while let Some(Ok(msg)) = ws_rx.next().await {
+        match msg {
+            Message::Text(text) => {
+                let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) else {
+                    continue;
+                };
+                match ws_msg.msg_type.as_str() {
+                    // Only devices push clipboard entries; browser sessions hold no keys
+                    MSG_CLIPBOARD_PUSH => {
+                        if let Some(device_id) = device_id
+                            && let Ok(payload) =
+                                serde_json::from_value::<ClipboardPushPayload>(ws_msg.payload)
+                        {
+                            handle_clipboard_push(&state, user_id, device_id, payload).await;
                         }
                     }
+                    MSG_PING => {
+                        let pong = serde_json::to_string(&WsMessage {
+                            msg_type: MSG_PONG.to_string(),
+                            payload: json!({}),
+                        })
+                        .unwrap_or_default();
+                        let _ = tx.send(pong);
+                    }
+                    _ => {}
                 }
-                Message::Close(_) => break,
-                _ => {}
             }
+            Message::Close(_) => break,
+            _ => {}
         }
     }
 
     // Cleanup
-    state.hub.remove(&uid, &did, &dname).await;
+    state.hub.remove(&uid, &hub_id, conn_id).await;
     write_handle.abort();
 }
 

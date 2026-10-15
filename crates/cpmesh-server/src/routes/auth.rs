@@ -474,7 +474,7 @@ pub async fn handle_login(
         Ok(t) => t,
         Err(_) => return json_error("internal error", StatusCode::INTERNAL_SERVER_ERROR),
     };
-    let refresh_token = match state.auth.generate_refresh_token(user.id) {
+    let refresh_token = match state.auth.generate_refresh_token(user.id, None) {
         Ok(t) => t,
         Err(_) => return json_error("internal error", StatusCode::INTERNAL_SERVER_ERROR),
     };
@@ -501,19 +501,30 @@ pub async fn handle_login(
 #[derive(Deserialize)]
 pub struct RefreshBody {
     pub refresh_token: String,
+    /// Binds a user-level session to one of the user's devices. Binding is one-way:
+    /// tokens refreshed from a device-bound token stay bound to that device.
+    #[serde(default)]
+    pub device_id: Option<uuid::Uuid>,
 }
 
 pub async fn handle_refresh(
     State(state): State<Arc<AppState>>,
     axum::Json(req): axum::Json<RefreshBody>,
 ) -> Response {
-    use crate::routes::auth_service::RefreshResult;
+    use crate::routes::auth_service::{RefreshResult, RefreshTokenUse};
 
-    match state.auth.validate_refresh_token(&req.refresh_token) {
-        RefreshResult::Ok(claims, old_jti, old_exp) => {
-            // Check bulk revocation
-            if let Ok(user) = state.db.get_user_by_id(claims.user_id).await
-                && let Some(revoked_before) = user.tokens_revoked_before
+    let (claims, jti, exp) = match state.auth.validate_refresh_token(&req.refresh_token) {
+        RefreshResult::Ok(claims, jti, exp) => (claims, jti, exp),
+        RefreshResult::Invalid(_) => {
+            return json_error("invalid refresh token", StatusCode::UNAUTHORIZED);
+        }
+    };
+
+    // Check bulk revocation. If the database is unreachable, recording the token
+    // use below fails closed instead.
+    match state.db.get_user_by_id(claims.user_id).await {
+        Ok(user) => {
+            if let Some(revoked_before) = user.tokens_revoked_before
                 && revoked_before > 0
                 && (claims.iat as i64) < revoked_before
             {
@@ -522,53 +533,107 @@ pub async fn handle_refresh(
                     StatusCode::UNAUTHORIZED,
                 );
             }
-
-            // Revoke the old refresh token (single-use enforcement)
-            state.auth.revoke_token(&old_jti, claims.user_id, old_exp);
-
-            // Generate new token pair
-            let access_token = match state
-                .auth
-                .generate_access_token(claims.user_id, claims.device_id)
-            {
-                Ok(t) => t,
-                Err(_) => return json_error("internal error", StatusCode::INTERNAL_SERVER_ERROR),
-            };
-            let refresh_token = match state.auth.generate_refresh_token(claims.user_id) {
-                Ok(t) => t,
-                Err(_) => return json_error("internal error", StatusCode::INTERNAL_SERVER_ERROR),
-            };
-
-            json_response(
-                StatusCode::OK,
-                json!({
-                    "access_token": access_token,
-                    "refresh_token": refresh_token,
-                }),
-            )
         }
-        RefreshResult::Reused(user_id) => {
+        Err(sqlx::Error::RowNotFound) => {
+            return json_error("invalid refresh token", StatusCode::UNAUTHORIZED);
+        }
+        Err(_) => {}
+    }
+
+    let device_id = match (claims.device_id, req.device_id) {
+        (Some(bound), Some(requested)) if bound != requested => {
+            return json_error(
+                "refresh token is bound to another device",
+                StatusCode::UNAUTHORIZED,
+            );
+        }
+        (Some(bound), _) => Some(bound),
+        (None, requested) => requested,
+    };
+
+    // A device-bound session ends when its device is removed, rejected or revoked.
+    if let Some(device_id) = device_id {
+        match state.db.get_device_by_id(device_id).await {
+            Ok(device)
+                if device.user_id == claims.user_id
+                    && device.status != "rejected"
+                    && device.status != "revoked" => {}
+            Ok(_) | Err(sqlx::Error::RowNotFound) => {
+                return json_error(
+                    "device is no longer registered, please log in again",
+                    StatusCode::UNAUTHORIZED,
+                );
+            }
+            Err(e) => {
+                warn!("Failed to look up device for token refresh: {e}");
+                return json_error(
+                    "temporarily unavailable, please retry",
+                    StatusCode::SERVICE_UNAVAILABLE,
+                );
+            }
+        }
+    }
+
+    // Refresh tokens are single-use: record this use atomically before issuing new tokens.
+    match state
+        .auth
+        .consume_refresh_token(&jti, claims.user_id, exp)
+        .await
+    {
+        Ok(RefreshTokenUse::First) => {}
+        Ok(RefreshTokenUse::Concurrent) => {
+            // Another request rotated this token moments ago; the caller should pick
+            // up the rotated tokens instead.
+            return json_error("refresh token already used", StatusCode::CONFLICT);
+        }
+        Ok(RefreshTokenUse::Reused) => {
             // Token theft detected — revoke ALL tokens for this user
-            warn!("Refresh token reuse detected for user {user_id}, revoking all sessions");
+            warn!(
+                "Refresh token reuse detected for user {}, revoking all sessions",
+                claims.user_id
+            );
             let _ = state
                 .db
-                .revoke_all_user_tokens(user_id, crate::routes::auth_service::now_epoch())
+                .revoke_all_user_tokens(claims.user_id, crate::routes::auth_service::now_epoch())
                 .await;
             audit_log_fire(
                 &state.db.pool,
-                Some(user_id),
+                Some(claims.user_id),
                 AUDIT_TOKEN_REVOKE_ALL,
                 "unknown",
                 None,
                 &json!({"reason": "refresh_token_reuse"}),
             );
-            json_error(
+            return json_error(
                 "session compromised, all sessions revoked — please log in again",
                 StatusCode::UNAUTHORIZED,
-            )
+            );
         }
-        RefreshResult::Invalid(_) => json_error("invalid refresh token", StatusCode::UNAUTHORIZED),
+        Err(e) => {
+            warn!("Failed to record refresh token use: {e}");
+            return json_error(
+                "temporarily unavailable, please retry",
+                StatusCode::SERVICE_UNAVAILABLE,
+            );
+        }
     }
+
+    let access_token = match state.auth.generate_access_token(claims.user_id, device_id) {
+        Ok(t) => t,
+        Err(_) => return json_error("internal error", StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let refresh_token = match state.auth.generate_refresh_token(claims.user_id, device_id) {
+        Ok(t) => t,
+        Err(_) => return json_error("internal error", StatusCode::INTERNAL_SERVER_ERROR),
+    };
+
+    json_response(
+        StatusCode::OK,
+        json!({
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+        }),
+    )
 }
 
 #[derive(Deserialize)]
@@ -1149,7 +1214,7 @@ pub async fn handle_social_callback(
                 .into_response();
         }
     };
-    let refresh_token = match state.auth.generate_refresh_token(user.id) {
+    let refresh_token = match state.auth.generate_refresh_token(user.id, None) {
         Ok(t) => t,
         Err(_) => {
             let redirect = format!("{}?social_error=internal+error", frontend_login);
@@ -1833,50 +1898,54 @@ mod tests {
         );
     }
 
+    async fn post_refresh(app: &axum::Router, body: serde_json::Value) -> Response {
+        send(app, json_request("POST", "/api/auth/refresh", body)).await
+    }
+
     #[tokio::test]
-    async fn refresh_rotates_tokens_and_detects_reuse() {
+    async fn refresh_rotates_tokens_and_rejects_a_concurrent_replay() {
         let state = test_state(test_config()).await;
         let app = test_router(state.clone());
         let user = uuid::Uuid::new_v4();
-        let refresh = state.auth.generate_refresh_token(user).unwrap();
+        let refresh = state.auth.generate_refresh_token(user, None).unwrap();
 
-        let resp = send(
-            &app,
-            json_request(
-                "POST",
-                "/api/auth/refresh",
-                json!({"refresh_token": refresh}),
-            ),
-        )
-        .await;
+        let resp = post_refresh(&app, json!({"refresh_token": refresh})).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
         let new_access = body["access_token"].as_str().unwrap();
         let new_refresh = body["refresh_token"].as_str().unwrap();
         assert_ne!(new_refresh, refresh);
-        assert_eq!(
-            state
-                .auth
-                .validate_access_token(new_access)
-                .unwrap()
-                .user_id,
-            user
-        );
+        let access_claims = state.auth.validate_access_token(new_access).unwrap();
+        assert_eq!(access_claims.user_id, user);
+        assert_eq!(access_claims.device_id, None);
         assert!(matches!(
             state.auth.validate_refresh_token(new_refresh),
             crate::routes::auth_service::RefreshResult::Ok(..)
         ));
 
-        // Presenting the consumed refresh token again is treated as theft
-        let resp = send(
-            &app,
-            json_request(
-                "POST",
-                "/api/auth/refresh",
-                json!({"refresh_token": refresh}),
-            ),
-        )
-        .await;
+        // Replaying the consumed token right away is a race, not theft: no new
+        // tokens, and the rotated session stays valid.
+        let resp = post_refresh(&app, json!({"refresh_token": refresh})).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(resp).await["error"], "refresh token already used");
+        let resp = post_refresh(&app, json!({"refresh_token": new_refresh})).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn refresh_token_reuse_after_the_grace_window_is_theft() {
+        let auth = test_auth_service().with_refresh_reuse_grace(std::time::Duration::ZERO);
+        let state = test_state_with_auth(test_config(), auth).await;
+        let app = test_router(state.clone());
+        let refresh = state
+            .auth
+            .generate_refresh_token(uuid::Uuid::new_v4(), None)
+            .unwrap();
+
+        let resp = post_refresh(&app, json!({"refresh_token": refresh})).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = post_refresh(&app, json!({"refresh_token": refresh})).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert!(
             body_json(resp).await["error"]
@@ -1884,6 +1953,34 @@ mod tests {
                 .unwrap()
                 .contains("session compromised")
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_keeps_a_device_bound_session_on_its_device() {
+        let state = test_state(test_config()).await;
+        let app = test_router(state.clone());
+        let (user, device) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let refresh = state
+            .auth
+            .generate_refresh_token(user, Some(device))
+            .unwrap();
+
+        // Asking for a different device is refused before anything else happens
+        let resp = post_refresh(
+            &app,
+            json!({"refresh_token": refresh, "device_id": uuid::Uuid::new_v4()}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body_json(resp).await["error"],
+            "refresh token is bound to another device"
+        );
+
+        // The device must be confirmed before new tokens are issued; without a
+        // database that check fails closed.
+        let resp = post_refresh(&app, json!({"refresh_token": refresh})).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
