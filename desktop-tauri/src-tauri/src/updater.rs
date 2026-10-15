@@ -276,6 +276,20 @@ mod tests {
     }
 
     #[test]
+    fn built_in_key_is_empty_or_valid() {
+        // An empty key only turns off automatic updates; a malformed one is a mistake
+        let key = UPDATE_PUBLIC_KEY.trim();
+        if !key.is_empty() {
+            assert!(
+                decode_base64_text(key)
+                    .and_then(|text| PublicKey::decode(&text).ok())
+                    .is_some(),
+                "updater-key.pub is not a public key written by `tauri signer generate`"
+            );
+        }
+    }
+
+    #[test]
     fn parses_release_versions_only() {
         assert_eq!(parse_version("0.1.0"), Some((0, 1, 0)));
         assert_eq!(parse_version("10.20.30"), Some((10, 20, 30)));
