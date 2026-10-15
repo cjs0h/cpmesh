@@ -4,10 +4,13 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager, State};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::api::client::ApiClient;
+use crate::api::client::{
+    ApiClient, ApiError, LoginOutcome, MfaChallenge, MfaMethod, MfaStage, MfaVerified,
+};
 use crate::config::{AppConfig, TokenStore};
 use crate::crypto::exchange::KeyExchange;
 use crate::crypto::keys::{KeyPair, derive_approval_code};
@@ -46,6 +49,28 @@ pub(crate) fn restore_api_client(
 const SESSION_EXPIRED: &str =
     "Your session has expired. Sign out, then sign in again to resume syncing.";
 
+/// How long the server accepts the ticket for a sign-in's second factor.
+const MFA_TICKET_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// Shown when the second factor arrives after the sign-in ended.
+const MFA_SIGN_IN_EXPIRED: &str = "Your sign-in expired. Sign in again.";
+
+/// A password sign-in waiting for its second factor. The ticket is kept in memory
+/// only: it is used once and expires after [`MFA_TICKET_TTL`].
+struct PendingMfaLogin {
+    server_url: String,
+    device_name: String,
+    mfa_token: String,
+    /// Taken before the password was sent, so it never outlives the server's ticket.
+    started: Instant,
+}
+
+impl PendingMfaLogin {
+    fn is_expired(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.started) >= MFA_TICKET_TTL
+    }
+}
+
 /// Shared application state managed by Tauri.
 pub struct AppContext {
     pub config: RwLock<AppConfig>,
@@ -60,6 +85,8 @@ pub struct AppContext {
     pub skip_clipboard: Arc<AtomicBool>,
     /// Hash of the last content written to clipboard (prevents echo duplicates).
     pub last_clipboard_hash: Arc<tokio::sync::Mutex<[u8; 32]>>,
+    /// The sign-in `complete_mfa_login` finishes. Lock after `api` when holding both.
+    pending_mfa: Mutex<Option<PendingMfaLogin>>,
 }
 
 impl AppContext {
@@ -85,11 +112,126 @@ impl AppContext {
             devices: RwLock::new(vec![]),
             skip_clipboard: Arc::new(AtomicBool::new(false)),
             last_clipboard_hash: Arc::new(tokio::sync::Mutex::new([0u8; 32])),
+            pending_mfa: Mutex::new(None),
         }
+    }
+
+    /// Takes the sign-in waiting for its second factor, unless it has expired.
+    async fn take_pending_mfa(&self, now: Instant) -> Option<PendingMfaLogin> {
+        self.pending_mfa
+            .lock()
+            .await
+            .take()
+            .filter(|pending| !pending.is_expired(now))
     }
 }
 
 // === Serializable types for frontend ===
+
+/// What `setup_and_login` led to.
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum LoginStep {
+    /// Signed in, and this device is set up.
+    SignedIn,
+    /// The password was right; a second factor comes next.
+    MfaRequired(MfaPrompt),
+}
+
+/// What the sign-in screen asks for next. The ticket itself stays in the backend.
+#[derive(Debug, PartialEq, Serialize)]
+pub struct MfaPrompt {
+    pub stage: MfaStage,
+    /// Verify: the methods the account has. Enroll: the methods it can set up.
+    pub methods: Vec<String>,
+    pub email_code_required: bool,
+    pub email_hint: Option<String>,
+    pub passkeys_available: bool,
+    /// The server's explanation.
+    pub message: String,
+}
+
+impl From<&MfaChallenge> for MfaPrompt {
+    fn from(challenge: &MfaChallenge) -> Self {
+        MfaPrompt {
+            stage: challenge.stage,
+            methods: challenge.methods.clone(),
+            email_code_required: challenge.email_code_required,
+            email_hint: challenge.email_hint.clone(),
+            passkeys_available: challenge.passkeys_available,
+            message: challenge.message.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct MfaLoginDone {
+    /// Set when a recovery code was used: how many unused ones are left.
+    pub recovery_codes_remaining: Option<u32>,
+}
+
+/// Why the second factor did not finish the sign-in.
+#[derive(Debug, PartialEq, Serialize)]
+pub struct MfaLoginError {
+    pub message: String,
+    /// The sign-in cannot continue (expired, locked, suspended, or the device setup
+    /// after the code failed): start again with the password.
+    pub restart: bool,
+}
+
+impl MfaLoginError {
+    fn restart(message: impl Into<String>) -> Self {
+        MfaLoginError {
+            message: message.into(),
+            restart: true,
+        }
+    }
+
+    /// Explains a rejected second factor. A locked (for longer than the ticket lives) or
+    /// suspended account ends the sign-in; anything else, usually a mistyped code, can
+    /// be retried with the same ticket.
+    fn from_api(e: &ApiError) -> Self {
+        let (message, restart) = match e {
+            ApiError::Server {
+                code: Some(code),
+                message,
+                ..
+            } => (
+                sentence_case(message),
+                matches!(code.as_str(), "mfa_locked" | "account_suspended"),
+            ),
+            ApiError::Server { status, .. } if *status >= 500 => (
+                format!("The server could not check the code (HTTP {status}). Try again."),
+                false,
+            ),
+            ApiError::Server { message, .. } => (sentence_case(message), false),
+            ApiError::Http(e) => (format!("Could not reach the server: {e}"), false),
+        };
+        MfaLoginError { message, restart }
+    }
+}
+
+/// `message` with its first letter capitalized, to show a server error on its own.
+fn sentence_case(message: &str) -> String {
+    let mut chars = message.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// Structured server errors carry a message written for people; other errors keep
+/// their status for troubleshooting.
+fn describe_api_error(e: &ApiError) -> String {
+    match e {
+        ApiError::Server {
+            code: Some(_),
+            message,
+            ..
+        } => message.clone(),
+        other => other.to_string(),
+    }
+}
 
 #[derive(Serialize)]
 pub struct StatusInfo {
@@ -186,7 +328,7 @@ pub async fn setup_and_login(
     password_confirm: Option<String>,
     country: Option<String>,
     mobile: Option<String>,
-) -> Result<(), String> {
+) -> Result<LoginStep, String> {
     // Validate server URL scheme
     if !server_url.starts_with("https://") && !server_url.starts_with("http://") {
         return Err("Server URL must start with https:// or http://".into());
@@ -194,6 +336,8 @@ pub async fn setup_and_login(
 
     let mut api = ctx.api.lock().await;
     *api = api_client(&server_url, &ctx.config_dir);
+    // A new sign-in replaces one that was waiting for its second factor
+    ctx.pending_mfa.lock().await.take();
 
     // Register or login
     if is_register {
@@ -215,13 +359,109 @@ pub async fn setup_and_login(
 
     let device_name = crate::fingerprint::auto_device_name();
 
-    let auth_resp = api
+    let started = Instant::now();
+    let outcome = api
         .login(&username, &password, &device_name)
         .await
-        .map_err(|e| format!("Login failed: {e}"))?;
+        .map_err(|e| format!("Login failed: {}", describe_api_error(&e)))?;
+    let auth_resp = match outcome {
+        LoginOutcome::SignedIn(auth) => auth,
+        LoginOutcome::SecondFactor(challenge) => {
+            let prompt = MfaPrompt::from(&challenge);
+            // Only codes can be confirmed in the app; setting up a second factor needs
+            // the web dashboard
+            if challenge.stage == MfaStage::Verify {
+                *ctx.pending_mfa.lock().await = Some(PendingMfaLogin {
+                    server_url,
+                    device_name,
+                    mfa_token: challenge.mfa_token,
+                    started,
+                });
+            }
+            return Ok(LoginStep::MfaRequired(prompt));
+        }
+    };
 
-    // Generate stable device fingerprint using user_id from auth response
-    let user_id = auth_resp.user_id.clone().unwrap_or_default();
+    let user_id = auth_resp.user_id.unwrap_or_default();
+    finish_sign_in(&ctx, &mut api, server_url, user_id, device_name).await?;
+    Ok(LoginStep::SignedIn)
+}
+
+/// Finishes the sign-in `setup_and_login` paused for a second factor, then sets up
+/// this device like a sign-in without one.
+#[tauri::command]
+pub async fn complete_mfa_login(
+    ctx: State<'_, AppContext>,
+    method: MfaMethod,
+    code: String,
+) -> Result<MfaLoginDone, MfaLoginError> {
+    let mut api = ctx.api.lock().await;
+    let (pending, verified) = verify_pending_mfa(&ctx, &mut api, method, code.trim()).await?;
+
+    // The ticket is used up, so a failure from here on needs a new sign-in
+    let user = api
+        .get_me()
+        .await
+        .map_err(|e| MfaLoginError::restart(format!("Failed to get user info: {e}")))?;
+    finish_sign_in(
+        &ctx,
+        &mut api,
+        pending.server_url,
+        user.id,
+        pending.device_name,
+    )
+    .await
+    .map_err(MfaLoginError::restart)?;
+
+    Ok(MfaLoginDone {
+        recovery_codes_remaining: verified.recovery_codes_remaining,
+    })
+}
+
+/// Forgets a sign-in waiting for its second factor.
+#[tauri::command]
+pub async fn cancel_mfa_login(ctx: State<'_, AppContext>) -> Result<(), String> {
+    ctx.pending_mfa.lock().await.take();
+    Ok(())
+}
+
+/// Sends the second factor of the paused sign-in. A ticket rejected because of a
+/// mistyped code stays pending for another try; otherwise it is used up.
+async fn verify_pending_mfa(
+    ctx: &AppContext,
+    api: &mut ApiClient,
+    method: MfaMethod,
+    code: &str,
+) -> Result<(PendingMfaLogin, MfaVerified), MfaLoginError> {
+    let pending = ctx
+        .take_pending_mfa(Instant::now())
+        .await
+        .ok_or_else(|| MfaLoginError::restart(MFA_SIGN_IN_EXPIRED))?;
+
+    *api = api_client(&pending.server_url, &ctx.config_dir);
+    match api.verify_mfa(&pending.mfa_token, method, code).await {
+        Ok(verified) => Ok((pending, verified)),
+        Err(e) => {
+            let error = MfaLoginError::from_api(&e);
+            if !error.restart {
+                *ctx.pending_mfa.lock().await = Some(pending);
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Registers this device for a freshly signed-in session and saves the account: the
+/// device key pair, the group key (once the device is approved), the tokens in secure
+/// storage and the config.
+async fn finish_sign_in(
+    ctx: &AppContext,
+    api: &mut ApiClient,
+    server_url: String,
+    user_id: String,
+    device_name: String,
+) -> Result<(), String> {
+    // Generate stable device fingerprint using the account's user_id
     let fingerprint = crate::fingerprint::generate_device_fingerprint(&user_id).ok();
 
     // Generate device key pair
@@ -243,7 +483,7 @@ pub async fn setup_and_login(
     // Setup group key (only if device is approved — first device auto-approves)
     let mut exchange = KeyExchange::new(kp);
     if device_status == "approved" {
-        setup_group_key(&mut exchange, &api, &device_id, &ctx.config_dir)
+        setup_group_key(&mut exchange, api, &device_id, &ctx.config_dir)
             .await
             .map_err(|e| format!("Key exchange failed: {e}"))?;
     }
@@ -1609,6 +1849,7 @@ pub async fn logout(
 
     // Forget the session in memory first, so no refresh can write it back to storage
     *ctx.api.lock().await = ApiClient::new(&AppConfig::default().server_url);
+    ctx.pending_mfa.lock().await.take();
 
     // Clear tokens from secure storage
     let token_store = TokenStore::new(&ctx.config_dir);
@@ -1846,7 +2087,33 @@ pub async fn check_social_status(server_url: String) -> Result<SocialStatus, Str
     })
 }
 
-/// Complete device setup using tokens obtained from OAuth (via PKCE exchange).
+/// Whether the server's web dashboard can hand a sign-in to the app ("Sign in with
+/// browser"). Servers with two-factor authentication publish public settings; older
+/// ones answer `/api/settings` with the dashboard's page.
+#[tauri::command]
+pub async fn check_browser_sign_in(server_url: String) -> Result<bool, String> {
+    let url = format!("{}/api/settings", server_url.trim_end_matches('/'));
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to reach server: {e}"))?;
+    if !resp.status().is_success() {
+        return Ok(false);
+    }
+    let body = resp.text().await.unwrap_or_default();
+    Ok(supports_browser_sign_in(&body))
+}
+
+/// Recognizes the public settings of a server with two-factor authentication.
+fn supports_browser_sign_in(settings: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(settings)
+        .is_ok_and(|v| v.get("mfa_required").is_some_and(|r| r.is_boolean()))
+}
+
+/// Complete device setup using tokens obtained from OAuth (via PKCE exchange), or from
+/// a sign-in on the web dashboard ("Sign in with browser").
 /// Reuses the device registration + group key flow from setup_and_login.
 #[tauri::command]
 pub async fn setup_with_oauth_tokens(
@@ -1863,72 +2130,17 @@ pub async fn setup_with_oauth_tokens(
     let mut api = ctx.api.lock().await;
     *api = api_client(&server_url, &ctx.config_dir);
     api.set_tokens(access_token, refresh_token);
+    // The browser finished the sign-in instead of the second-factor prompt
+    ctx.pending_mfa.lock().await.take();
 
     // Get user info to obtain user_id for fingerprinting
     let user_info = api
         .get_me()
         .await
         .map_err(|e| format!("Failed to get user info: {e}"))?;
-    let user_id = user_info.id.clone();
 
     let device_name = crate::fingerprint::auto_device_name();
-    let fingerprint = crate::fingerprint::generate_device_fingerprint(&user_id).ok();
-
-    // Generate device key pair
-    let key_path = AppConfig::key_path(&ctx.config_dir);
-    let kp =
-        KeyPair::load_or_generate(&key_path).map_err(|e| format!("Key generation failed: {e}"))?;
-    let pub_bytes = kp.public_key_bytes();
-    let sig = kp.sign_public_key();
-
-    // Register device with fingerprint
-    let reg_resp = api
-        .register_device(&device_name, pub_bytes, Some(sig), fingerprint)
-        .await
-        .map_err(|e| format!("Device registration failed: {e}"))?;
-
-    let device_id = reg_resp.device.id.clone();
-    let device_status = reg_resp.device.status.to_string();
-
-    // Setup group key (only if approved)
-    let mut exchange = KeyExchange::new(kp);
-    if device_status == "approved" {
-        setup_group_key(&mut exchange, &api, &device_id, &ctx.config_dir)
-            .await
-            .map_err(|e| format!("Key exchange failed: {e}"))?;
-    }
-
-    // Save tokens to secure storage
-    let token_store = TokenStore::new(&ctx.config_dir);
-    token_store
-        .save_tokens(
-            &api.access_token().unwrap_or_default(),
-            &api.refresh_token().unwrap_or_default(),
-        )
-        .map_err(|e| format!("Token save failed: {e}"))?;
-
-    // Save config
-    let mut config = ctx.config.write().await;
-    config.server_url = server_url;
-    config.user_id = user_id;
-    config.device_id = device_id;
-    config.device_name = device_name;
-    config.device_status = device_status;
-    config
-        .save(&ctx.config_dir)
-        .map_err(|e| format!("Config save failed: {e}"))?;
-
-    // Update state
-    *ctx.state.write().await = AppState::Disconnected;
-    *ctx.exchange.lock().await = Some(exchange);
-
-    // Initialize history
-    let db_path = ctx.config_dir.join("history.db");
-    if let Ok(h) = History::open(&db_path, 1000) {
-        *ctx.history.lock().await = Some(h);
-    }
-
-    Ok(())
+    finish_sign_in(&ctx, &mut api, server_url, user_info.id, device_name).await
 }
 
 #[derive(Serialize, serde::Deserialize)]
@@ -2184,5 +2396,276 @@ mod tests {
     #[test]
     fn encode_rgba_to_png_rejects_mismatched_buffer() {
         assert!(encode_rgba_to_png(&[0u8; 3], 2, 2).is_none());
+    }
+
+    // ---- two-factor sign-in ----------------------------------------------------
+
+    use crate::api::client::tests::serve;
+
+    fn context() -> (tempfile::TempDir, AppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(dir.path().to_path_buf());
+        (dir, ctx)
+    }
+
+    fn pending_login(server_url: &str, started: Instant) -> PendingMfaLogin {
+        PendingMfaLogin {
+            server_url: server_url.to_string(),
+            device_name: "Laptop".into(),
+            mfa_token: "ticket-1".into(),
+            started,
+        }
+    }
+
+    fn server_error(status: u16, code: Option<&str>, message: &str) -> ApiError {
+        ApiError::Server {
+            status,
+            code: code.map(str::to_string),
+            message: message.into(),
+        }
+    }
+
+    /// Why `verify_pending_mfa` turned down `code`.
+    async fn rejected(ctx: &AppContext, api: &mut ApiClient, code: &str) -> MfaLoginError {
+        match verify_pending_mfa(ctx, api, MfaMethod::Totp, code).await {
+            Ok(_) => panic!("{code} was accepted"),
+            Err(e) => e,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_paused_sign_in_is_used_once_and_expires_after_ten_minutes() {
+        let (_dir, ctx) = context();
+        let started = Instant::now();
+        let almost_expired = started + MFA_TICKET_TTL - Duration::from_secs(1);
+
+        *ctx.pending_mfa.lock().await = Some(pending_login("https://s", started));
+        assert!(ctx.take_pending_mfa(almost_expired).await.is_some());
+        assert!(
+            ctx.take_pending_mfa(almost_expired).await.is_none(),
+            "used once"
+        );
+
+        *ctx.pending_mfa.lock().await = Some(pending_login("https://s", started));
+        assert!(
+            ctx.take_pending_mfa(started + MFA_TICKET_TTL)
+                .await
+                .is_none()
+        );
+        assert!(
+            ctx.pending_mfa.lock().await.is_none(),
+            "an expired ticket is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mistyped_code_can_be_retried_but_a_lockout_ends_the_sign_in() {
+        let (base_url, log) = serve(vec![
+            (401, r#"{"error":"invalid authentication code"}"#),
+            (
+                429,
+                r#"{"error":"Too many failed attempts. Try again in 15 minutes.","code":"mfa_locked"}"#,
+            ),
+        ])
+        .await;
+        let (_dir, ctx) = context();
+        *ctx.pending_mfa.lock().await = Some(pending_login(&base_url, Instant::now()));
+        let mut api = ApiClient::new(&base_url);
+
+        let err = rejected(&ctx, &mut api, "000000").await;
+        assert_eq!(
+            err,
+            MfaLoginError {
+                message: "Invalid authentication code".into(),
+                restart: false,
+            }
+        );
+        assert!(
+            ctx.pending_mfa.lock().await.is_some(),
+            "kept for another try"
+        );
+
+        let err = rejected(&ctx, &mut api, "111111").await;
+        assert_eq!(
+            err,
+            MfaLoginError {
+                message: "Too many failed attempts. Try again in 15 minutes.".into(),
+                restart: true,
+            }
+        );
+        assert!(ctx.pending_mfa.lock().await.is_none());
+
+        // Nothing is left to send
+        let err = rejected(&ctx, &mut api, "222222").await;
+        assert_eq!(err, MfaLoginError::restart(MFA_SIGN_IN_EXPIRED));
+        assert_eq!(log.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_accepted_code_uses_up_the_ticket() {
+        let (base_url, log) = serve(vec![(
+            200,
+            r#"{"access_token":"access-1","refresh_token":"refresh-1","recovery_codes_remaining":9}"#,
+        )])
+        .await;
+        let (_dir, ctx) = context();
+        *ctx.pending_mfa.lock().await = Some(pending_login(&base_url, Instant::now()));
+        let mut api = ApiClient::new("https://elsewhere.example");
+
+        let (pending, verified) =
+            verify_pending_mfa(&ctx, &mut api, MfaMethod::Recovery, "abcd-efgh-ijkl-mnop")
+                .await
+                .unwrap();
+        assert_eq!(pending.server_url, base_url);
+        assert_eq!(pending.device_name, "Laptop");
+        assert_eq!(verified.recovery_codes_remaining, Some(9));
+        // The client now talks to the sign-in's server, with the new session
+        assert_eq!(api.access_token().as_deref(), Some("access-1"));
+        assert!(ctx.pending_mfa.lock().await.is_none());
+        assert_eq!(log.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_mfa_prompt_leaves_the_ticket_in_the_backend() {
+        let challenge = MfaChallenge {
+            message: "Two-factor authentication is required.".into(),
+            mfa_token: "ticket-1".into(),
+            stage: MfaStage::Verify,
+            methods: vec!["totp".into(), "recovery".into()],
+            email_code_required: false,
+            email_hint: None,
+            passkeys_available: true,
+        };
+        assert_eq!(
+            serde_json::to_value(LoginStep::MfaRequired(MfaPrompt::from(&challenge))).unwrap(),
+            serde_json::json!({
+                "status": "mfa_required",
+                "stage": "verify",
+                "methods": ["totp", "recovery"],
+                "email_code_required": false,
+                "email_hint": null,
+                "passkeys_available": true,
+                "message": "Two-factor authentication is required.",
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(LoginStep::SignedIn).unwrap(),
+            serde_json::json!({ "status": "signed_in" })
+        );
+
+        let enroll = MfaChallenge {
+            stage: MfaStage::Enroll,
+            email_code_required: true,
+            email_hint: Some("a***@example.com".into()),
+            ..challenge
+        };
+        let prompt = serde_json::to_value(MfaPrompt::from(&enroll)).unwrap();
+        assert_eq!(prompt["stage"], "enroll");
+        assert_eq!(prompt["email_code_required"], true);
+        assert_eq!(prompt["email_hint"], "a***@example.com");
+    }
+
+    #[test]
+    fn the_app_sends_codes_but_not_passkeys() {
+        assert_eq!(
+            serde_json::from_str::<MfaMethod>(r#""totp""#).unwrap(),
+            MfaMethod::Totp
+        );
+        assert_eq!(
+            serde_json::from_str::<MfaMethod>(r#""recovery""#).unwrap(),
+            MfaMethod::Recovery
+        );
+        assert!(serde_json::from_str::<MfaMethod>(r#""webauthn""#).is_err());
+    }
+
+    #[test]
+    fn mfa_errors_say_whether_the_sign_in_can_continue() {
+        for (error, message, restart) in [
+            (
+                server_error(401, None, "invalid authentication code"),
+                "Invalid authentication code",
+                false,
+            ),
+            (
+                server_error(401, None, "invalid recovery code"),
+                "Invalid recovery code",
+                false,
+            ),
+            (
+                server_error(429, None, "too many requests, please try again later"),
+                "Too many requests, please try again later",
+                false,
+            ),
+            (
+                server_error(
+                    429,
+                    Some("mfa_locked"),
+                    "Too many failed attempts. Try again in 15 minutes.",
+                ),
+                "Too many failed attempts. Try again in 15 minutes.",
+                true,
+            ),
+            (
+                server_error(403, Some("account_suspended"), "this account is suspended"),
+                "This account is suspended",
+                true,
+            ),
+            (
+                server_error(502, None, "<html>Bad Gateway</html>"),
+                "The server could not check the code (HTTP 502). Try again.",
+                false,
+            ),
+        ] {
+            assert_eq!(
+                MfaLoginError::from_api(&error),
+                MfaLoginError {
+                    message: message.into(),
+                    restart,
+                },
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn login_errors_show_structured_messages_alone() {
+        assert_eq!(
+            describe_api_error(&server_error(
+                403,
+                Some("account_suspended"),
+                "This account is suspended. Contact your administrator."
+            )),
+            "This account is suspended. Contact your administrator."
+        );
+        assert_eq!(
+            describe_api_error(&server_error(401, None, "invalid credentials")),
+            "Server error (401): invalid credentials"
+        );
+    }
+
+    #[test]
+    fn sentence_case_capitalizes_the_first_letter_only() {
+        assert_eq!(sentence_case("invalid code"), "Invalid code");
+        assert_eq!(sentence_case("Already. fine"), "Already. fine");
+        assert_eq!(sentence_case("élan"), "Élan");
+        assert_eq!(sentence_case(""), "");
+    }
+
+    #[test]
+    fn recognizes_servers_whose_dashboard_hands_sign_ins_to_the_app() {
+        assert!(supports_browser_sign_in(
+            r#"{"registration_open":true,"banner":null,"passkeys_available":true,"mfa_required":true}"#
+        ));
+        assert!(supports_browser_sign_in(r#"{"mfa_required":false}"#));
+        // Older servers answer with the dashboard's page
+        for older in [
+            "<!doctype html><html></html>",
+            "",
+            "{}",
+            "[]",
+            r#"{"mfa_required":"yes"}"#,
+        ] {
+            assert!(!supports_browser_sign_in(older), "{older}");
+        }
     }
 }

@@ -14,6 +14,19 @@ describe('Tauri command wrappers', () => {
 	it.each([
 		['getStatus', () => api.getStatus(), 'get_status', undefined],
 		['getAppState', () => api.getAppState(), 'get_app_state', undefined],
+		[
+			'completeMfaLogin (authenticator code)',
+			() => api.completeMfaLogin('totp', '123456'),
+			'complete_mfa_login',
+			{ method: 'totp', code: '123456' },
+		],
+		[
+			'completeMfaLogin (recovery code)',
+			() => api.completeMfaLogin('recovery', 'abcdefghijklmnop'),
+			'complete_mfa_login',
+			{ method: 'recovery', code: 'abcdefghijklmnop' },
+		],
+		['cancelMfaLogin', () => api.cancelMfaLogin(), 'cancel_mfa_login', undefined],
 		['connectToServer', () => api.connectToServer(), 'connect', undefined],
 		['disconnectFromServer', () => api.disconnectFromServer(), 'disconnect', undefined],
 		['getDevices', () => api.getDevices(), 'get_devices', undefined],
@@ -64,6 +77,12 @@ describe('Tauri command wrappers', () => {
 			'checkSocialStatus',
 			() => api.checkSocialStatus('https://s'),
 			'check_social_status',
+			{ serverUrl: 'https://s' },
+		],
+		[
+			'checkBrowserSignIn',
+			() => api.checkBrowserSignIn('https://s'),
+			'check_browser_sign_in',
 			{ serverUrl: 'https://s' },
 		],
 		[
@@ -130,6 +149,20 @@ describe('setupAndLogin', () => {
 			country: null,
 			mobile: null,
 		});
+	});
+
+	it('returns the second-factor prompt when the sign-in pauses', async () => {
+		const step = {
+			status: 'mfa_required',
+			stage: 'verify',
+			methods: ['totp', 'recovery'],
+			email_code_required: false,
+			email_hint: null,
+			passkeys_available: true,
+			message: 'Two-factor authentication is required.',
+		};
+		invoke.mockResolvedValueOnce(step);
+		await expect(api.setupAndLogin('https://s', 'alice', 'pw', false)).resolves.toEqual(step);
 	});
 });
 
