@@ -343,6 +343,9 @@ jobs:
         if: github.event_name == 'push' || inputs.publish_website
         env:
           CPMESH_URL: ${{ vars.CPMESH_URL || 'https://cpmesh.com' }}
+          # An API token with the releases:write scope (admin console → API tokens). The username and
+          # password are an optional fallback for servers without two-factor authentication.
+          CPMESH_ADMIN_TOKEN: ${{ secrets.CPMESH_ADMIN_TOKEN }}
           CPMESH_ADMIN_USERNAME: ${{ secrets.CPMESH_ADMIN_USERNAME }}
           CPMESH_ADMIN_PASSWORD: ${{ secrets.CPMESH_ADMIN_PASSWORD }}
         run: |
