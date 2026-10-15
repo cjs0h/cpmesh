@@ -44,6 +44,14 @@
     ],
     "shortDescription": "Encrypted clipboard sync across devices",
     "longDescription": "cpmesh is a self-hosted, end-to-end encrypted clipboard sync tool. Copy on one device, paste on another instantly.",
+    "linux": {
+      "deb": {
+        "desktopTemplate": "linux/cpmesh.desktop"
+      },
+      "rpm": {
+        "desktopTemplate": "linux/cpmesh.desktop"
+      }
+    },
     "windows": {
       "nsis": {
         "installMode": "currentUser"
