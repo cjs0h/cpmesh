@@ -148,8 +148,11 @@ async function publishWith(server, plan, options) {
 
 describe('buildPlan', () => {
   it('maps installers to website links and update targets', () => {
-    const plan = buildPlan(release('0.2.0', [...ALL_INSTALLERS('0.2.0'), 'SHA256SUMS.txt']));
+    const installers = ALL_INSTALLERS('0.2.0');
+    const signatures = installers.map((name) => `${name}.sig`);
+    const plan = buildPlan(release('0.2.0', [...installers, ...signatures, 'SHA256SUMS.txt']));
     assert.equal(plan.version, '0.2.0');
+    // Signatures are expected companions, not stray assets
     assert.deepEqual(plan.ignored, ['SHA256SUMS.txt']);
     assert.deepEqual(
       plan.releases.map((r) => [r.key, r.installer]),

@@ -1,11 +1,12 @@
 use axum::{
     extract::{ConnectInfo, Request, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
 use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DefaultKeyedStateStore};
 use serde_json::json;
+use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -27,23 +28,62 @@ pub struct AuthClaims {
     pub iat: u64,
 }
 
+/// A refused request; becomes a JSON error response.
+#[derive(Debug)]
+pub(crate) struct Rejection {
+    status: StatusCode,
+    message: Cow<'static, str>,
+}
+
+impl Rejection {
+    fn new(status: StatusCode, message: impl Into<Cow<'static, str>>) -> Self {
+        Rejection {
+            status,
+            message: message.into(),
+        }
+    }
+}
+
+impl IntoResponse for Rejection {
+    fn into_response(self) -> Response {
+        json_error(&self.message, self.status)
+    }
+}
+
 pub async fn auth_middleware(
     State(state): State<Arc<AppState>>,
     mut req: Request,
     next: Next,
 ) -> Response {
-    let token = extract_token(&req);
-    let token = match token {
-        Some(t) => t,
-        None => return json_error("missing authorization token", StatusCode::UNAUTHORIZED),
-    };
+    match authenticate(&state, req.headers()).await {
+        Ok(claims) => {
+            req.extensions_mut().insert(claims);
+            next.run(req).await
+        }
+        Err(rejection) => rejection.into_response(),
+    }
+}
 
-    let claims = match state.auth.validate_access_token(&token) {
-        Ok(c) => c,
-        Err(_) => return json_error("invalid or expired token", StatusCode::UNAUTHORIZED),
-    };
+/// Validates the request's bearer token and confirms the session is still valid.
+pub(crate) async fn authenticate(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthClaims, Rejection> {
+    let token = bearer_token(headers)
+        .ok_or_else(|| Rejection::new(StatusCode::UNAUTHORIZED, "missing authorization token"))?;
 
-    // Verify user still exists and check bulk revocation
+    let claims = state
+        .auth
+        .validate_access_token(&token)
+        .map_err(|_| Rejection::new(StatusCode::UNAUTHORIZED, "invalid or expired token"))?;
+
+    check_session(state, &claims).await?;
+    Ok(claims)
+}
+
+/// Confirms the user still exists and has not revoked all sessions since `claims`
+/// were issued.
+pub(crate) async fn check_session(state: &AppState, claims: &AuthClaims) -> Result<(), Rejection> {
     match state.db.get_user_by_id(claims.user_id).await {
         Ok(user) => {
             // Check if token was issued before bulk revocation
@@ -51,22 +91,18 @@ pub async fn auth_middleware(
                 && revoked_before > 0
                 && (claims.iat as i64) < revoked_before
             {
-                return json_error(
-                    "session has been revoked, please log in again",
+                return Err(Rejection::new(
                     StatusCode::UNAUTHORIZED,
-                );
+                    "session has been revoked, please log in again",
+                ));
             }
+            Ok(())
         }
-        Err(_) => {
-            return json_error(
-                "user no longer exists, please re-register or log in again",
-                StatusCode::UNAUTHORIZED,
-            );
-        }
+        Err(_) => Err(Rejection::new(
+            StatusCode::UNAUTHORIZED,
+            "user no longer exists, please re-register or log in again",
+        )),
     }
-
-    req.extensions_mut().insert(claims);
-    next.run(req).await
 }
 
 /// Middleware that requires the device to be in "approved" status.
@@ -81,24 +117,35 @@ pub async fn approved_device_middleware(
         None => return json_error("unauthorized", StatusCode::UNAUTHORIZED),
     };
 
+    if let Err(rejection) = require_approved_device(&state, &claims).await {
+        return rejection.into_response();
+    }
+
+    next.run(req).await
+}
+
+/// Sessions bound to a device may only proceed once that device is approved.
+pub(crate) async fn require_approved_device(
+    state: &AppState,
+    claims: &AuthClaims,
+) -> Result<(), Rejection> {
     if let Some(device_id) = claims.device_id {
         match state.db.get_device_status(device_id).await {
             Ok(status) if status == "approved" => {}
             Ok(status) => {
-                return json_error(
-                    &format!(
+                return Err(Rejection::new(
+                    StatusCode::FORBIDDEN,
+                    format!(
                         "device is not approved (status: {status}). Approval from another device is required."
                     ),
-                    StatusCode::FORBIDDEN,
-                );
+                ));
             }
             Err(_) => {
-                return json_error("device not found", StatusCode::NOT_FOUND);
+                return Err(Rejection::new(StatusCode::NOT_FOUND, "device not found"));
             }
         }
     }
-
-    next.run(req).await
+    Ok(())
 }
 
 pub async fn admin_middleware(
@@ -160,23 +207,12 @@ pub async fn security_headers(req: Request, next: Next) -> Response {
     response
 }
 
-fn extract_token(req: &Request) -> Option<String> {
-    // Check Authorization header
-    if let Some(auth) = req.headers().get(header::AUTHORIZATION)
-        && let Ok(auth_str) = auth.to_str()
-        && let Some(token) = auth_str.strip_prefix("Bearer ")
-    {
-        return Some(token.to_string());
-    }
-    // Check query param (for WebSocket)
-    if let Some(query) = req.uri().query() {
-        for pair in query.split('&') {
-            if let Some(token) = pair.strip_prefix("token=") {
-                return Some(token.to_string());
-            }
-        }
-    }
-    None
+/// Reads the bearer token from the Authorization header. Tokens are never accepted
+/// from the query string, where they would end up in proxy and access logs; browser
+/// WebSockets use a single-use ticket instead (see `websocket::ws_auth_middleware`).
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let auth = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    auth.strip_prefix("Bearer ").map(str::to_string)
 }
 
 /// Extract real client IP, respecting X-Forwarded-For when trust_proxy is true.
@@ -281,35 +317,36 @@ mod tests {
     }
 
     #[test]
-    fn extract_token_prefers_bearer_header_then_query() {
+    fn bearer_token_is_read_only_from_the_authorization_header() {
         let req = Request::builder()
             .uri("/ws?ticket=abc&token=from-query")
             .header(header::AUTHORIZATION, "Bearer from-header")
             .body(axum::body::Body::empty())
             .unwrap();
-        assert_eq!(extract_token(&req).as_deref(), Some("from-header"));
+        assert_eq!(bearer_token(req.headers()).as_deref(), Some("from-header"));
 
+        // Query-string tokens would leak into proxy and access logs
         let req = Request::builder()
             .uri("/ws?ticket=abc&token=from-query")
             .body(axum::body::Body::empty())
             .unwrap();
-        assert_eq!(extract_token(&req).as_deref(), Some("from-query"));
+        assert_eq!(bearer_token(req.headers()), None);
     }
 
     #[test]
-    fn extract_token_rejects_non_bearer_schemes_and_missing() {
+    fn bearer_token_rejects_non_bearer_schemes_and_missing() {
         let req = Request::builder()
             .uri("/api/me")
             .header(header::AUTHORIZATION, "Basic dXNlcjpwdw==")
             .body(axum::body::Body::empty())
             .unwrap();
-        assert_eq!(extract_token(&req), None);
+        assert_eq!(bearer_token(req.headers()), None);
 
         let req = Request::builder()
             .uri("/api/me?other=1")
             .body(axum::body::Body::empty())
             .unwrap();
-        assert_eq!(extract_token(&req), None);
+        assert_eq!(bearer_token(req.headers()), None);
 
         // "Bearer" without a space is not a bearer token
         let req = Request::builder()
@@ -317,7 +354,7 @@ mod tests {
             .header(header::AUTHORIZATION, "Bearertoken")
             .body(axum::body::Body::empty())
             .unwrap();
-        assert_eq!(extract_token(&req), None);
+        assert_eq!(bearer_token(req.headers()), None);
     }
 
     #[test]

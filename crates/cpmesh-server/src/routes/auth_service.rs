@@ -4,7 +4,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
@@ -32,14 +32,39 @@ struct PublicKeyEntry {
     decoding_key: DecodingKey,
 }
 
-/// Result of validating a refresh token.
+/// Result of validating a refresh token. Single use is enforced separately by
+/// [`AuthService::consume_refresh_token`].
 pub enum RefreshResult {
     /// Valid token: (claims, jti, exp)
     Ok(AuthClaims, String, u64),
-    /// Token was already revoked — possible theft
-    Reused(uuid::Uuid),
     /// Token is invalid (expired, bad signature, wrong type, etc.)
     Invalid(String),
+}
+
+/// Outcome of recording a refresh token use.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RefreshTokenUse {
+    /// First use: the caller may issue a new token pair.
+    First,
+    /// Already used moments ago, typically by a concurrent request from the same
+    /// client (e.g. two processes sharing a session). Not treated as theft.
+    Concurrent,
+    /// Used or revoked earlier: treat as token theft.
+    Reused,
+}
+
+/// How long a second use of a refresh token counts as a benign race rather than theft.
+const REFRESH_REUSE_GRACE: Duration = Duration::from_secs(10);
+
+/// How long revocations are kept after the token expires. Must exceed the leeway
+/// token validation allows on `exp` (60 seconds by default).
+const REVOCATION_RETENTION_MARGIN: Duration = Duration::from_secs(300);
+
+/// A revoked or consumed token in the in-memory cache.
+#[derive(Clone, Copy)]
+struct Revocation {
+    expires_at: u64,
+    revoked_at: u64,
 }
 
 pub struct AuthService {
@@ -48,7 +73,8 @@ pub struct AuthService {
     public_keys: Vec<PublicKeyEntry>,
     access_expiry: Duration,
     refresh_expiry: Duration,
-    revoked: RwLock<HashMap<String, u64>>, // L1 cache: jti -> expires_at
+    refresh_reuse_grace: Duration,
+    revoked: Arc<RwLock<HashMap<String, Revocation>>>, // L1 cache keyed by jti
     pool: Option<PgPool>,
 }
 
@@ -77,9 +103,16 @@ impl AuthService {
             public_keys,
             access_expiry: Duration::from_secs(3600), // 1 hour
             refresh_expiry: Duration::from_secs(7 * 24 * 3600), // 7 days
-            revoked: RwLock::new(HashMap::new()),
+            refresh_reuse_grace: REFRESH_REUSE_GRACE,
+            revoked: Arc::new(RwLock::new(HashMap::new())),
             pool,
         })
+    }
+
+    /// Overrides the window in which a repeated refresh token use counts as a benign race.
+    pub fn with_refresh_reuse_grace(mut self, grace: Duration) -> Self {
+        self.refresh_reuse_grace = grace;
+        self
     }
 
     pub fn hash_password(&self, password: &str) -> Result<String, String> {
@@ -119,11 +152,17 @@ impl AuthService {
         encode(&header, &claims, &self.encoding_key).map_err(|e| format!("encode token: {e}"))
     }
 
-    pub fn generate_refresh_token(&self, user_id: uuid::Uuid) -> Result<String, String> {
+    /// Issues a refresh token. A device-bound token keeps every token refreshed
+    /// from it bound to the same device.
+    pub fn generate_refresh_token(
+        &self,
+        user_id: uuid::Uuid,
+        device_id: Option<uuid::Uuid>,
+    ) -> Result<String, String> {
         let now = now_secs();
         let claims = Claims {
             user_id: user_id.to_string(),
-            device_id: None,
+            device_id: device_id.map(|d| d.to_string()),
             exp: now + self.refresh_expiry.as_secs(),
             iat: now,
             jti: generate_jti(),
@@ -198,8 +237,8 @@ impl AuthService {
         })
     }
 
-    /// Validate a refresh token. Returns the claims, JTI, and expiry on success.
-    /// Returns `RefreshResult::Reused` if the token was already revoked (theft detection).
+    /// Validate a refresh token's signature, expiry and type. Returns the claims, JTI,
+    /// and expiry on success. Reuse is detected by [`Self::consume_refresh_token`].
     pub fn validate_refresh_token(&self, token: &str) -> RefreshResult {
         let decoding_key = match self.decoding_key_for_token(token) {
             Ok(k) => k,
@@ -218,15 +257,9 @@ impl AuthService {
             return RefreshResult::Invalid("not a refresh token".to_string());
         }
 
-        // Check revocation — if revoked, this is a reuse (theft detection)
-        if !data.claims.jti.is_empty() {
-            let revoked = self.revoked.read().expect("revoked RwLock poisoned");
-            if revoked.contains_key(&data.claims.jti) {
-                if let Ok(uid) = uuid::Uuid::parse_str(&data.claims.user_id) {
-                    return RefreshResult::Reused(uid);
-                }
-                return RefreshResult::Invalid("token has been revoked".to_string());
-            }
+        // Single use is tracked by JTI, so a refresh token without one cannot be accepted
+        if data.claims.jti.is_empty() {
+            return RefreshResult::Invalid("refresh token has no jti".to_string());
         }
 
         let user_id = match uuid::Uuid::parse_str(&data.claims.user_id) {
@@ -254,12 +287,99 @@ impl AuthService {
         self.validate_access_token(token)
     }
 
+    /// Records that a refresh token has been used, atomically, before new tokens are
+    /// issued for it. With a database the `revoked_tokens` primary key decides, so
+    /// concurrent requests and other server instances cannot both succeed.
+    pub async fn consume_refresh_token(
+        &self,
+        jti: &str,
+        user_id: uuid::Uuid,
+        expires_at: u64,
+    ) -> Result<RefreshTokenUse, String> {
+        let now = now_secs();
+        let cached = self
+            .revoked
+            .read()
+            .expect("revoked RwLock poisoned")
+            .get(jti)
+            .copied();
+        if let Some(r) = cached {
+            return Ok(self.classify_reuse(now, r.revoked_at));
+        }
+
+        let Some(ref pool) = self.pool else {
+            // No database (tests): the cache decides, under its write lock.
+            let mut revoked = self.revoked.write().expect("revoked RwLock poisoned");
+            if let Some(r) = revoked.get(jti) {
+                return Ok(self.classify_reuse(now, r.revoked_at));
+            }
+            revoked.insert(
+                jti.to_string(),
+                Revocation {
+                    expires_at,
+                    revoked_at: now,
+                },
+            );
+            return Ok(RefreshTokenUse::First);
+        };
+
+        let inserted = sqlx::query(
+            "INSERT INTO revoked_tokens (jti, user_id, expires_at) VALUES ($1, $2, $3) ON CONFLICT (jti) DO NOTHING",
+        )
+        .bind(jti)
+        .bind(user_id)
+        .bind(expires_at as i64)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("record refresh token use: {e}"))?
+        .rows_affected()
+            == 1;
+        if inserted {
+            let mut revoked = self.revoked.write().expect("revoked RwLock poisoned");
+            revoked.insert(
+                jti.to_string(),
+                Revocation {
+                    expires_at,
+                    revoked_at: now,
+                },
+            );
+            return Ok(RefreshTokenUse::First);
+        }
+
+        let recent: Option<(bool,)> = sqlx::query_as(
+            "SELECT COALESCE(revoked_at > NOW() - make_interval(secs => $2), FALSE) FROM revoked_tokens WHERE jti = $1",
+        )
+        .bind(jti)
+        .bind(self.refresh_reuse_grace.as_secs_f64())
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("look up refresh token use: {e}"))?;
+        Ok(match recent {
+            Some((true,)) => RefreshTokenUse::Concurrent,
+            _ => RefreshTokenUse::Reused,
+        })
+    }
+
+    fn classify_reuse(&self, now: u64, revoked_at: u64) -> RefreshTokenUse {
+        if now.saturating_sub(revoked_at) < self.refresh_reuse_grace.as_secs() {
+            RefreshTokenUse::Concurrent
+        } else {
+            RefreshTokenUse::Reused
+        }
+    }
+
     /// Revoke a token by JTI. Persists to DB if pool is available.
     pub fn revoke_token(&self, jti: &str, user_id: uuid::Uuid, expires_at: u64) {
         // L1: in-memory
         {
             let mut revoked = self.revoked.write().expect("revoked RwLock poisoned");
-            revoked.insert(jti.to_string(), expires_at);
+            revoked.insert(
+                jti.to_string(),
+                Revocation {
+                    expires_at,
+                    revoked_at: now_secs(),
+                },
+            );
         }
 
         // L2: persist to DB (fire-and-forget)
@@ -294,24 +414,37 @@ impl AuthService {
             if let Some((expires_at,)) = row {
                 // Promote to L1 cache
                 let mut revoked = self.revoked.write().expect("revoked RwLock poisoned");
-                revoked.insert(jti.to_string(), expires_at as u64);
+                revoked.insert(
+                    jti.to_string(),
+                    Revocation {
+                        expires_at: expires_at as u64,
+                        revoked_at: now_secs(),
+                    },
+                );
                 return true;
             }
         }
         false
     }
 
-    /// Spawn a background task that cleans up expired revoked tokens.
+    /// Spawn a background task that drops expired entries from the revocation table
+    /// and from this instance's cache.
     pub fn start_cleanup(&self) {
         if let Some(ref pool) = self.pool {
             let pool = pool.clone();
+            let revoked = self.revoked.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(60));
                 loop {
                     interval.tick().await;
-                    let now = now_secs() as i64;
+                    // Keep entries a while past expiry: token validation allows clock leeway
+                    let cutoff = now_secs().saturating_sub(REVOCATION_RETENTION_MARGIN.as_secs());
+                    revoked
+                        .write()
+                        .expect("revoked RwLock poisoned")
+                        .retain(|_, r| r.expires_at >= cutoff);
                     let _ = sqlx::query("DELETE FROM revoked_tokens WHERE expires_at < $1")
-                        .bind(now)
+                        .bind(cutoff as i64)
                         .execute(&pool)
                         .await;
                 }
@@ -450,7 +583,7 @@ mod tests {
     fn refresh_token_cannot_be_used_as_access_token_and_vice_versa() {
         let svc = test_auth_service();
         let user = uid();
-        let refresh = svc.generate_refresh_token(user).unwrap();
+        let refresh = svc.generate_refresh_token(user, None).unwrap();
         let access = svc.generate_access_token(user, None).unwrap();
 
         let err = svc.validate_access_token(&refresh).unwrap_err();
@@ -463,10 +596,10 @@ mod tests {
     }
 
     #[test]
-    fn refresh_token_validates_and_detects_reuse() {
+    fn refresh_token_validates() {
         let svc = test_auth_service();
         let user = uid();
-        let token = svc.generate_refresh_token(user).unwrap();
+        let token = svc.generate_refresh_token(user, None).unwrap();
 
         let (claims, jti, exp) = match svc.validate_refresh_token(&token) {
             RefreshResult::Ok(c, jti, exp) => (c, jti, exp),
@@ -474,14 +607,74 @@ mod tests {
         };
         assert_eq!(claims.user_id, user);
         assert!(claims.device_id.is_none());
+        assert_eq!(jti.len(), 32);
         assert!(exp > now_secs() + 6 * 24 * 3600, "7 day expiry");
+    }
 
-        // Rotation revokes the old token; presenting it again is theft detection
-        svc.revoke_token(&jti, user, exp);
+    #[test]
+    fn device_bound_refresh_token_carries_the_device() {
+        let svc = test_auth_service();
+        let (user, device) = (uid(), uid());
+        let token = svc.generate_refresh_token(user, Some(device)).unwrap();
         match svc.validate_refresh_token(&token) {
-            RefreshResult::Reused(u) => assert_eq!(u, user),
-            _ => panic!("revoked refresh token was not flagged as reused"),
+            RefreshResult::Ok(c, _, _) => {
+                assert_eq!(c.user_id, user);
+                assert_eq!(c.device_id, Some(device));
+            }
+            _ => panic!("device-bound refresh token rejected"),
         }
+    }
+
+    #[tokio::test]
+    async fn refresh_token_is_single_use() {
+        let svc = test_auth_service();
+        let user = uid();
+        let token = svc.generate_refresh_token(user, None).unwrap();
+        let RefreshResult::Ok(_, jti, exp) = svc.validate_refresh_token(&token) else {
+            panic!("fresh refresh token rejected");
+        };
+
+        assert_eq!(
+            svc.consume_refresh_token(&jti, user, exp).await.unwrap(),
+            RefreshTokenUse::First
+        );
+        // A second use within the grace window is a race between the client's own requests
+        assert_eq!(
+            svc.consume_refresh_token(&jti, user, exp).await.unwrap(),
+            RefreshTokenUse::Concurrent
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_token_reuse_after_grace_is_theft() {
+        let svc = test_auth_service().with_refresh_reuse_grace(Duration::ZERO);
+        let user = uid();
+        let token = svc.generate_refresh_token(user, None).unwrap();
+        let RefreshResult::Ok(_, jti, exp) = svc.validate_refresh_token(&token) else {
+            panic!("fresh refresh token rejected");
+        };
+
+        assert_eq!(
+            svc.consume_refresh_token(&jti, user, exp).await.unwrap(),
+            RefreshTokenUse::First
+        );
+        assert_eq!(
+            svc.consume_refresh_token(&jti, user, exp).await.unwrap(),
+            RefreshTokenUse::Reused
+        );
+    }
+
+    #[tokio::test]
+    async fn revoked_refresh_token_counts_as_reused() {
+        let svc = test_auth_service().with_refresh_reuse_grace(Duration::ZERO);
+        let user = uid();
+        svc.revoke_token("revoked-jti", user, now_secs() + 60);
+        assert_eq!(
+            svc.consume_refresh_token("revoked-jti", user, now_secs() + 60)
+                .await
+                .unwrap(),
+            RefreshTokenUse::Reused
+        );
     }
 
     #[test]

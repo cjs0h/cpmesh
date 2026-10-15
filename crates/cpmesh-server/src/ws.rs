@@ -13,8 +13,15 @@ pub type DeviceId = String;
 
 pub struct Client {
     pub user_id: String,
+    /// The device ID, or a per-connection ID for browser sessions.
     pub device_id: String,
     pub device_name: String,
+    /// Identifies this connection, so cleanup of a stale connection cannot remove a
+    /// newer connection of the same device.
+    pub conn_id: uuid::Uuid,
+    /// Whether the user's other devices are told when this client goes on- or offline.
+    /// True for devices, false for browser sessions.
+    pub announce: bool,
     pub tx: mpsc::UnboundedSender<String>,
 }
 
@@ -32,6 +39,7 @@ impl Hub {
         let user_id = client.user_id.clone();
         let device_id = client.device_id.clone();
         let device_name = client.device_name.clone();
+        let announce = client.announce;
 
         let mut clients = self.clients.write().await;
         clients
@@ -40,34 +48,54 @@ impl Hub {
             .insert(device_id.clone(), client);
         drop(clients);
 
-        // Notify other devices
-        let msg = WsMessage {
-            msg_type: MSG_DEVICE_STATUS.to_string(),
-            payload: json!(DeviceStatusPayload {
-                device_id: device_id.clone(),
-                device_name,
-                online: true,
-            }),
-        };
-        self.broadcast_to_user(&user_id, &device_id, &msg).await;
+        if announce {
+            self.broadcast_device_status(&user_id, &device_id, &device_name, true)
+                .await;
+        }
     }
 
-    pub async fn remove(&self, user_id: &str, device_id: &str, device_name: &str) {
-        let mut clients = self.clients.write().await;
-        if let Some(user_clients) = clients.get_mut(user_id) {
-            user_clients.remove(device_id);
+    /// Removes connection `conn_id` of `device_id`. Does nothing if the device has
+    /// reconnected since, so the newer connection keeps receiving messages.
+    pub async fn remove(&self, user_id: &str, device_id: &str, conn_id: uuid::Uuid) {
+        let removed = {
+            let mut clients = self.clients.write().await;
+            let Some(user_clients) = clients.get_mut(user_id) else {
+                return;
+            };
+            if user_clients
+                .get(device_id)
+                .is_none_or(|c| c.conn_id != conn_id)
+            {
+                return;
+            }
+            let removed = user_clients.remove(device_id);
             if user_clients.is_empty() {
                 clients.remove(user_id);
             }
-        }
-        drop(clients);
+            removed
+        };
 
+        if let Some(client) = removed
+            && client.announce
+        {
+            self.broadcast_device_status(user_id, device_id, &client.device_name, false)
+                .await;
+        }
+    }
+
+    async fn broadcast_device_status(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        device_name: &str,
+        online: bool,
+    ) {
         let msg = WsMessage {
             msg_type: MSG_DEVICE_STATUS.to_string(),
             payload: json!(DeviceStatusPayload {
                 device_id: device_id.to_string(),
                 device_name: device_name.to_string(),
-                online: false,
+                online,
             }),
         };
         self.broadcast_to_user(user_id, device_id, &msg).await;
@@ -129,6 +157,8 @@ mod tests {
                 user_id: user.to_string(),
                 device_id: device.to_string(),
                 device_name: format!("{device}-name"),
+                conn_id: uuid::Uuid::new_v4(),
+                announce: true,
                 tx,
             },
             rx,
@@ -169,20 +199,22 @@ mod tests {
         let hub = Hub::new();
         let (a, mut rx_a) = client("u1", "a");
         let (b, _rx_b) = client("u1", "b");
+        let (conn_a, conn_b) = (a.conn_id, b.conn_id);
         hub.register(a).await;
         hub.register(b).await;
         let _ = rx_a.try_recv(); // b came online
         assert_eq!(hub.user_connection_count("u1").await, 2);
 
-        hub.remove("u1", "b", "b-name").await;
+        hub.remove("u1", "b", conn_b).await;
         let msg = parse(rx_a.try_recv().unwrap());
         let payload: DeviceStatusPayload = serde_json::from_value(msg.payload).unwrap();
         assert_eq!(payload.device_id, "b");
+        assert_eq!(payload.device_name, "b-name");
         assert!(!payload.online);
         assert!(!hub.is_device_online("u1", "b").await);
         assert!(hub.is_device_online("u1", "a").await);
 
-        hub.remove("u1", "a", "a-name").await;
+        hub.remove("u1", "a", conn_a).await;
         assert_eq!(hub.user_connection_count("u1").await, 0);
         assert_eq!(hub.total_connections().await, 0);
         assert!(
@@ -191,7 +223,65 @@ mod tests {
         );
 
         // Removing something unknown is harmless
-        hub.remove("nobody", "nothing", "n").await;
+        hub.remove("nobody", "nothing", uuid::Uuid::new_v4()).await;
+    }
+
+    #[tokio::test]
+    async fn stale_connection_cleanup_keeps_the_newer_connection() {
+        let hub = Hub::new();
+        let (watcher, mut rx_watcher) = client("u1", "w");
+        let (old, _rx_old) = client("u1", "a");
+        let (new, mut rx_new) = client("u1", "a");
+        let old_conn = old.conn_id;
+        hub.register(watcher).await;
+        hub.register(old).await;
+        // The device reconnects before the server notices its old connection died
+        hub.register(new).await;
+        while rx_watcher.try_recv().is_ok() {}
+
+        hub.remove("u1", "a", old_conn).await;
+        assert!(hub.is_device_online("u1", "a").await);
+        assert!(
+            matches!(rx_watcher.try_recv(), Err(TryRecvError::Empty)),
+            "no offline notice for a device that is still connected"
+        );
+
+        let msg = WsMessage {
+            msg_type: MSG_CLIPBOARD_NEW.to_string(),
+            payload: json!({"entry": {"id": "e1"}}),
+        };
+        hub.broadcast_to_user("u1", "w", &msg).await;
+        assert_eq!(
+            parse(rx_new.try_recv().unwrap()).payload["entry"]["id"],
+            "e1"
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_sessions_are_not_announced_as_devices() {
+        let hub = Hub::new();
+        let (device, mut rx_device) = client("u1", "a");
+        let (mut browser, mut rx_browser) = client("u1", "web-1");
+        browser.announce = false;
+        let browser_conn = browser.conn_id;
+        hub.register(device).await;
+        hub.register(browser).await;
+        assert!(matches!(rx_device.try_recv(), Err(TryRecvError::Empty)));
+
+        // The browser still receives the user's broadcasts
+        let msg = WsMessage {
+            msg_type: MSG_CLIPBOARD_NEW.to_string(),
+            payload: json!({"entry": {"id": "e1"}}),
+        };
+        hub.broadcast_to_user("u1", "a", &msg).await;
+        assert_eq!(
+            parse(rx_browser.try_recv().unwrap()).payload["entry"]["id"],
+            "e1"
+        );
+
+        hub.remove("u1", "web-1", browser_conn).await;
+        assert!(matches!(rx_device.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(hub.user_connection_count("u1").await, 1);
     }
 
     #[tokio::test]

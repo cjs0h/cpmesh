@@ -220,6 +220,12 @@ jobs:
           MACOS_SIGNED: ${{ matrix.platform == 'macos' && secrets.APPLE_CERTIFICATE != '' }}
         run: bash scripts/release/collect-desktop.sh "$PLATFORM" "$TARGET" "$VERSION" dist
 
+      - name: Sign installers for the in-app updater
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: bash scripts/release/sign-installers.sh "$VERSION" dist
+
       - name: Upload to the release
         env:
           GH_TOKEN: ${{ github.token }}

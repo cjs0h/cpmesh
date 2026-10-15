@@ -171,12 +171,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/clipboard/{id}",
             axum::routing::delete(clipboard::handle_delete_clipboard_entry),
         )
-        // WebSocket
+        // Single-use ticket for browser WebSockets
         .route(
             "/api/ws/ticket",
             axum::routing::post(websocket::handle_ws_ticket),
         )
-        .route("/ws", axum::routing::get(websocket::handle_ws_upgrade))
         .route_layer(axum_mw::from_fn_with_state(
             state.clone(),
             middleware::approved_device_middleware,
@@ -184,6 +183,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route_layer(axum_mw::from_fn_with_state(
             state.clone(),
             middleware::auth_middleware,
+        ));
+
+    // WebSocket: authenticated by a bearer token or a single-use ticket
+    let websocket = Router::new()
+        .route("/ws", axum::routing::get(websocket::handle_ws_upgrade))
+        .route_layer(axum_mw::from_fn_with_state(
+            state.clone(),
+            websocket::ws_auth_middleware,
         ));
 
     // Admin routes (protected + admin check)
@@ -269,6 +276,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(public)
         .merge(protected_any_device)
         .merge(protected_approved)
+        .merge(websocket)
         .merge(admin_routes)
         .fallback(spa_handler)
         .layer(axum_mw::from_fn(middleware::security_headers))

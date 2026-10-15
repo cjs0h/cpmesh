@@ -49,7 +49,7 @@ async fn protected_routes_reject_invalid_tokens() {
     let app = test_router(state.clone());
     let refresh = state
         .auth
-        .generate_refresh_token(uuid::Uuid::new_v4())
+        .generate_refresh_token(uuid::Uuid::new_v4(), None)
         .unwrap();
     let resp = send(
         &app,
@@ -91,18 +91,88 @@ async fn valid_token_for_unknown_user_is_unauthorized() {
 }
 
 #[tokio::test]
-async fn websocket_token_may_come_from_query_string() {
+async fn tokens_in_the_query_string_are_not_accepted() {
+    let state = test_state(test_config()).await;
+    let app = test_router(state.clone());
+    let token = state
+        .auth
+        .generate_access_token(uuid::Uuid::new_v4(), None)
+        .unwrap();
+    for path in [
+        format!("/ws?token={token}"),
+        format!("/api/me?token={token}"),
+    ] {
+        let resp = send(&app, request("GET", &path).body(Body::empty()).unwrap()).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{path}");
+        assert_eq!(
+            body_json(resp).await["error"],
+            "missing authorization token",
+            "{path}"
+        );
+    }
+}
+
+/// A web dashboard session: signed in, but not bound to a device.
+fn browser_session() -> crate::routes::middleware::AuthClaims {
+    crate::routes::middleware::AuthClaims {
+        user_id: uuid::Uuid::new_v4(),
+        device_id: None,
+        iat: 0,
+    }
+}
+
+/// A WebSocket upgrade request (as a browser sends it) for `uri`.
+fn ws_upgrade(uri: &str) -> axum::http::Request<Body> {
+    request("GET", uri)
+        .header(header::CONNECTION, "upgrade")
+        .header(header::UPGRADE, "websocket")
+        .header(header::SEC_WEBSOCKET_VERSION, "13")
+        .header(header::SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==")
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn websocket_ticket_replaces_the_bearer_token_and_is_single_use() {
     let app = test_router(test_state(test_config()).await);
-    let resp = send(
-        &app,
-        request("GET", "/ws?token=garbage")
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-    // Token was found (not "missing") but is invalid
+    let ticket =
+        crate::routes::websocket::issue_ticket(browser_session(), client_addr().ip()).await;
+
+    // The ticket stands in for the bearer token: the request gets past ticket
+    // validation to the session check, which fails here only because the test
+    // state has no database.
+    let resp = send(&app, ws_upgrade(&format!("/ws?ticket={ticket}"))).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(body_json(resp).await["error"], "invalid or expired token");
+    assert!(
+        body_json(resp).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("user no longer exists")
+    );
+
+    // Tickets are single-use
+    let resp = send(&app, ws_upgrade(&format!("/ws?ticket={ticket}"))).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(resp).await["error"], "invalid or expired ticket");
+}
+
+#[tokio::test]
+async fn websocket_ticket_is_bound_to_the_requesting_address() {
+    let app = test_router(test_state(test_config()).await);
+    let other_ip = "198.51.100.7".parse().unwrap();
+    let ticket = crate::routes::websocket::issue_ticket(browser_session(), other_ip).await;
+
+    let resp = send(&app, ws_upgrade(&format!("/ws?ticket={ticket}"))).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(resp).await["error"], "invalid or expired ticket");
+}
+
+#[tokio::test]
+async fn websocket_rejects_unknown_tickets() {
+    let app = test_router(test_state(test_config()).await);
+    let resp = send(&app, ws_upgrade("/ws?ticket=deadbeef")).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(resp).await["error"], "invalid or expired ticket");
 }
 
 #[tokio::test]

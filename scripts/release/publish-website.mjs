@@ -70,6 +70,8 @@ export function buildPlan(release, { notes = '' } = {}) {
   const installers = [];
   const ignored = [];
   for (const asset of release.assets ?? []) {
+    // Updater signatures sit next to their installers; the apps fetch them from there
+    if (asset.name.endsWith('.sig')) continue;
     const match = ASSET_RE.exec(asset.name);
     if (!match) {
       ignored.push(asset.name);

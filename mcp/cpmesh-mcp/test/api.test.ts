@@ -169,6 +169,42 @@ describe("CpmeshApi", () => {
     expect(api.refresh).toBe("rt-rotated");
   });
 
+  it("adopts the pair another process saved when the server reports a concurrent refresh", async () => {
+    mockFetch((url, init) => {
+      if (url.endsWith("/api/auth/refresh")) return { status: 409, body: { error: "refresh token already used" } };
+      const auth = (init?.headers as Record<string, string>).Authorization;
+      return auth === "Bearer theirs" ? { status: 200, body: [] } : { status: 401, body: { error: "expired" } };
+    });
+    const api = new CpmeshApi("https://srv");
+    api.setTokens("mine", "rt-spent");
+    let loads = 0;
+    // Nothing newer is saved when the refresh starts; the other process saves just after
+    api.tokenStore = {
+      load: () => (++loads === 1 ? { access: "mine", refresh: "rt-spent" } : { access: "theirs", refresh: "rt-rotated" }),
+      save: vi.fn(),
+    };
+    await expect(api.getDevices()).resolves.toEqual([]);
+    expect(api.refresh).toBe("rt-rotated");
+  });
+
+  it("never presents a refresh token again after the server reports it already used", async () => {
+    let refreshCalls = 0;
+    mockFetch((url) => {
+      if (url.endsWith("/api/auth/refresh")) {
+        refreshCalls++;
+        return { status: 409, body: { error: "refresh token already used" } };
+      }
+      return { status: 401, body: { error: "expired" } };
+    });
+    const api = new CpmeshApi("https://srv");
+    api.setTokens("mine", "rt-spent");
+    api.tokenStore = { load: () => ({ access: "mine", refresh: "rt-spent" }), save: vi.fn() };
+    await expect(api.getDevices()).rejects.toThrow(SessionExpiredError);
+    await expect(api.getDevices()).rejects.toThrow(SessionExpiredError);
+    expect(refreshCalls).toBe(1);
+    expect(api.refresh).toBeNull();
+  });
+
   it("keeps the rotated refresh token when re-binding fails and drops the unbound access token", async () => {
     mockFetch((url) =>
       url.endsWith("/api/auth/refresh")
