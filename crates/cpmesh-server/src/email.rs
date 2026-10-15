@@ -130,6 +130,66 @@ impl EmailService {
         self.send_html(to_email, subject, &body)
     }
 
+    /// Sends the code that confirms an account before it sets up two-factor
+    /// authentication. Unlike notices, this fails when SMTP is not configured.
+    pub fn send_mfa_email_code(
+        &self,
+        to_email: &str,
+        name: &str,
+        code: &str,
+    ) -> Result<(), String> {
+        if !self.is_configured() {
+            return Err("SMTP not configured".to_string());
+        }
+        let body = format!(
+            r#"<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+  <h1 style="font-size: 20px;">cpmesh</h1>
+  <p>Hi {name},</p>
+  <p>Use this code to confirm it's you and set up two-factor authentication:</p>
+  <p style="font-size: 28px; font-weight: bold; letter-spacing: 6px; font-family: monospace;">{code}</p>
+  <p style="color: #666; font-size: 14px;">The code expires in 10 minutes.</p>
+  <hr style="border: none; border-top: 1px solid #eee; margin: 30px 0;">
+  <p style="color: #999; font-size: 12px;">If you did not just sign in to cpmesh, someone knows your password. Change it now.</p>
+</body>
+</html>"#,
+            name = escape_html(name),
+            code = escape_html(code),
+        );
+        self.send_html(to_email, "Your cpmesh confirmation code", &body)
+    }
+
+    /// Tells a user about a change to their account's security (2FA, sessions, status).
+    pub fn send_security_notice(
+        &self,
+        to_email: &str,
+        name: &str,
+        subject: &str,
+        message: &str,
+    ) -> Result<(), String> {
+        if !self.is_configured() {
+            return Ok(());
+        }
+        let body = format!(
+            r#"<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+  <h1 style="font-size: 20px;">cpmesh</h1>
+  <p>Hi {name},</p>
+  <p>{message}</p>
+  <hr style="border: none; border-top: 1px solid #eee; margin: 30px 0;">
+  <p style="color: #999; font-size: 12px;">If this wasn't you, change your password and contact your administrator.</p>
+</body>
+</html>"#,
+            name = escape_html(name),
+            message = escape_html(message),
+        );
+        self.send_html(to_email, &format!("{subject} - cpmesh"), &body)
+    }
+
     fn send_html(&self, to: &str, subject: &str, html_body: &str) -> Result<(), String> {
         use lettre::message::header::ContentType;
         use lettre::transport::smtp::authentication::Credentials;
@@ -169,9 +229,25 @@ impl EmailService {
         };
 
         mailer.send(&email).map_err(|e| format!("SMTP send: {e}"))?;
-        info!("Verification email sent to {to}");
+        info!("Email \"{subject}\" sent to {to}");
         Ok(())
     }
+}
+
+/// Escapes text for HTML element content.
+fn escape_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -245,6 +321,28 @@ mod tests {
             .test_connection("a@example.com")
             .unwrap_err();
         assert!(err.contains("not configured"), "{err}");
+    }
+
+    #[test]
+    fn security_emails_without_configuration() {
+        let svc = EmailService::disabled();
+        // Notices are best effort; the confirmation code must not silently vanish
+        svc.send_security_notice("a@example.com", "Alice", "Subject", "Body")
+            .unwrap();
+        assert!(
+            svc.send_mfa_email_code("a@example.com", "Alice", "123456")
+                .unwrap_err()
+                .contains("not configured")
+        );
+    }
+
+    #[test]
+    fn html_is_escaped() {
+        assert_eq!(
+            escape_html(r#"<b>"Tom" & 'Jerry'</b>"#),
+            "&lt;b&gt;&quot;Tom&quot; &amp; &#39;Jerry&#39;&lt;/b&gt;"
+        );
+        assert_eq!(escape_html("plain"), "plain");
     }
 
     #[test]

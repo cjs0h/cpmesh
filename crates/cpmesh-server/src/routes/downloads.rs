@@ -34,8 +34,9 @@ pub async fn handle_download_file(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    // Sanitize: no path traversal
+    // Sanitize: no path traversal, and no hidden files (uploads in progress)
     if filename.is_empty()
+        || filename.starts_with('.')
         || filename.contains('/')
         || filename.contains('\\')
         || filename.contains("..")
@@ -44,25 +45,31 @@ pub async fn handle_download_file(
     }
 
     let path = std::path::Path::new(&state.config.downloads_dir).join(&filename);
-    if !path.is_file() {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(b) => b,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let metadata = match file.metadata().await {
+        Ok(m) if m.is_file() => m,
+        _ => return StatusCode::NOT_FOUND.into_response(),
     };
 
+    // Stream from disk: installers are large and many people download at once
+    let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file));
     let mime = mime_for_download(&filename);
     let disposition = format!("attachment; filename=\"{}\"", filename);
 
     (
         StatusCode::OK,
         [
-            (axum::http::header::CONTENT_TYPE, mime),
-            (axum::http::header::CONTENT_DISPOSITION, &disposition),
+            (axum::http::header::CONTENT_TYPE, mime.to_string()),
+            (axum::http::header::CONTENT_DISPOSITION, disposition),
+            (
+                axum::http::header::CONTENT_LENGTH,
+                metadata.len().to_string(),
+            ),
         ],
-        bytes,
+        body,
     )
         .into_response()
 }

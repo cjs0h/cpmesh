@@ -21,6 +21,8 @@ pub async fn handle_get_me(
     };
 
     let (email, full_name, country, mobile) = decrypt_user_pii(&user, state.pii.as_ref());
+    let role = user.role();
+    let mfa = state.db.mfa_summary(user.id).await.unwrap_or_default();
 
     let mut resp = json!({
         "id": user.id.to_string(),
@@ -29,7 +31,14 @@ pub async fn handle_get_me(
         "full_name": full_name,
         "email_verified": user.email_verified,
         "auth_provider": user.auth_provider,
-        "is_admin": user.is_admin,
+        "is_admin": role.is_staff(),
+        "role": role.as_str(),
+        "permissions": crate::rbac::permission_names(role),
+        "mfa": {
+            "enabled": mfa.enabled(),
+            "required": crate::mfa::required_for(&state.config, &user),
+            "session_verified": claims.mfa,
+        },
     });
 
     if let Some(c) = country {

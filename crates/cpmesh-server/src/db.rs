@@ -4,6 +4,12 @@ use sqlx::postgres::PgPoolOptions;
 use crate::models::*;
 use crate::pii::PiiService;
 
+mod console;
+mod mfa;
+
+pub use console::{AuditFilter, RoleChange, UserListFilter};
+pub use mfa::{EmailCodeCheck, MfaSummary};
+
 pub struct CreateUserParams<'a> {
     pub username: &'a str,
     pub password_hash: &'a str,
@@ -27,7 +33,7 @@ pub struct CreateOidcUserParams<'a> {
 pub struct SubscriptionPlanParams<'a> {
     pub name: &'a str,
     pub description: &'a str,
-    pub price: f64,
+    pub price: rust_decimal::Decimal,
     pub currency: &'a str,
     pub billing_period: &'a str,
     pub max_devices: i32,
@@ -259,8 +265,8 @@ impl Db {
         };
 
         sqlx::query(
-            "INSERT INTO users (username, password, is_admin, username_idx, email, email_idx, email_verified, auth_provider, full_name)
-             VALUES ($1, $2, TRUE, $3, $4, NULLIF($5,''), TRUE, 'local', $6)
+            "INSERT INTO users (username, password, is_admin, role, username_idx, email, email_idx, email_verified, auth_provider, full_name)
+             VALUES ($1, $2, TRUE, 'owner', $3, $4, NULLIF($5,''), TRUE, 'local', $6)
              ON CONFLICT (username_idx) DO NOTHING"
         )
         .bind(username)
@@ -824,7 +830,7 @@ impl Db {
         )
         .bind(params.name)
         .bind(params.description)
-        .bind(sqlx::types::Decimal::try_from(params.price).unwrap_or_default())
+        .bind(params.price)
         .bind(params.currency)
         .bind(params.billing_period)
         .bind(params.max_devices)
@@ -851,7 +857,7 @@ impl Db {
         )
         .bind(params.name)
         .bind(params.description)
-        .bind(sqlx::types::Decimal::try_from(params.price).unwrap_or_default())
+        .bind(params.price)
         .bind(params.currency)
         .bind(params.billing_period)
         .bind(params.max_devices)
@@ -888,24 +894,32 @@ impl Db {
         Ok(())
     }
 
+    /// Fails with `RowNotFound` when the user does not exist.
     pub async fn assign_user_subscription(
         &self,
         user_id: uuid::Uuid,
         plan_id: uuid::Uuid,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE users SET subscription_plan_id = $1 WHERE id = $2")
+        let result = sqlx::query("UPDATE users SET subscription_plan_id = $1 WHERE id = $2")
             .bind(plan_id)
             .bind(user_id)
             .execute(&self.pool)
             .await?;
+        if result.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
         Ok(())
     }
 
+    /// Fails with `RowNotFound` when the user does not exist.
     pub async fn remove_user_subscription(&self, user_id: uuid::Uuid) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE users SET subscription_plan_id = NULL WHERE id = $1")
+        let result = sqlx::query("UPDATE users SET subscription_plan_id = NULL WHERE id = $1")
             .bind(user_id)
             .execute(&self.pool)
             .await?;
+        if result.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
         Ok(())
     }
 
@@ -1147,74 +1161,6 @@ impl Db {
     }
 
     // === Admin operations ===
-
-    pub async fn admin_list_users(
-        &self,
-        pii: Option<&PiiService>,
-    ) -> Result<Vec<AdminUserRow>, sqlx::Error> {
-        let rows = sqlx::query_as::<_, (uuid::Uuid, String, Option<String>, Option<String>, bool, String, bool, DateTime<Utc>, i32, Option<uuid::Uuid>, Option<String>)>(
-            "SELECT u.id, u.username, u.email, u.full_name, u.email_verified, COALESCE(u.auth_provider,'local'),
-                    u.is_admin, u.created_at, COUNT(d.id)::int AS device_count,
-                    u.subscription_plan_id, sp.name AS plan_name
-             FROM users u
-             LEFT JOIN devices d ON d.user_id = u.id
-             LEFT JOIN subscription_plans sp ON sp.id = u.subscription_plan_id
-             GROUP BY u.id, sp.name
-             ORDER BY u.created_at"
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut users = Vec::new();
-        for (
-            id,
-            username,
-            enc_email,
-            enc_full_name,
-            email_verified,
-            auth_provider,
-            is_admin,
-            created_at,
-            device_count,
-            sub_plan_id,
-            plan_name,
-        ) in rows
-        {
-            let email = decrypt_optional_field(enc_email.as_deref(), pii);
-            let full_name = decrypt_optional_field(enc_full_name.as_deref(), pii);
-            users.push(AdminUserRow {
-                id,
-                username,
-                email,
-                full_name,
-                email_verified,
-                auth_provider,
-                is_admin,
-                created_at,
-                device_count,
-                subscription_plan_id: sub_plan_id,
-                subscription_plan_name: plan_name,
-            });
-        }
-        Ok(users)
-    }
-
-    pub async fn admin_get_stats(&self) -> Result<AdminStats, sqlx::Error> {
-        let row: (i64, i64, i64) = sqlx::query_as(
-            "SELECT
-                (SELECT COUNT(*) FROM users),
-                (SELECT COUNT(*) FROM devices),
-                (SELECT COUNT(*) FROM clipboard_entries)",
-        )
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(AdminStats {
-            total_users: row.0,
-            total_devices: row.1,
-            total_entries: row.2,
-            active_connections: 0,
-        })
-    }
 
     pub async fn admin_delete_user(&self, user_id: uuid::Uuid) -> Result<(), sqlx::Error> {
         let result = sqlx::query("DELETE FROM users WHERE id = $1")
@@ -1757,6 +1703,100 @@ CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action, created_a
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS fingerprint VARCHAR(64);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_user_fingerprint
     ON devices(user_id, fingerprint) WHERE fingerprint IS NOT NULL;
+
+-- Roles: 'user' for members; viewer, support, admin and owner are staff (see rbac.rs).
+-- Admins from before roles existed become owners; is_admin mirrors "is staff".
+ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) NOT NULL DEFAULT 'user';
+UPDATE users SET role = 'owner' WHERE is_admin = TRUE AND role = 'user';
+UPDATE users SET is_admin = (role <> 'user') WHERE is_admin IS DISTINCT FROM (role <> 'user');
+ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended_at TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended_reason TEXT;
+CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at);
+
+-- Two-factor authentication: authenticator app (TOTP) state and lockout
+CREATE TABLE IF NOT EXISTS user_mfa (
+    user_id             UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    totp_secret         TEXT,
+    totp_pending_secret TEXT,
+    totp_enabled_at     TIMESTAMPTZ,
+    totp_last_step      BIGINT NOT NULL DEFAULT 0,
+    failed_attempts     INT NOT NULL DEFAULT 0,
+    locked_until        TIMESTAMPTZ,
+    updated_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS mfa_recovery_codes (
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    code_hash   VARCHAR(64) NOT NULL,
+    used_at     TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_mfa_recovery_codes_user ON mfa_recovery_codes(user_id);
+
+-- Passkeys (WebAuthn credentials)
+CREATE TABLE IF NOT EXISTS webauthn_credentials (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    credential_id   BYTEA NOT NULL UNIQUE,
+    public_key      BYTEA NOT NULL,
+    algorithm       INT NOT NULL,
+    sign_count      BIGINT NOT NULL DEFAULT 0,
+    transports      JSONB NOT NULL DEFAULT '[]'::jsonb,
+    name            VARCHAR(100) NOT NULL,
+    backup_eligible BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    last_used_at    TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_webauthn_credentials_user ON webauthn_credentials(user_id);
+
+-- Codes emailed to confirm an account before it sets up two-factor authentication
+CREATE TABLE IF NOT EXISTS mfa_email_codes (
+    user_id     UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    code_hash   VARCHAR(64) NOT NULL,
+    attempts    INT NOT NULL DEFAULT 0,
+    expires_at  TIMESTAMPTZ NOT NULL,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- API tokens for automation such as the release workflow (only a hash is stored)
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id           UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name         VARCHAR(100) NOT NULL,
+    token_hash   VARCHAR(64) NOT NULL UNIQUE,
+    token_prefix VARCHAR(16) NOT NULL,
+    scopes       JSONB NOT NULL DEFAULT '[]'::jsonb,
+    expires_at   TIMESTAMPTZ,
+    last_used_at TIMESTAMPTZ,
+    revoked_at   TIMESTAMPTZ,
+    created_at   TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Settings changed from the admin console; they override environment defaults
+CREATE TABLE IF NOT EXISTS app_settings (
+    key         VARCHAR(100) PRIMARY KEY,
+    value       JSONB NOT NULL,
+    updated_by  UUID REFERENCES users(id) ON DELETE SET NULL,
+    updated_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- One row per user per day with activity, for active-user statistics
+CREATE TABLE IF NOT EXISTS user_daily_activity (
+    day      DATE NOT NULL,
+    user_id  UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    PRIMARY KEY (day, user_id)
+);
+
+-- Admin actions name the account they affected
+ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS target_user_id UUID REFERENCES users(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_audit_logs_target ON audit_logs(target_user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_clipboard_entries_created ON clipboard_entries(created_at);
+
+-- Checksums of installers uploaded to this server
+ALTER TABLE download_links ADD COLUMN IF NOT EXISTS sha256 VARCHAR(64);
+ALTER TABLE download_links ADD COLUMN IF NOT EXISTS size_bytes BIGINT;
 "#;
 
 #[cfg(test)]
@@ -1866,6 +1906,13 @@ mod tests {
             "device_approval_sessions",
             "group_key_versions",
             "device_group_keys",
+            "user_mfa",
+            "mfa_recovery_codes",
+            "webauthn_credentials",
+            "mfa_email_codes",
+            "api_tokens",
+            "app_settings",
+            "user_daily_activity",
         ] {
             assert!(
                 SCHEMA.contains(&format!("CREATE TABLE IF NOT EXISTS {table}")),

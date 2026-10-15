@@ -8,6 +8,7 @@ use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use super::auth_service::SessionGrant;
 use super::middleware::{AuthClaims, extract_client_ip, json_error, json_response};
 use crate::AppState;
 use crate::models::{AUDIT_DEVICE_DELETE, AUDIT_DEVICE_REGISTER, AUDIT_GROUP_KEY_ROTATE};
@@ -53,10 +54,9 @@ pub async fn handle_register_device(
 
         if is_same_keys {
             // Same device, same keys — simple reconnect: return existing device + new token
-            let access_token = match state
-                .auth
-                .generate_access_token(claims.user_id, Some(existing_device.id))
-            {
+            let access_token = match state.auth.issue_access(
+                &SessionGrant::from_claims(&claims).with_device(Some(existing_device.id)),
+            ) {
                 Ok(t) => t,
                 Err(_) => {
                     return json_error("internal error", StatusCode::INTERNAL_SERVER_ERROR);
@@ -105,7 +105,7 @@ pub async fn handle_register_device(
 
         let access_token = match state
             .auth
-            .generate_access_token(claims.user_id, Some(device.id))
+            .issue_access(&SessionGrant::from_claims(&claims).with_device(Some(device.id)))
         {
             Ok(t) => t,
             Err(_) => return json_error("internal error", StatusCode::INTERNAL_SERVER_ERROR),
@@ -192,7 +192,7 @@ pub async fn handle_register_device(
 
     let access_token = match state
         .auth
-        .generate_access_token(claims.user_id, Some(device.id))
+        .issue_access(&SessionGrant::from_claims(&claims).with_device(Some(device.id)))
     {
         Ok(t) => t,
         Err(_) => return json_error("internal error", StatusCode::INTERNAL_SERVER_ERROR),

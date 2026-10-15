@@ -1,7 +1,7 @@
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{Notify, RwLock, mpsc};
 use tracing::warn;
 
 use cpmesh_proto::models::*;
@@ -23,6 +23,8 @@ pub struct Client {
     /// True for devices, false for browser sessions.
     pub announce: bool,
     pub tx: mpsc::UnboundedSender<String>,
+    /// Signalled to close the connection (account suspended, deleted or signed out).
+    pub kick: Arc<Notify>,
 }
 
 #[derive(Default)]
@@ -122,6 +124,21 @@ impl Hub {
         }
     }
 
+    /// Closes every connection of `user_id`, returning how many there were. Nobody is
+    /// told the devices went offline: the user has no connection left to tell.
+    pub async fn disconnect_user(&self, user_id: &str) -> usize {
+        let removed = self.clients.write().await.remove(user_id);
+        match removed {
+            Some(clients) => {
+                for client in clients.values() {
+                    client.kick.notify_one();
+                }
+                clients.len()
+            }
+            None => 0,
+        }
+    }
+
     pub async fn total_connections(&self) -> i64 {
         let clients = self.clients.read().await;
         clients.values().map(|uc| uc.len() as i64).sum()
@@ -160,6 +177,7 @@ mod tests {
                 conn_id: uuid::Uuid::new_v4(),
                 announce: true,
                 tx,
+                kick: Arc::new(Notify::new()),
             },
             rx,
         )
@@ -357,6 +375,35 @@ mod tests {
         assert_eq!(hub.user_connection_count("u2").await, 1);
         assert!(hub.is_device_online("u1", "a").await);
         assert!(!hub.is_device_online("u2", "a").await);
+    }
+
+    #[tokio::test]
+    async fn disconnect_user_kicks_every_connection_of_that_user_only() {
+        let hub = Hub::new();
+        let (a, _ra) = client("u1", "a");
+        let (b, _rb) = client("u1", "b");
+        let (x, _rx) = client("u2", "x");
+        let (kick_a, kick_b, kick_x) = (a.kick.clone(), b.kick.clone(), x.kick.clone());
+        for c in [a, b, x] {
+            hub.register(c).await;
+        }
+
+        assert_eq!(hub.disconnect_user("u1").await, 2);
+        assert_eq!(hub.user_connection_count("u1").await, 0);
+        assert_eq!(hub.user_connection_count("u2").await, 1);
+        // The kicked connections are woken (a stored permit completes immediately)
+        for kick in [kick_a, kick_b] {
+            tokio::time::timeout(std::time::Duration::from_secs(1), kick.notified())
+                .await
+                .expect("connection was kicked");
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), kick_x.notified())
+                .await
+                .is_err(),
+            "other users stay connected"
+        );
+        assert_eq!(hub.disconnect_user("u1").await, 0);
     }
 
     #[tokio::test]

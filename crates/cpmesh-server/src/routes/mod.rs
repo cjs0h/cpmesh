@@ -5,10 +5,14 @@ pub mod auth_service;
 pub mod clipboard;
 pub mod devices;
 pub mod downloads;
+pub mod mfa;
 pub mod middleware;
+pub mod settings;
 pub mod user;
 pub mod websocket;
 
+#[cfg(test)]
+mod flow_tests;
 #[cfg(test)]
 mod tests;
 
@@ -19,6 +23,10 @@ use tower_http::cors::{AllowHeaders, Any, CorsLayer};
 
 use crate::AppState;
 use crate::spa::spa_handler;
+
+/// Body limit of the installer upload route: room for an installer, its signature
+/// and multipart framing (each file is capped while it streams to disk).
+const UPLOAD_BODY_LIMIT: usize = 2 * admin::MAX_UPLOAD_BYTES as usize;
 
 pub fn build_router(state: Arc<AppState>) -> Router {
     let cors = build_cors(&state.config.allowed_origins);
@@ -89,7 +97,71 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/plans",
             axum::routing::get(auth::handle_list_active_plans),
+        )
+        .route(
+            "/api/settings",
+            axum::routing::get(settings::handle_public_settings),
         );
+
+    // Two-factor authentication: a session, or a sign-in waiting for its second factor
+    let mfa_routes = Router::new()
+        .route("/api/mfa", axum::routing::get(mfa::handle_status))
+        .route(
+            "/api/mfa/totp/setup",
+            axum::routing::post(mfa::handle_totp_setup),
+        )
+        .route(
+            "/api/mfa/totp",
+            axum::routing::delete(mfa::handle_totp_disable),
+        )
+        .route(
+            "/api/mfa/passkeys/options",
+            axum::routing::post(mfa::handle_passkey_options),
+        )
+        .route(
+            "/api/mfa/passkeys",
+            axum::routing::post(mfa::handle_passkey_register),
+        )
+        .route(
+            "/api/mfa/passkeys/{id}",
+            axum::routing::delete(mfa::handle_passkey_delete).patch(mfa::handle_passkey_rename),
+        )
+        .route(
+            "/api/mfa/verify/options",
+            axum::routing::post(mfa::handle_verify_options),
+        )
+        .route(
+            "/api/mfa/recovery-codes",
+            axum::routing::post(mfa::handle_regenerate_recovery_codes),
+        )
+        .route_layer(axum_mw::from_fn_with_state(
+            state.clone(),
+            middleware::mfa_principal_middleware,
+        ));
+
+    // Endpoints that check codes are also rate limited per client address
+    let mfa_code_routes = Router::new()
+        .route("/api/mfa/verify", axum::routing::post(mfa::handle_verify))
+        .route(
+            "/api/mfa/totp/enable",
+            axum::routing::post(mfa::handle_totp_enable),
+        )
+        .route(
+            "/api/mfa/email-code",
+            axum::routing::post(mfa::handle_send_email_code),
+        )
+        .route(
+            "/api/mfa/email-code/verify",
+            axum::routing::post(mfa::handle_verify_email_code),
+        )
+        .route_layer(axum_mw::from_fn_with_state(
+            state.clone(),
+            middleware::mfa_principal_middleware,
+        ))
+        .route_layer(axum_mw::from_fn_with_state(
+            state.clone(),
+            middleware::rate_limit_auth,
+        ));
 
     // Protected routes accessible to ALL authenticated devices (including pending)
     let protected_any_device = Router::new()
@@ -100,6 +172,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/devices",
             axum::routing::post(devices::handle_register_device),
+        )
+        // Hands a fresh web sign-in to the desktop app ("Sign in with browser")
+        .route(
+            "/api/auth/native-code",
+            axum::routing::post(auth::handle_native_code),
         )
         .route_layer(axum_mw::from_fn_with_state(
             state.clone(),
@@ -193,19 +270,16 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             websocket::ws_auth_middleware,
         ));
 
-    // Admin routes (protected + admin check)
+    // Admin console: staff sessions confirmed with a second factor
     let admin_routes = Router::new()
         .route(
             "/api/admin/users",
             axum::routing::get(admin::handle_admin_list_users),
         )
         .route(
-            "/api/admin/stats",
-            axum::routing::get(admin::handle_admin_get_stats),
-        )
-        .route(
             "/api/admin/users/{id}",
-            axum::routing::delete(admin::handle_admin_delete_user),
+            axum::routing::get(admin::handle_admin_get_user)
+                .delete(admin::handle_admin_delete_user),
         )
         .route(
             "/api/admin/users/{id}/subscription",
@@ -217,6 +291,42 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             axum::routing::put(admin::handle_admin_verify_email),
         )
         .route(
+            "/api/admin/users/{id}/resend-verification",
+            axum::routing::post(admin::handle_admin_resend_verification),
+        )
+        .route(
+            "/api/admin/users/{id}/suspend",
+            axum::routing::post(admin::handle_admin_suspend_user),
+        )
+        .route(
+            "/api/admin/users/{id}/unsuspend",
+            axum::routing::post(admin::handle_admin_unsuspend_user),
+        )
+        .route(
+            "/api/admin/users/{id}/revoke-sessions",
+            axum::routing::post(admin::handle_admin_revoke_sessions),
+        )
+        .route(
+            "/api/admin/users/{id}/role",
+            axum::routing::put(admin::handle_admin_set_role),
+        )
+        .route(
+            "/api/admin/users/{id}/mfa",
+            axum::routing::delete(admin::handle_admin_reset_mfa),
+        )
+        .route(
+            "/api/admin/stats",
+            axum::routing::get(admin::handle_admin_get_stats),
+        )
+        .route(
+            "/api/admin/audit-logs",
+            axum::routing::get(admin::handle_admin_list_audit_logs),
+        )
+        .route(
+            "/api/admin/audit-logs/actions",
+            axum::routing::get(admin::handle_admin_audit_actions),
+        )
+        .route(
             "/api/admin/plans",
             axum::routing::get(admin::handle_admin_list_plans)
                 .post(admin::handle_admin_create_plan),
@@ -226,6 +336,45 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             axum::routing::put(admin::handle_admin_update_plan)
                 .delete(admin::handle_admin_delete_plan),
         )
+        // Installers are streamed to disk; only this route accepts large bodies
+        .route(
+            "/api/admin/downloads/upload",
+            axum::routing::post(admin::handle_admin_upload_binary)
+                .layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)),
+        )
+        .route(
+            "/api/admin/settings",
+            axum::routing::get(admin::handle_admin_get_settings)
+                .put(admin::handle_admin_update_settings),
+        )
+        .route(
+            "/api/admin/test/smtp",
+            axum::routing::post(admin::handle_admin_test_smtp),
+        )
+        .route(
+            "/api/admin/test/oidc",
+            axum::routing::post(admin::handle_admin_test_oidc),
+        )
+        .route(
+            "/api/admin/api-tokens",
+            axum::routing::get(admin::handle_admin_list_api_tokens)
+                .post(admin::handle_admin_create_api_token),
+        )
+        .route(
+            "/api/admin/api-tokens/{id}",
+            axum::routing::delete(admin::handle_admin_revoke_api_token),
+        )
+        .route_layer(axum_mw::from_fn_with_state(
+            state.clone(),
+            middleware::admin_middleware,
+        ))
+        .route_layer(axum_mw::from_fn_with_state(
+            state.clone(),
+            middleware::auth_middleware,
+        ));
+
+    // Release publishing: staff sessions, or an API token with the releases scope (CI)
+    let release_routes = Router::new()
         .route(
             "/api/admin/downloads",
             axum::routing::get(admin::handle_admin_list_downloads)
@@ -237,11 +386,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                 .delete(admin::handle_admin_delete_download),
         )
         .route(
-            "/api/admin/downloads/upload",
-            axum::routing::post(admin::handle_admin_upload_binary),
-        )
-        .layer(DefaultBodyLimit::max(500 * 1024 * 1024)) // 500MB for file uploads
-        .route(
             "/api/admin/releases",
             axum::routing::get(admin::handle_admin_list_releases)
                 .post(admin::handle_admin_create_release),
@@ -251,25 +395,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             axum::routing::put(admin::handle_admin_update_release)
                 .delete(admin::handle_admin_delete_release),
         )
-        .route(
-            "/api/admin/test/smtp",
-            axum::routing::post(admin::handle_admin_test_smtp),
-        )
-        .route(
-            "/api/admin/test/oidc",
-            axum::routing::post(admin::handle_admin_test_oidc),
-        )
-        .route(
-            "/api/admin/audit-logs",
-            axum::routing::get(admin::handle_admin_list_audit_logs),
-        )
         .route_layer(axum_mw::from_fn_with_state(
             state.clone(),
-            middleware::admin_middleware,
-        ))
-        .route_layer(axum_mw::from_fn_with_state(
-            state.clone(),
-            middleware::auth_middleware,
+            middleware::release_admin_middleware,
         ));
 
     Router::new()
@@ -278,6 +406,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(protected_approved)
         .merge(websocket)
         .merge(admin_routes)
+        .merge(release_routes)
+        .merge(mfa_routes)
+        .merge(mfa_code_routes)
         .fallback(spa_handler)
         .layer(axum_mw::from_fn(middleware::security_headers))
         .layer(cors)

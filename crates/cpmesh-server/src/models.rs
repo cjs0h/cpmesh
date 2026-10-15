@@ -22,6 +22,20 @@ pub struct User {
     pub username_idx: Option<String>,
     pub created_at: DateTime<Utc>,
     pub tokens_revoked_before: Option<i64>,
+    /// "user" or a staff role (see [`crate::rbac::Role`]).
+    pub role: String,
+    pub suspended_at: Option<DateTime<Utc>>,
+    pub suspended_reason: Option<String>,
+}
+
+impl User {
+    pub fn role(&self) -> crate::rbac::Role {
+        crate::rbac::Role::from_db(&self.role)
+    }
+
+    pub fn is_suspended(&self) -> bool {
+        self.suspended_at.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -74,6 +88,9 @@ pub struct DownloadLink {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub release_id: Option<uuid::Uuid>,
+    /// SHA-256 of a file uploaded to this server, for users to check their download.
+    pub sha256: Option<String>,
+    pub size_bytes: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -85,18 +102,58 @@ pub struct AdminUserRow {
     pub email_verified: bool,
     pub auth_provider: String,
     pub is_admin: bool,
+    pub role: String,
     pub created_at: DateTime<Utc>,
     pub device_count: i32,
     pub subscription_plan_id: Option<uuid::Uuid>,
     pub subscription_plan_name: Option<String>,
+    pub suspended_at: Option<DateTime<Utc>>,
+    pub mfa_enabled: bool,
+    pub last_seen: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// One page of a list.
+#[derive(Debug, Serialize)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub total: i64,
+    pub page: i64,
+    pub per_page: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct AdminStats {
     pub total_users: i64,
     pub total_devices: i64,
     pub total_entries: i64,
     pub active_connections: i64,
+    pub pending_devices: i64,
+    pub suspended_users: i64,
+    pub staff_users: i64,
+    pub mfa_users: i64,
+    pub active_users_1d: i64,
+    pub active_users_7d: i64,
+    pub active_users_30d: i64,
+    /// On-disk size of stored (encrypted) clipboard data.
+    pub storage_bytes: i64,
+    pub signups: Vec<DailyCount>,
+    pub active_users: Vec<DailyCount>,
+    pub entries: Vec<DailyCount>,
+    pub plans: Vec<PlanUsage>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct DailyCount {
+    /// `YYYY-MM-DD`
+    pub day: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct PlanUsage {
+    pub plan_id: Option<uuid::Uuid>,
+    pub name: String,
+    pub users: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -171,6 +228,72 @@ pub struct AuditLog {
     pub created_at: DateTime<Utc>,
 }
 
+/// An audit log entry with the names of the people involved, for the admin console.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct AuditLogRow {
+    pub id: uuid::Uuid,
+    pub user_id: Option<uuid::Uuid>,
+    pub username: Option<String>,
+    pub target_user_id: Option<uuid::Uuid>,
+    pub target_username: Option<String>,
+    pub action: String,
+    pub ip_address: Option<String>,
+    pub user_agent: Option<String>,
+    pub details: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A registered passkey.
+#[derive(Debug, Clone, FromRow)]
+pub struct WebauthnCredential {
+    pub id: uuid::Uuid,
+    pub user_id: uuid::Uuid,
+    pub credential_id: Vec<u8>,
+    pub public_key: Vec<u8>,
+    pub algorithm: i32,
+    pub sign_count: i64,
+    pub transports: serde_json::Value,
+    pub name: String,
+    pub backup_eligible: bool,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
+}
+
+impl WebauthnCredential {
+    pub fn transport_list(&self) -> Vec<String> {
+        serde_json::from_value(self.transports.clone()).unwrap_or_default()
+    }
+}
+
+/// Second-factor state of an account.
+#[derive(Debug, Clone, Default, FromRow)]
+pub struct UserMfa {
+    pub user_id: uuid::Uuid,
+    /// Encrypted TOTP secret once enabled.
+    pub totp_secret: Option<String>,
+    /// Encrypted TOTP secret awaiting its first code.
+    pub totp_pending_secret: Option<String>,
+    pub totp_enabled_at: Option<DateTime<Utc>>,
+    pub totp_last_step: i64,
+    pub failed_attempts: i32,
+    pub locked_until: Option<DateTime<Utc>>,
+}
+
+/// An API token as listed in the admin console (the secret is never stored).
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct ApiToken {
+    pub id: uuid::Uuid,
+    pub user_id: uuid::Uuid,
+    pub username: Option<String>,
+    pub name: String,
+    pub token_prefix: String,
+    pub scopes: serde_json::Value,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
 // Audit action constants
 pub const AUDIT_LOGIN_OK: &str = "login_success";
 pub const AUDIT_LOGIN_FAIL: &str = "login_failure";
@@ -185,3 +308,88 @@ pub const AUDIT_TOKEN_REVOKE_ALL: &str = "token_revoke_all";
 pub const AUDIT_DEVICE_APPROVE: &str = "device_approve";
 pub const AUDIT_DEVICE_REJECT: &str = "device_reject";
 pub const AUDIT_GROUP_KEY_ROTATE: &str = "group_key_rotate";
+// Two-factor authentication
+pub const AUDIT_MFA_CHALLENGE: &str = "mfa_challenge";
+pub const AUDIT_MFA_FAIL: &str = "mfa_failure";
+pub const AUDIT_MFA_LOCKED: &str = "mfa_locked";
+pub const AUDIT_MFA_STEP_UP: &str = "mfa_step_up";
+pub const AUDIT_MFA_TOTP_ENABLE: &str = "mfa_totp_enabled";
+pub const AUDIT_MFA_TOTP_DISABLE: &str = "mfa_totp_disabled";
+pub const AUDIT_MFA_PASSKEY_ADD: &str = "mfa_passkey_added";
+pub const AUDIT_MFA_PASSKEY_REMOVE: &str = "mfa_passkey_removed";
+pub const AUDIT_MFA_RECOVERY_USED: &str = "mfa_recovery_code_used";
+pub const AUDIT_MFA_RECOVERY_REGENERATE: &str = "mfa_recovery_codes_regenerated";
+pub const AUDIT_MFA_EMAIL_CODE_SENT: &str = "mfa_email_code_sent";
+// Admin console
+pub const AUDIT_ADMIN_VERIFY_EMAIL: &str = "admin_verify_email";
+pub const AUDIT_ADMIN_RESEND_VERIFICATION: &str = "admin_resend_verification";
+pub const AUDIT_ADMIN_SUSPEND: &str = "admin_suspend_user";
+pub const AUDIT_ADMIN_UNSUSPEND: &str = "admin_unsuspend_user";
+pub const AUDIT_ADMIN_REVOKE_SESSIONS: &str = "admin_revoke_sessions";
+pub const AUDIT_ADMIN_SET_ROLE: &str = "admin_set_role";
+pub const AUDIT_ADMIN_RESET_MFA: &str = "admin_reset_mfa";
+pub const AUDIT_ADMIN_PLAN_CREATE: &str = "admin_plan_create";
+pub const AUDIT_ADMIN_PLAN_UPDATE: &str = "admin_plan_update";
+pub const AUDIT_ADMIN_PLAN_DELETE: &str = "admin_plan_delete";
+pub const AUDIT_ADMIN_DOWNLOAD_CREATE: &str = "admin_download_create";
+pub const AUDIT_ADMIN_DOWNLOAD_UPDATE: &str = "admin_download_update";
+pub const AUDIT_ADMIN_DOWNLOAD_DELETE: &str = "admin_download_delete";
+pub const AUDIT_ADMIN_UPLOAD: &str = "admin_upload";
+pub const AUDIT_ADMIN_RELEASE_CREATE: &str = "admin_release_create";
+pub const AUDIT_ADMIN_RELEASE_UPDATE: &str = "admin_release_update";
+pub const AUDIT_ADMIN_RELEASE_DELETE: &str = "admin_release_delete";
+pub const AUDIT_ADMIN_SETTINGS_UPDATE: &str = "admin_settings_update";
+pub const AUDIT_ADMIN_TEST_SMTP: &str = "admin_test_smtp";
+pub const AUDIT_ADMIN_TEST_OIDC: &str = "admin_test_oidc";
+pub const AUDIT_ADMIN_API_TOKEN_CREATE: &str = "admin_api_token_create";
+pub const AUDIT_ADMIN_API_TOKEN_REVOKE: &str = "admin_api_token_revoke";
+
+/// Every audit action, for filtering in the admin console.
+pub const AUDIT_ACTIONS: &[&str] = &[
+    AUDIT_LOGIN_OK,
+    AUDIT_LOGIN_FAIL,
+    AUDIT_REGISTER,
+    AUDIT_PASSWORD_CHANGE,
+    AUDIT_DEVICE_REGISTER,
+    AUDIT_DEVICE_DELETE,
+    AUDIT_DEVICE_APPROVE,
+    AUDIT_DEVICE_REJECT,
+    AUDIT_GROUP_KEY_ROTATE,
+    AUDIT_TOKEN_REVOKE_ALL,
+    AUDIT_MFA_CHALLENGE,
+    AUDIT_MFA_FAIL,
+    AUDIT_MFA_LOCKED,
+    AUDIT_MFA_STEP_UP,
+    AUDIT_MFA_TOTP_ENABLE,
+    AUDIT_MFA_TOTP_DISABLE,
+    AUDIT_MFA_PASSKEY_ADD,
+    AUDIT_MFA_PASSKEY_REMOVE,
+    AUDIT_MFA_RECOVERY_USED,
+    AUDIT_MFA_RECOVERY_REGENERATE,
+    AUDIT_MFA_EMAIL_CODE_SENT,
+    AUDIT_ADMIN_DELETE_USER,
+    AUDIT_ADMIN_ASSIGN_SUB,
+    AUDIT_ADMIN_REMOVE_SUB,
+    AUDIT_ADMIN_VERIFY_EMAIL,
+    AUDIT_ADMIN_RESEND_VERIFICATION,
+    AUDIT_ADMIN_SUSPEND,
+    AUDIT_ADMIN_UNSUSPEND,
+    AUDIT_ADMIN_REVOKE_SESSIONS,
+    AUDIT_ADMIN_SET_ROLE,
+    AUDIT_ADMIN_RESET_MFA,
+    AUDIT_ADMIN_PLAN_CREATE,
+    AUDIT_ADMIN_PLAN_UPDATE,
+    AUDIT_ADMIN_PLAN_DELETE,
+    AUDIT_ADMIN_DOWNLOAD_CREATE,
+    AUDIT_ADMIN_DOWNLOAD_UPDATE,
+    AUDIT_ADMIN_DOWNLOAD_DELETE,
+    AUDIT_ADMIN_UPLOAD,
+    AUDIT_ADMIN_RELEASE_CREATE,
+    AUDIT_ADMIN_RELEASE_UPDATE,
+    AUDIT_ADMIN_RELEASE_DELETE,
+    AUDIT_ADMIN_SETTINGS_UPDATE,
+    AUDIT_ADMIN_TEST_SMTP,
+    AUDIT_ADMIN_TEST_OIDC,
+    AUDIT_ADMIN_API_TOKEN_CREATE,
+    AUDIT_ADMIN_API_TOKEN_REVOKE,
+];

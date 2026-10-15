@@ -201,6 +201,7 @@ async fn handle_ws_connection(
         Peer::Browser => (format!("web-{conn_id}"), String::new(), None),
     };
 
+    let kick = Arc::new(tokio::sync::Notify::new());
     state
         .hub
         .register(Client {
@@ -210,8 +211,10 @@ async fn handle_ws_connection(
             conn_id,
             announce: device_id.is_some(),
             tx: tx.clone(),
+            kick: kick.clone(),
         })
         .await;
+    crate::audit::record_activity(&state, user_id);
 
     // Prompt a device to rotate the group key when rotation is due
     if device_id.is_some()
@@ -225,17 +228,30 @@ async fn handle_ws_connection(
         let _ = tx.send(rotation_msg);
     }
 
-    // Write pump: forward messages from hub to WebSocket
-    let write_handle = tokio::spawn(async move {
+    // Write pump: forward messages from hub to WebSocket, then close the socket once
+    // every sender is gone (the hub dropped this client and the read pump finished)
+    let mut write_handle = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if ws_tx.send(Message::Text(msg.into())).await.is_err() {
-                break;
+                return;
             }
         }
+        let _ = ws_tx.send(Message::Close(None)).await;
     });
 
-    // Read pump: handle messages from WebSocket
-    while let Some(Ok(msg)) = ws_rx.next().await {
+    // Read pump: handle messages from WebSocket until the client leaves or is kicked
+    let mut kicked = false;
+    loop {
+        let msg = tokio::select! {
+            msg = ws_rx.next() => match msg {
+                Some(Ok(msg)) => msg,
+                _ => break,
+            },
+            _ = kick.notified() => {
+                kicked = true;
+                break;
+            }
+        };
         match msg {
             Message::Text(text) => {
                 let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) else {
@@ -268,8 +284,19 @@ async fn handle_ws_connection(
     }
 
     // Cleanup
-    state.hub.remove(&uid, &hub_id, conn_id).await;
-    write_handle.abort();
+    if kicked {
+        // Let the write pump flush and send a close frame before the socket drops
+        drop(tx);
+        if tokio::time::timeout(Duration::from_secs(2), &mut write_handle)
+            .await
+            .is_err()
+        {
+            write_handle.abort();
+        }
+    } else {
+        state.hub.remove(&uid, &hub_id, conn_id).await;
+        write_handle.abort();
+    }
 }
 
 async fn handle_clipboard_push(

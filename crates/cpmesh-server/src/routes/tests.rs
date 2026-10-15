@@ -118,6 +118,8 @@ fn browser_session() -> crate::routes::middleware::AuthClaims {
         user_id: uuid::Uuid::new_v4(),
         device_id: None,
         iat: 0,
+        mfa: false,
+        auth_time: 0,
     }
 }
 
