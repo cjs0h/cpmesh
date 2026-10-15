@@ -40,6 +40,8 @@ export class CpmeshApi {
   private baseUrl: string;
   private accessToken: string | null = null;
   private refreshToken: string | null = null;
+  /** A refresh token the server reported already used; it must never be sent again. */
+  private spentRefreshToken: string | null = null;
   private refreshing: Promise<boolean> | null = null;
 
   /** Persists rotated tokens; also consulted before refreshing (see refreshSession). */
@@ -123,7 +125,11 @@ export class CpmeshApi {
 
   private async doRefresh(rejectedAccess: string | null): Promise<boolean> {
     const stored = this.tokenStore?.load();
-    if (stored?.refresh && stored.refresh !== this.refreshToken) {
+    if (
+      stored?.refresh &&
+      stored.refresh !== this.refreshToken &&
+      stored.refresh !== this.spentRefreshToken
+    ) {
       this.accessToken = stored.access || null;
       this.refreshToken = stored.refresh;
     }
@@ -137,6 +143,20 @@ export class CpmeshApi {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ refresh_token: this.refreshToken }),
       });
+      if (res.status === 409) {
+        // Another process sharing this session used the token moments ago. Adopt the
+        // pair it saved; otherwise forget the spent token, because presenting it again
+        // later would count as theft and revoke every session.
+        const rotated = this.tokenStore?.load();
+        if (rotated?.refresh && rotated.refresh !== this.refreshToken) {
+          this.accessToken = rotated.access || null;
+          this.refreshToken = rotated.refresh;
+          return this.accessToken !== null;
+        }
+        this.spentRefreshToken = this.refreshToken;
+        this.refreshToken = null;
+        return false;
+      }
       if (!res.ok) return false;
       data = (await res.json()) as typeof data;
     } catch {
