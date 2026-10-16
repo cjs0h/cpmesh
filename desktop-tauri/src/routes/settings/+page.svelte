@@ -1,89 +1,134 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
-	import { getConfig, updateConfig, changePassword, checkUpdate, downloadAndInstallUpdate, logout, disconnectFromServer, connectToServer, setupAndLogin, getUserInfo, type AppConfig } from '#lib/api.js';
-	import { setAppState, refreshStatus } from '#lib/store.svelte.js';
-	import { isDesktop } from '#lib/platform.js';
 	import { getVersion } from '@tauri-apps/api/app';
+	import {
+		getConfig,
+		updateConfig,
+		changePassword,
+		checkUpdate,
+		downloadAndInstallUpdate,
+		logout,
+		getUserInfo,
+		type AppConfig,
+		type UpdateInfo,
+		type UserInfo,
+	} from '#lib/api.js';
+	import { setAppState, getStatusValue } from '#lib/store.svelte.js';
+	import { confirmAction } from '#lib/confirm.svelte.js';
+	import { isDesktop } from '#lib/platform.js';
+	import { getThemePreference, setThemePreference, type ThemePreference } from '#lib/theme.svelte.js';
+	import { toast } from '#lib/toast.svelte.js';
+	import { errorMessage, forgetServerUrl, isMacLike, serverHost } from '#lib/ui.js';
+	import Alert from '#lib/components/ui/Alert.svelte';
+	import Badge from '#lib/components/ui/Badge.svelte';
+	import Button from '#lib/components/ui/Button.svelte';
+	import Dialog from '#lib/components/ui/Dialog.svelte';
+	import Field from '#lib/components/ui/Field.svelte';
+	import Kbd from '#lib/components/ui/Kbd.svelte';
+	import PageHeader from '#lib/components/ui/PageHeader.svelte';
+	import Segmented from '#lib/components/ui/Segmented.svelte';
+	import SettingRow from '#lib/components/ui/SettingRow.svelte';
+	import SettingsGroup from '#lib/components/ui/SettingsGroup.svelte';
+	import Skeleton from '#lib/components/ui/Skeleton.svelte';
+	import Switch from '#lib/components/ui/Switch.svelte';
+
+	const desktop = isDesktop();
+	const status = $derived(getStatusValue());
 
 	let config = $state<AppConfig | null>(null);
 	let loading = $state(true);
-	let settingsError = $state('');
-	const desktop = isDesktop();
-	let authProvider = $state('local');
-	let savingToggle = $state(false);
+	let loadError = $state('');
+	let user = $state<UserInfo | null>(null);
+	let savingKey = $state<string | null>(null);
+	let theme = $state<ThemePreference>(getThemePreference());
+	let appVersion = $state('');
 
 	// Password change
+	let passwordOpen = $state(false);
 	let currentPassword = $state('');
 	let newPassword = $state('');
 	let confirmPassword = $state('');
-	let passwordMsg = $state('');
-	let passwordError = $state(false);
+	let passwordError = $state('');
 	let changingPassword = $state(false);
 
-	// Update check
-	let updateInfo = $state<import('#lib/api.js').UpdateInfo | null>(null);
+	// Updates
+	let updateInfo = $state<UpdateInfo | null>(null);
 	let checkingUpdate = $state(false);
+	let checkedUpdate = $state(false);
 	let updateCheckFailed = $state(false);
 	let downloadingUpdate = $state(false);
-	let downloadError = $state('');
-	let appVersion = $state('0.1.0');
+
+	let signingOut = $state(false);
+
+	const authProvider = $derived(user?.auth_provider || 'local');
+	const displayName = $derived(user?.full_name || user?.username || '');
+	const initials = $derived(
+		displayName
+			.split(/\s+/)
+			.filter(Boolean)
+			.slice(0, 2)
+			.map((part) => part[0]?.toUpperCase())
+			.join('') || '?',
+	);
 
 	async function loadConfig() {
 		loading = true;
-		settingsError = '';
+		loadError = '';
 		try {
 			config = await getConfig();
 		} catch (e) {
-			settingsError = 'Failed to load settings.';
-			console.error('loadConfig:', e);
+			loadError = errorMessage(e);
 		} finally {
 			loading = false;
 		}
 	}
 
-	async function toggleSetting(key: 'auto_connect' | 'autostart' | 'notifications_enabled') {
-		if (!config || savingToggle) return;
+	type ToggleKey = 'auto_connect' | 'autostart' | 'notifications_enabled';
+
+	async function toggleSetting(key: ToggleKey) {
+		if (!config || savingKey) return;
 		const prev = config[key];
 		config[key] = !prev;
-		savingToggle = true;
+		savingKey = key;
 		try {
 			await updateConfig({ [key]: config[key] });
 		} catch (e) {
 			config[key] = prev; // rollback on failure
-			settingsError = 'Failed to save setting.';
-			setTimeout(() => { settingsError = ''; }, 3000);
-			console.error('toggleSetting:', e);
+			toast.error('Couldn’t save that setting', errorMessage(e));
 		} finally {
-			savingToggle = false;
+			savingKey = null;
 		}
 	}
 
-	async function handlePasswordChange() {
-		passwordMsg = '';
-		passwordError = false;
+	function openPasswordDialog() {
+		currentPassword = '';
+		newPassword = '';
+		confirmPassword = '';
+		passwordError = '';
+		passwordOpen = true;
+	}
 
+	async function handlePasswordChange(event: SubmitEvent) {
+		event.preventDefault();
+		passwordError = '';
+		if (newPassword.length < 8) {
+			passwordError = 'Use at least 8 characters for your new password.';
+			return;
+		}
 		if (newPassword !== confirmPassword) {
-			passwordMsg = 'Passwords do not match';
-			passwordError = true;
+			passwordError = 'The new passwords don’t match.';
 			return;
 		}
-		if (newPassword.length < 6) {
-			passwordMsg = 'Password must be at least 6 characters';
-			passwordError = true;
-			return;
-		}
-
 		changingPassword = true;
 		try {
+			// The backend signs this device out once the password changed
 			await changePassword(currentPassword, newPassword);
-			passwordMsg = 'Password changed successfully';
-			currentPassword = '';
-			newPassword = '';
-			confirmPassword = '';
+			changingPassword = false;
+			passwordOpen = false;
+			toast.success('Password changed', 'Sign in again with your new password.', 8000);
 		} catch (e) {
-			passwordMsg = String(e);
-			passwordError = true;
+			passwordError = errorMessage(e);
 		} finally {
 			changingPassword = false;
 		}
@@ -94,488 +139,290 @@
 		updateCheckFailed = false;
 		try {
 			updateInfo = await checkUpdate();
-		} catch (e) {
+			checkedUpdate = true;
+		} catch {
 			updateCheckFailed = true;
-			console.error('checkUpdate:', e);
 		} finally {
 			checkingUpdate = false;
 		}
 	}
 
-	// Change Server flow (multi-step: URL → credentials → done)
-	let changeServerStep = $state(0); // 0 = hidden, 1 = URL+device, 2 = login, 3 = done
-	let csUrl = $state('');
-	let csUsername = $state('');
-	let csPassword = $state('');
-	let csIsRegister = $state(false);
-	let csError = $state('');
-	let csLoading = $state(false);
-
-	function startChangeServer() {
-		csUrl = config?.server_url ?? '';
-		csUsername = '';
-		csPassword = '';
-		csIsRegister = false;
-		csError = '';
-		csLoading = false;
-		changeServerStep = 1;
-	}
-
-	function cancelChangeServer() {
-		changeServerStep = 0;
-		csError = '';
-	}
-
-	async function csSubmitLogin() {
-		csError = '';
-		csLoading = true;
+	async function handleInstallUpdate() {
+		if (!updateInfo) return;
+		downloadingUpdate = true;
 		try {
-			// Disconnect current session
-			try { await disconnectFromServer(); } catch {}
-			// Full setup: login/register + device registration + key exchange
-			await setupAndLogin(
-				csUrl.trim().replace(/\/+$/, ''),
-				csUsername,
-				csPassword,
-				csIsRegister
-			);
-			changeServerStep = 3;
-			// Reload config to reflect new values
-			await loadConfig();
-			await refreshStatus();
+			await downloadAndInstallUpdate(updateInfo.download_url);
 		} catch (e) {
-			csError = String(e);
+			toast.error('Update failed', errorMessage(e));
 		} finally {
-			csLoading = false;
+			downloadingUpdate = false;
 		}
 	}
 
-	async function csDone() {
-		changeServerStep = 0;
-		try { await connectToServer(); } catch {}
+	async function openDashboard() {
+		if (!config?.server_url) return;
+		try {
+			const { openUrl } = await import('@tauri-apps/plugin-opener');
+			await openUrl(config.server_url);
+		} catch (e) {
+			toast.error('Couldn’t open your browser', errorMessage(e));
+		}
 	}
 
-	let confirmingLogout = $state(false);
-
-	async function handleLogout() {
+	async function signOut(options: { switchServer: boolean }) {
+		signingOut = true;
+		// Before logout: its event can mount the sign-in screen before this resumes
+		if (options.switchServer) forgetServerUrl();
 		try {
 			await logout();
 			setAppState('not_configured');
 			goto('/');
 		} catch (e) {
-			console.error('Logout failed:', e);
+			toast.error('Couldn’t sign out', errorMessage(e));
+		} finally {
+			signingOut = false;
 		}
+	}
+
+	async function handleSwitchServer() {
+		const confirmed = await confirmAction({
+			title: 'Switch to another server?',
+			description: `This signs this device out of ${serverHost(config?.server_url)} and removes its keys here. You’ll sign in to the new server next, and approve this device there.`,
+			confirmLabel: 'Sign out and switch',
+		});
+		if (confirmed) await signOut({ switchServer: true });
+	}
+
+	async function handleSignOut() {
+		const confirmed = await confirmAction({
+			title: 'Sign out of cpmesh?',
+			description: 'This device disconnects and forgets its keys and settings. To use it again, sign in and approve it from another device.',
+			confirmLabel: 'Sign out',
+			tone: 'danger',
+		});
+		if (confirmed) await signOut({ switchServer: false });
 	}
 
 	onMount(() => {
 		loadConfig();
-		getUserInfo().then((info) => {
-			authProvider = info.auth_provider || 'local';
-		}).catch(() => {});
-		getVersion().then((v) => {
-			appVersion = v;
-		}).catch(() => {});
+		getUserInfo()
+			.then((info) => (user = info))
+			.catch(() => {});
+		getVersion()
+			.then((v) => (appVersion = v))
+			.catch(() => {});
 	});
 
-	async function handleDownloadAndInstall() {
-		if (!updateInfo) return;
-		downloadingUpdate = true;
-		downloadError = '';
-		try {
-			await downloadAndInstallUpdate(updateInfo.download_url);
-		} catch (e) {
-			downloadError = 'Download failed. Please try again.';
-			console.error('downloadAndInstall:', e);
-		} finally {
-			downloadingUpdate = false;
-		}
-	}
+	const providerLabel = $derived(authProvider === 'local' ? 'Password' : authProvider.charAt(0).toUpperCase() + authProvider.slice(1));
 </script>
 
-<div class="settings-page">
-	<h1>Settings</h1>
+<svelte:head>
+	<title>Settings · cpmesh</title>
+</svelte:head>
 
-	{#if settingsError}
-		<p class="error">{settingsError}</p>
-	{/if}
+<PageHeader title="Settings" />
 
-	{#if loading}
-		<p>Loading...</p>
-	{:else if config}
-		<!-- Connection -->
-		<section class="card">
-			<h2>Connection</h2>
-
-			{#if changeServerStep === 0}
-				<!-- Normal display -->
-				<div class="setting-row">
-					<div>
-						<div class="setting-label">Server URL</div>
-						<div class="setting-value">{config.server_url}</div>
-					</div>
-					<button class="small" onclick={startChangeServer}>Change</button>
-				</div>
-				<div class="setting-row">
-					<div>
-						<div class="setting-label">Device Name</div>
-						<div class="setting-value">{config.device_name}</div>
-					</div>
-				</div>
-
-			{:else if changeServerStep === 1}
-				<!-- Step 1: Server URL -->
-				<div class="cs-flow">
-					<h3>Change Server — Step 1</h3>
-					<p class="muted">Enter the new server URL.</p>
-					<input type="url" placeholder="https://your-server.com" bind:value={csUrl} />
-					<div class="button-row">
-						<button class="small" onclick={cancelChangeServer}>Cancel</button>
-						<button class="small primary" onclick={() => changeServerStep = 2} disabled={!csUrl}>
-							Next
-						</button>
-					</div>
-				</div>
-
-			{:else if changeServerStep === 2}
-				<!-- Step 2: Login / Register -->
-				<div class="cs-flow">
-					<h3>Change Server — Step 2</h3>
-					<p class="muted">Log in or register on <strong>{csUrl}</strong></p>
-					<div class="tabs">
-						<button class:active={!csIsRegister} onclick={() => csIsRegister = false}>Login</button>
-						<button class:active={csIsRegister} onclick={() => csIsRegister = true}>Register</button>
-					</div>
-					<input type="text" placeholder="Username" bind:value={csUsername} />
-					<input type="password" placeholder="Password" bind:value={csPassword} />
-					{#if csError}<p class="error">{csError}</p>{/if}
-					<div class="button-row">
-						<button class="small" onclick={() => changeServerStep = 1}>Back</button>
-						<button class="small primary" onclick={csSubmitLogin} disabled={csLoading || !csUsername || !csPassword}>
-							{csLoading ? 'Setting up...' : csIsRegister ? 'Register & Setup' : 'Login & Setup'}
-						</button>
-					</div>
-				</div>
-
-			{:else}
-				<!-- Step 3: Done -->
-				<div class="cs-flow">
-					<h3>Server Changed!</h3>
-					<p class="muted">Successfully connected to <strong>{csUrl}</strong>.</p>
-					<button class="small primary" onclick={csDone}>Done</button>
-				</div>
-			{/if}
-
-			<div class="setting-row">
-				<div>
-					<div class="setting-label">Auto-connect on launch</div>
-					<div class="setting-desc">Automatically connect when the app starts</div>
-				</div>
-				<label class="toggle">
-					<input type="checkbox" checked={config.auto_connect} onchange={() => toggleSetting('auto_connect')} disabled={savingToggle} />
-					<span class="slider"></span>
-				</label>
+{#if loading}
+	<div class="space-y-8" aria-busy="true" aria-label="Loading settings">
+		{#each [0, 1, 2] as i (i)}
+			<div class="space-y-2">
+				<Skeleton class="h-3.5 w-28" />
+				<Skeleton class="h-28 w-full rounded-xl" />
 			</div>
-			{#if desktop}
-			<div class="setting-row">
-				<div>
-					<div class="setting-label">Start on login</div>
-					<div class="setting-desc">Launch cpmesh when you log in</div>
-				</div>
-				<label class="toggle">
-					<input type="checkbox" checked={config.autostart} onchange={() => toggleSetting('autostart')} disabled={savingToggle} />
-					<span class="slider"></span>
-				</label>
-			</div>
-			{/if}
-		</section>
-
-		<!-- Notifications -->
-		<section class="card">
-			<h2>Notifications</h2>
-			<div class="setting-row">
-				<div>
-					<div class="setting-label">Clipboard notifications</div>
-					<div class="setting-desc">Show a notification when a clipboard entry arrives</div>
-				</div>
-				<label class="toggle">
-					<input type="checkbox" checked={config.notifications_enabled} onchange={() => toggleSetting('notifications_enabled')} disabled={savingToggle} />
-					<span class="slider"></span>
-				</label>
-			</div>
-		</section>
-
-		<!-- Password -->
-		{#if authProvider === 'local'}
-		<section class="card">
-			<h2>Change Password</h2>
-			<div class="password-form">
-				<input type="password" placeholder="Current password" bind:value={currentPassword} />
-				<input type="password" placeholder="New password" bind:value={newPassword} />
-				<input type="password" placeholder="Confirm new password" bind:value={confirmPassword} />
-				{#if passwordMsg}
-					<p class:error={passwordError} class:success={!passwordError}>{passwordMsg}</p>
-				{/if}
-				<button class="primary" onclick={handlePasswordChange} disabled={changingPassword || !currentPassword || !newPassword || !confirmPassword}>
-					{changingPassword ? 'Changing...' : 'Change Password'}
-				</button>
-			</div>
-		</section>
-		{:else}
-		<section class="card">
-			<h2>Password</h2>
-			<p class="muted">Your account uses <strong>{authProvider}</strong> for authentication. Password is managed by your identity provider.</p>
-		</section>
-		{/if}
-
-		<!-- About -->
-		<section class="card">
-			<h2>About</h2>
-			<div class="setting-row">
-				<div>
-					<div class="setting-label">Version</div>
-					<div class="setting-value">{appVersion}</div>
+		{/each}
+	</div>
+{:else if loadError || !config}
+	<Alert tone="danger" title="Couldn’t load settings">
+		{loadError}
+		{#snippet actions()}
+			<Button size="sm" icon="refresh" onclick={loadConfig}>Try again</Button>
+		{/snippet}
+	</Alert>
+{:else}
+	<div class="space-y-8">
+		<SettingsGroup title="Account">
+			<div class="flex items-center gap-3.5 px-4 py-4">
+				<span
+					class="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-ink text-sm font-semibold text-on-ink"
+					aria-hidden="true">{initials}</span
+				>
+				<div class="min-w-0 flex-1">
+					{#if user}
+						<p class="flex items-center gap-2 truncate text-[13px] font-medium text-fg">
+							{displayName}
+							{#if user.is_admin}<Badge>Admin</Badge>{/if}
+						</p>
+						<p class="truncate text-xs text-muted">{user.email || `@${user.username}`}</p>
+					{:else}
+						<Skeleton class="h-3.5 w-32" />
+						<Skeleton class="mt-1.5 h-3 w-44" />
+					{/if}
 				</div>
 				{#if desktop}
-				<button onclick={handleCheckUpdate} disabled={checkingUpdate}>
-					{checkingUpdate ? 'Checking...' : 'Check for Updates'}
-				</button>
+					<Button size="sm" iconRight="external-link" onclick={openDashboard}>Web dashboard</Button>
 				{/if}
 			</div>
-			{#if updateInfo}
-				<div class="update-available">
-					<p>Update available: <strong>v{updateInfo.version}</strong></p>
-					{#if updateInfo.release_notes}
-						<p class="muted" style="margin-top: 4px; font-size: 12px;">{updateInfo.release_notes}</p>
+			<SettingRow
+				label="Sign-in method"
+				description={authProvider === 'local'
+					? 'Two-factor authentication and passkeys are managed on the web dashboard.'
+					: `Your password is managed by ${providerLabel}.`}
+			>
+				{#snippet control()}
+					{#if authProvider === 'local'}
+						<Button size="sm" onclick={openPasswordDialog}>Change password</Button>
+					{:else}
+						<Badge>{providerLabel}</Badge>
 					{/if}
-					{#if downloadError}
-						<p class="error" style="margin-top: 4px;">{downloadError}</p>
-					{/if}
-					{#if updateInfo.download_url}
-						<button class="small primary" onclick={handleDownloadAndInstall} disabled={downloadingUpdate} style="margin-top: 6px; font-size: 13px;">
-							{downloadingUpdate ? 'Downloading...' : 'Download & Install'}
-						</button>
-					{/if}
-				</div>
-			{:else if updateCheckFailed}
-				<p class="error" style="font-size: 12px;">Failed to check for updates.</p>
-			{:else if !checkingUpdate}
-				<p class="muted" style="font-size: 12px;">You're up to date.</p>
+				{/snippet}
+			</SettingRow>
+		</SettingsGroup>
+
+		<SettingsGroup title="Appearance">
+			<SettingRow label="Theme" description="Follow your system, or keep cpmesh light or dark.">
+				{#snippet control()}
+					<Segmented
+						label="Theme"
+						size="sm"
+						bind:value={theme}
+						onchange={setThemePreference}
+						options={[
+							{ value: 'system', label: 'System', icon: 'sun-moon' },
+							{ value: 'light', label: 'Light', icon: 'sun' },
+							{ value: 'dark', label: 'Dark', icon: 'moon' },
+						]}
+					/>
+				{/snippet}
+			</SettingRow>
+		</SettingsGroup>
+
+		<SettingsGroup title="Sync and startup">
+			<SettingRow label="Connect when cpmesh opens" description="Start syncing as soon as the app launches." for="setting-auto-connect">
+				{#snippet control()}
+					<Switch
+						id="setting-auto-connect"
+						label="Connect when cpmesh opens"
+						checked={config?.auto_connect ?? false}
+						disabled={savingKey !== null}
+						onchange={() => toggleSetting('auto_connect')}
+					/>
+				{/snippet}
+			</SettingRow>
+			{#if desktop}
+				<SettingRow
+					label="Open at login"
+					description="Launch cpmesh in the {isMacLike() ? 'menu bar' : 'system tray'} when you sign in to this computer."
+					for="setting-autostart"
+				>
+					{#snippet control()}
+						<Switch
+							id="setting-autostart"
+							label="Open at login"
+							checked={config?.autostart ?? false}
+							disabled={savingKey !== null}
+							onchange={() => toggleSetting('autostart')}
+						/>
+					{/snippet}
+				</SettingRow>
 			{/if}
-		</section>
+			<SettingRow label="Clip notifications" description="Show a notification when a clip arrives from another device." for="setting-notifications">
+				{#snippet control()}
+					<Switch
+						id="setting-notifications"
+						label="Clip notifications"
+						checked={config?.notifications_enabled ?? false}
+						disabled={savingKey !== null}
+						onchange={() => toggleSetting('notifications_enabled')}
+					/>
+				{/snippet}
+			</SettingRow>
+		</SettingsGroup>
 
-		<!-- Danger Zone -->
-		<section class="card danger-zone">
-			<h2>Danger Zone</h2>
-			<div class="setting-row">
-				<div>
-					<div class="setting-label">Logout &amp; Reset</div>
-					<div class="setting-desc">Disconnect and clear all settings. You'll need to set up again.</div>
-				</div>
-				{#if confirmingLogout}
-					<div class="confirm-actions">
-						<button class="small danger" onclick={handleLogout}>Confirm</button>
-						<button class="small" onclick={() => confirmingLogout = false}>Cancel</button>
-					</div>
-				{:else}
-					<button class="danger" onclick={() => confirmingLogout = true}>Logout</button>
+		{#if desktop}
+			<SettingsGroup title="Keyboard shortcuts">
+				<SettingRow label="Show cpmesh from anywhere">
+					{#snippet control()}<Kbd keys={['mod', 'shift', 'Space']} />{/snippet}
+				</SettingRow>
+				<SettingRow label="Switch between sections">
+					{#snippet control()}<Kbd keys={['mod', '1']} /><span class="text-xs text-dim">to</span><Kbd keys={['mod', '4']} />{/snippet}
+				</SettingRow>
+				<SettingRow label="Search history">
+					{#snippet control()}<Kbd keys={['mod', 'F']} />{/snippet}
+				</SettingRow>
+				<SettingRow label="Open settings">
+					{#snippet control()}<Kbd keys={['mod', ',']} />{/snippet}
+				</SettingRow>
+			</SettingsGroup>
+		{/if}
+
+		<SettingsGroup title="Connection">
+			<SettingRow label="Server" description={config.server_url}>
+				{#snippet control()}
+					<Button size="sm" loading={signingOut} onclick={handleSwitchServer}>Switch server…</Button>
+				{/snippet}
+			</SettingRow>
+			<SettingRow label="This device" description={config.device_name || status?.device_name || '—'} />
+		</SettingsGroup>
+
+		<SettingsGroup title="About">
+			<SettingRow
+				label="cpmesh {appVersion ? `v${appVersion}` : ''}"
+				description={updateInfo
+					? `Version ${updateInfo.version} is available.`
+					: updateCheckFailed
+						? 'Couldn’t check for updates. Try again in a moment.'
+						: checkedUpdate
+							? 'You’re on the latest version.'
+							: 'Updates are checked automatically in the background.'}
+			>
+				{#snippet control()}
+					{#if updateInfo?.download_url}
+						<Button size="sm" variant="primary" icon="download" loading={downloadingUpdate} onclick={handleInstallUpdate}>
+							Install {updateInfo.version}
+						</Button>
+					{:else if desktop}
+						<Button size="sm" icon="refresh" loading={checkingUpdate} onclick={handleCheckUpdate}>Check for updates</Button>
+					{/if}
+				{/snippet}
+				{#if updateInfo?.release_notes}
+					<p class="mt-2 max-w-[56ch] text-xs leading-relaxed whitespace-pre-line text-muted">{updateInfo.release_notes}</p>
 				{/if}
-			</div>
-		</section>
-	{/if}
-</div>
+			</SettingRow>
+		</SettingsGroup>
 
-<style>
-	.settings-page h1 {
-		font-size: 1.25rem;
-		margin-bottom: 1rem;
-	}
+		<SettingsGroup>
+			<SettingRow label="Sign out" description="Disconnect this device and remove its keys and settings.">
+				{#snippet control()}
+					<Button size="sm" variant="danger-soft" icon="log-out" loading={signingOut} onclick={handleSignOut}>Sign out</Button>
+				{/snippet}
+			</SettingRow>
+		</SettingsGroup>
+	</div>
+{/if}
 
-	section {
-		margin-bottom: 1rem;
-	}
-
-	section h2 {
-		font-size: 0.875rem;
-		font-weight: 600;
-		text-transform: uppercase;
-		letter-spacing: 0.05em;
-		color: var(--text-secondary);
-		margin-bottom: 0.75rem;
-	}
-
-	.setting-row {
-		display: flex;
-		justify-content: space-between;
-		align-items: center;
-		padding: 0.5rem 0;
-	}
-
-	.setting-row + .setting-row {
-		border-top: 1px solid var(--border);
-	}
-
-	.setting-label {
-		font-size: 0.875rem;
-		font-weight: 500;
-	}
-
-	.setting-desc {
-		font-size: 0.75rem;
-		color: var(--text-secondary);
-	}
-
-	.setting-value {
-		font-size: 0.875rem;
-		color: var(--text-secondary);
-		word-break: break-all;
-	}
-
-	.toggle {
-		position: relative;
-		display: inline-block;
-		width: 40px;
-		height: 22px;
-		flex-shrink: 0;
-	}
-
-	.toggle input {
-		opacity: 0;
-		width: 0;
-		height: 0;
-	}
-
-	.slider {
-		position: absolute;
-		cursor: pointer;
-		inset: 0;
-		background: var(--border);
-		border-radius: 22px;
-		transition: 0.2s;
-	}
-
-	.slider::before {
-		content: '';
-		position: absolute;
-		height: 16px;
-		width: 16px;
-		left: 3px;
-		bottom: 3px;
-		background: white;
-		border-radius: 50%;
-		transition: 0.2s;
-	}
-
-	.toggle input:checked + .slider {
-		background: var(--accent);
-	}
-
-	.toggle input:checked + .slider::before {
-		transform: translateX(18px);
-	}
-
-	.password-form {
-		display: flex;
-		flex-direction: column;
-		gap: 0.5rem;
-		max-width: 300px;
-	}
-
-	.error {
-		color: var(--danger);
-		font-size: 0.8rem;
-	}
-
-	.muted {
-		font-size: 0.8rem;
-		color: var(--text-secondary);
-	}
-
-	.success {
-		color: var(--success);
-		font-size: 0.8rem;
-	}
-
-	.update-available {
-		color: var(--accent);
-		font-size: 0.875rem;
-		margin-top: 0.5rem;
-	}
-
-	.cs-flow {
-		display: flex;
-		flex-direction: column;
-		gap: 0.5rem;
-		padding: 0.5rem 0;
-	}
-
-	.cs-flow h3 {
-		font-size: 0.9rem;
-		margin: 0;
-	}
-
-	.cs-flow .muted {
-		font-size: 0.8rem;
-		color: var(--text-secondary);
-		margin: 0;
-	}
-
-	.cs-flow input {
-		max-width: 350px;
-	}
-
-	.tabs {
-		display: flex;
-		gap: 0;
-		border-radius: 6px;
-		overflow: hidden;
-		width: fit-content;
-	}
-
-	.tabs button {
-		padding: 0.35rem 1rem;
-		font-size: 0.8rem;
-		border: 1px solid var(--border);
-		background: var(--bg-secondary);
-		cursor: pointer;
-	}
-
-	.tabs button.active {
-		background: var(--accent);
-		border-color: var(--accent);
-		color: white;
-	}
-
-	.button-row {
-		display: flex;
-		gap: 0.5rem;
-		margin-top: 0.25rem;
-	}
-
-	button.small {
-		padding: 0.25rem 0.75rem;
-		font-size: 0.75rem;
-	}
-
-	button.danger {
-		background: var(--danger);
-		border-color: var(--danger);
-		color: white;
-	}
-
-	button.danger:hover {
-		opacity: 0.9;
-	}
-
-	.danger-zone {
-		border: 1px solid var(--danger);
-	}
-
-	.danger-zone h2 {
-		color: var(--danger);
-	}
-
-	.confirm-actions {
-		display: flex;
-		gap: 0.5rem;
-	}
-</style>
+<Dialog
+	bind:open={passwordOpen}
+	locked={changingPassword}
+	size="sm"
+	title="Change password"
+	description="After the change, this device signs out and you sign in again with the new password."
+>
+	<form id="password-form" class="flex flex-col gap-3.5" onsubmit={handlePasswordChange} novalidate>
+		<Field label="Current password" type="password" autocomplete="current-password" bind:value={currentPassword} />
+		<Field label="New password" type="password" autocomplete="new-password" hint="At least 8 characters." bind:value={newPassword} />
+		<Field label="Confirm new password" type="password" autocomplete="new-password" bind:value={confirmPassword} />
+		{#if passwordError}<p class="text-xs text-danger-fg" role="alert">{passwordError}</p>{/if}
+	</form>
+	{#snippet footer()}
+		<Button variant="ghost" disabled={changingPassword} onclick={() => (passwordOpen = false)}>Cancel</Button>
+		<Button
+			type="submit"
+			form="password-form"
+			variant="primary"
+			loading={changingPassword}
+			disabled={!currentPassword || !newPassword || !confirmPassword}
+		>
+			Change password
+		</Button>
+	{/snippet}
+</Dialog>

@@ -174,6 +174,24 @@ graph on future Tauri updates and exercise Linux builds when a compatible fix be
   (for example the clipboard `offset`) do not become reactive dependencies that re-trigger the load.
 - User feedback goes through the `toast` store (`lib/stores/toast.svelte.ts`).
 
+### Desktop app UI conventions
+
+- The desktop app shares the web dashboard's brand: the same token names, Geist type, ink primary
+  buttons and a single orange accent kept for live state (status dots, the mesh beam, the pending badge).
+  Tokens live in `desktop-tauri/src/lib/app.css`; the dark theme only swaps their values under
+  `:root.dark`, so prefer tokens (including the `*-soft` / `*-line` / `*-fg` semantic tints) over raw
+  colours and `dark:` overrides. `lib/theme.svelte.ts` applies System/Light/Dark and syncs the native
+  title bar.
+- Primitives are in `desktop-tauri/src/lib/components/ui/` (`Button`, `Field`, `Switch`, `Segmented`,
+  `Dialog`, `Alert`, `Badge`, `EmptyState`, `Skeleton`, `Fingerprint`, `Kbd`, `SettingsGroup`,
+  `SettingRow`, …); screens are in `lib/components/` and `routes/`.
+- Never use `window.confirm`/`alert` (webviews render them inconsistently): ask with
+  `confirmAction()` from `lib/confirm.svelte.ts` and report outcomes with `toast` from
+  `lib/toast.svelte.ts`.
+- Fingerprints are always shown in full with the `Fingerprint` component (groups of four); never shorten them.
+- Keep keyboard parity with desktop conventions: `⌘/Ctrl+1…4` switch sections, `⌘/Ctrl+,` opens
+  Settings, `⌘/Ctrl+F` searches history.
+
 ## Submitting Changes
 
 1. Make sure your code compiles without warnings (`cargo check`, `cargo clippy`)

@@ -10,6 +10,43 @@ let syncError = $state('');
 
 export function getSyncError() { return syncError; }
 
+export function clearSyncError() {
+	syncError = '';
+}
+
+// Devices waiting for approval, badged in the navigation
+let pendingDeviceCount = $state(0);
+
+export function getPendingDeviceCount() {
+	return pendingDeviceCount;
+}
+
+export function setPendingDeviceCount(count: number) {
+	pendingDeviceCount = count;
+}
+
+// What happened during this session, newest first, for the overview timeline
+export type ActivityKind = 'connected' | 'disconnected' | 'device-online' | 'device-offline' | 'sync-error';
+
+export interface ActivityEvent {
+	id: number;
+	kind: ActivityKind;
+	label: string;
+	at: number;
+}
+
+const MAX_ACTIVITY = 30;
+let activity = $state<ActivityEvent[]>([]);
+let nextActivityId = 1;
+
+export function getActivity() {
+	return activity;
+}
+
+function recordActivity(kind: ActivityKind, label: string) {
+	activity = [{ id: nextActivityId++, kind, label, at: Date.now() }, ...activity].slice(0, MAX_ACTIVITY);
+}
+
 // Update state
 let availableUpdate = $state<UpdateInfo | null>(null);
 let lastDismissedVersion = $state<string>('');
@@ -69,19 +106,30 @@ export function initEventListeners(): () => void {
 	listenersInitialized = true;
 
 	listen<string>('connection-state-changed', (event) => {
+		const previous = appState;
 		appState = event.payload as string;
 		if (appState === 'connected' || appState === 'not_configured') syncError = '';
+		if (appState !== previous) {
+			if (appState === 'connected') recordActivity('connected', 'Connected to the relay');
+			else if (appState === 'disconnected' && previous === 'connected') recordActivity('disconnected', 'Disconnected from the relay');
+		}
 		refreshStatus();
 	}).then((u) => unlistenFns.push(u));
 
-	listen<string>('sync-error', (event) => { syncError = event.payload; })
-		.then((u) => unlistenFns.push(u));
+	listen<string>('sync-error', (event) => {
+		syncError = event.payload;
+		recordActivity('sync-error', event.payload);
+	}).then((u) => unlistenFns.push(u));
 
 	listen<HistoryEntry>('clipboard-new', (event) => {
 		recentEntry = event.payload;
 	}).then((u) => unlistenFns.push(u));
 
-	listen('device-status-changed', () => {
+	listen<{ device_name?: unknown; online?: unknown }>('device-status-changed', (event) => {
+		const { device_name, online } = event.payload ?? {};
+		if (typeof device_name === 'string' && typeof online === 'boolean') {
+			recordActivity(online ? 'device-online' : 'device-offline', `${device_name} ${online ? 'came online' : 'went offline'}`);
+		}
 		refreshStatus();
 	}).then((u) => unlistenFns.push(u));
 

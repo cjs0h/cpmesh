@@ -122,7 +122,7 @@ closing the window hides it instead of quitting.
 |-----------|----------|------|-------------|
 | Server | `crates/cpmesh-server/` | Rust, Axum, SQLx, PostgreSQL | REST API, WebSocket relay, and web dashboard host |
 | Shared Proto | `crates/cpmesh-proto/` | Rust | Shared WebSocket message types and API request/response types |
-| Desktop App | `desktop-tauri/` | Rust, Tauri v2, SvelteKit 3 | Desktop client with tray integration and local device state |
+| Desktop App | `desktop-tauri/` | Rust, Tauri v2, SvelteKit 3, Tailwind CSS 4 | Desktop client with tray integration, light/dark themes and local device state |
 | Web Dashboard | `web/` | Svelte 5, TypeScript, Vite 8, Tailwind CSS 4 | Landing page, sign-in with two-factor authentication, device management, live clipboard history, and admin console |
 | MCP Server | `mcp/cpmesh-mcp/` | TypeScript, MCP SDK | Lets AI agents use cpmesh: share clipboard text, read history, manage devices |
 
