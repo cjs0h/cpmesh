@@ -8,6 +8,7 @@ use sha2::Sha256;
 use thiserror::Error;
 
 type GcmNonce = Nonce<Aes256Gcm>;
+type GcmKey = aes_gcm::Key<Aes256Gcm>;
 
 #[derive(Error, Debug)]
 pub enum CryptoError {
@@ -62,9 +63,10 @@ pub fn derive_key_from_secret(
 
 fn derive_key(secret: &[u8], salt: &[u8], info: &[u8]) -> Result<[u8; 32], CryptoError> {
     let hk = Hkdf::<Sha256>::new(Some(salt), secret);
-    let mut key = [0u8; 32];
-    hk.expand(info, &mut key).map_err(|_| CryptoError::Hkdf)?;
-    Ok(key)
+    let mut key = GcmKey::default();
+    hk.expand(info, key.as_mut_slice())
+        .map_err(|_| CryptoError::Hkdf)?;
+    Ok(key.0)
 }
 
 /// Encrypts plaintext using AES-256-GCM.
@@ -149,11 +151,11 @@ pub fn decrypt_with_aad(key: &[u8; 32], data: &[u8], aad: &[u8]) -> Result<Vec<u
         .map_err(|e| CryptoError::Decrypt(format!("open: {e}")))
 }
 
-/// Generates a random 256-bit group key.
+/// Generates a random 256-bit group key from the operating system's CSPRNG.
 pub fn generate_group_key() -> [u8; 32] {
-    let mut key = [0u8; 32];
-    fill_random(&mut key);
-    key
+    let mut key = GcmKey::default();
+    fill_random(key.as_mut_slice());
+    key.0
 }
 
 /// Legacy (protocol ≤ 2) wrap: static-static ECDH between two identity keys.
