@@ -3,6 +3,7 @@
 [![Server CI](https://github.com/cjs0h/cpmesh/actions/workflows/server.yml/badge.svg)](https://github.com/cjs0h/cpmesh/actions/workflows/server.yml)
 [![Web CI](https://github.com/cjs0h/cpmesh/actions/workflows/web.yml/badge.svg)](https://github.com/cjs0h/cpmesh/actions/workflows/web.yml)
 [![Desktop CI](https://github.com/cjs0h/cpmesh/actions/workflows/desktop.yml/badge.svg)](https://github.com/cjs0h/cpmesh/actions/workflows/desktop.yml)
+[![Built with AI, supervised by an experienced engineer](https://img.shields.io/badge/built_with_AI-engineer_supervised-ff5c38)](#how-cpmesh-is-built)
 
 > **Warning:** This project is under heavy development and has not reached a stable release. APIs, configuration, and behavior may change without notice. Use at your own risk.
 
@@ -322,6 +323,12 @@ at 16 KiB. Device queues hold at most eight messages, share a 64 MiB per-user by
 five-second write deadline. Slow consumers disconnect and recover from persisted history. Ciphertext
 history pages are byte-bounded; the browser requests size/metadata projections instead of ciphertext.
 Installer downloads stream with single byte-range support and cache validators.
+
+## How cpmesh is built
+
+cpmesh is built using AI, under the supervision of an experienced software engineer. AI coding agents write and change the code; the engineer sets the architecture and the security model, directs the work, and reviews it before it is merged.
+
+The same safeguards apply as for any other project: each component has automated tests that run in CI (see [Testing](#testing)), and security issues can be reported as described in [SECURITY.md](SECURITY.md).
 
 ## License
 
