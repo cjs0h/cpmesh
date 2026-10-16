@@ -71,10 +71,11 @@ function fakeServer({ mfa = false } = {}) {
     const token = req.auth?.replace(/^Bearer /, "");
     if (!token || !valid.has(token)) return reply(401, { error: "invalid token" });
 
+    if (req.path === "/api/devices/challenge") return reply(200, { challenge: `challenge-${bound}` });
     if (req.path === "/api/devices" && req.method === "POST") {
       const deviceToken = `device-token-${++bound}`;
       valid.add(deviceToken);
-      return reply(201, { device: { id: "d1", status: "approved", is_reregistration: false }, access_token: deviceToken });
+      return reply(201, { device: { id: "d1", status: "approved", is_reregistration: false }, access_token: deviceToken, refresh_token: refreshToken });
     }
     if (req.path === "/api/group-key" && req.method === "GET") return reply(404, { error: "no group key" });
     if (req.path === "/api/group-key" && req.method === "POST") return reply(200, {});

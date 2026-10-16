@@ -12,10 +12,14 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { join, dirname } from "node:path";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+const home = await mkdtemp(join(tmpdir(), "cpmesh-protocol-smoke-"));
 const proc = spawn(process.execPath, [join(root, "dist", "index.js")], {
   stdio: ["pipe", "pipe", "pipe"],
+  env: { ...process.env, CPMESH_HOME: home, CPMESH_SERVER_URL: "", CPMESH_USERNAME: "", CPMESH_PASSWORD: "" },
 });
 
 let failures = 0;
@@ -85,9 +89,11 @@ try {
     "cpmesh_list_devices",
     "cpmesh_remove_device",
     "cpmesh_logout",
+    "cpmesh_confirm_pairing",
+    "cpmesh_verify_device",
   ];
   check(
-    "all 11 tools registered",
+    `all ${expected.length} tools registered`,
     expected.every((n) => toolNames.includes(n)),
   );
 
@@ -126,6 +132,7 @@ try {
 } finally {
   clearTimeout(timeout);
   proc.kill();
+  await rm(home, { recursive: true, force: true });
 }
 
 process.exit(failures === 0 ? 0 : 1);

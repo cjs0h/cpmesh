@@ -106,7 +106,7 @@ describe("golden vectors (Rust ↔ TS byte compatibility)", () => {
     expect(unwrapped).toEqual(gk);
   });
 
-  it("derives the same 8-digit approval code", () => {
+  it("derives the same full 256-bit pairing fingerprint", () => {
     const code = deriveApprovalCode(
       hex(vectors.priv_a!),
       hex(vectors.pub_b!),

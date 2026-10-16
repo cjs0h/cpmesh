@@ -6,12 +6,18 @@ on:
     paths:
       - "mcp/cpmesh-mcp/**"
       - "desktop-tauri/src-tauri/src/crypto/**"
+      - "crates/**"
+      - "web/**"
+      - "Cargo.lock"
       - ".github/workflows/mcp.yml"
   pull_request:
     branches: [main, master]
     paths:
       - "mcp/cpmesh-mcp/**"
       - "desktop-tauri/src-tauri/src/crypto/**"
+      - "crates/**"
+      - "web/**"
+      - "Cargo.lock"
       - ".github/workflows/mcp.yml"
 
 jobs:
@@ -56,3 +62,36 @@ jobs:
           cargo run --release > /tmp/vectors.json
       - name: Compare with committed vectors
         run: diff <(jq -S . /tmp/vectors.json) <(jq -S . test/vectors.json)
+
+  integration:
+    name: MCP against the real relay
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: cpmesh
+          POSTGRES_PASSWORD: cpmesh
+          POSTGRES_DB: cpmesh_e2e
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U cpmesh"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            mcp/cpmesh-mcp/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: npm --prefix web ci && npm --prefix web run build
+      - run: cargo build --locked -p cpmesh-server
+      - run: npm --prefix mcp/cpmesh-mcp ci && npm --prefix mcp/cpmesh-mcp run build
+      - name: Mandatory MFA, registration proof, persistence ACK, retry and keyring restart
+        env:
+          CPMESH_E2E_DATABASE_URL: postgres://cpmesh:cpmesh@127.0.0.1:5432/cpmesh_e2e
+        run: node mcp/cpmesh-mcp/scripts/live-smoke.mjs

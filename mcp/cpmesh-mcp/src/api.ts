@@ -16,6 +16,7 @@ import type {
   StoreGroupKeyEntry,
   UserInfo,
 } from "./protocol.js";
+import { groupKeysSchema } from "./protocol.js";
 
 export class ApiError extends Error {
   constructor(
@@ -110,6 +111,7 @@ export class CpmeshApi {
       method,
       headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(30_000),
     });
 
     if (res.status === 401 && auth && token === undefined && !refreshed) {
@@ -160,6 +162,7 @@ export class CpmeshApi {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ refresh_token: this.refreshToken }),
+        signal: AbortSignal.timeout(30_000),
       });
       if (res.status === 409) {
         // Another process sharing this session used the token moments ago. Adopt the
@@ -238,15 +241,22 @@ export class CpmeshApi {
 
   async registerDevice(
     req: RegisterDeviceRequest,
+    signChallenge: (challenge: string) => string,
     opts: { retryOnExpiry?: boolean } = {},
   ): Promise<RegisterDeviceResponse> {
+    const challenge = await this.request<{ challenge: string }>("/api/devices/challenge", {
+      method: "POST", refreshed: opts.retryOnExpiry === false,
+    });
+    if (typeof challenge.challenge !== "string") throw new Error("Invalid device challenge");
     const resp = await this.request<RegisterDeviceResponse>("/api/devices", {
       method: "POST",
-      body: req,
-      refreshed: opts.retryOnExpiry === false,
+      body: { ...req, proof: { challenge: challenge.challenge, signature: signChallenge(challenge.challenge) } },
+      // Never replay a single-use proof with a different bearer session.
+      refreshed: true,
     });
-    // The server returns a device-bound access token.
+    if (!resp.refresh_token || !resp.access_token) throw new Error("Server did not return a device-bound session; update the server");
     this.accessToken = resp.access_token;
+    this.refreshToken = resp.refresh_token;
     return resp;
   }
 
@@ -287,7 +297,13 @@ export class CpmeshApi {
   ): Promise<GroupKeysResponse> {
     const q =
       sinceVersion !== undefined ? `?since_version=${sinceVersion}` : "";
-    return this.request<GroupKeysResponse>(`/api/group-keys/current${q}`);
+    return groupKeysSchema.parse(await this.request<unknown>(`/api/group-keys/current${q}`));
+  }
+
+  async rotateGroupKey(expected: number, version: number, wrappedKeys: StoreGroupKeyEntry[]): Promise<void> {
+    await this.request("/api/group-keys/rotate", {
+      method: "POST", body: { expected_current_version: expected, new_version: version, wrapped_keys: wrappedKeys },
+    });
   }
 
   // === Approvals ===

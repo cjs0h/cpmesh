@@ -40,8 +40,10 @@ describe("CpmeshApi", () => {
 
   it("registerDevice switches to the device-bound token", async () => {
     const calls = mockFetch((url) =>
-      url.includes("/api/devices")
-        ? { status: 201, body: { device: { id: "d1", status: "pending", is_reregistration: false }, access_token: "device-token" } }
+      url.endsWith("/api/devices/challenge")
+        ? { status: 200, body: { challenge: "session-challenge" } }
+        : url.endsWith("/api/devices")
+        ? { status: 201, body: { device: { id: "d1", status: "pending", is_reregistration: false }, access_token: "device-token", refresh_token: "device-refresh" } }
         : { status: 404, body: { error: "nf" } },
     );
     const api = new CpmeshApi("https://srv");
@@ -51,9 +53,11 @@ describe("CpmeshApi", () => {
       public_key: "cHVi",
       public_key_sig: "c2ln",
       fingerprint: "fp",
-    });
+    }, () => "cHJvb2Y=");
     expect(res.device.id).toBe("d1");
     expect(api.access).toBe("device-token");
+    expect(api.refresh).toBe("device-refresh");
+    expect(JSON.parse(calls[1]!.init!.body as string).proof).toEqual({ challenge: "session-challenge", signature: "cHJvb2Y=" });
     expect((calls[0]!.init!.headers as Record<string, string>).Authorization).toBe("Bearer old");
   });
 
@@ -164,10 +168,11 @@ describe("CpmeshApi", () => {
       if (url.endsWith("/api/auth/refresh")) {
         return { status: 200, body: { access_token: "unbound", refresh_token: "rt2" } };
       }
+      if (url.endsWith("/api/devices/challenge")) return { status: 200, body: { challenge: "fresh-challenge" } };
       const auth = (init?.headers as Record<string, string>).Authorization;
       if (url.endsWith("/api/devices") && init?.method === "POST") {
         return auth === "Bearer unbound"
-          ? { status: 200, body: { device: { id: "d1", status: "approved", is_reregistration: false }, access_token: "bound" } }
+          ? { status: 200, body: { device: { id: "d1", status: "approved", is_reregistration: false }, access_token: "bound", refresh_token: "rt2" } }
           : { status: 401, body: { error: "expired" } };
       }
       return auth === "Bearer bound" ? { status: 200, body: [] } : { status: 401, body: { error: "expired" } };
@@ -179,6 +184,7 @@ describe("CpmeshApi", () => {
     api.rebind = async (a) => {
       await a.registerDevice(
         { name: "MCP", public_key: "cHVi", public_key_sig: "c2ln", fingerprint: "fp" },
+        () => "cHJvb2Y=",
         { retryOnExpiry: false },
       );
     };

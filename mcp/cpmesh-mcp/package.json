@@ -21,7 +21,7 @@
     "node": ">=18.19"
   },
   "scripts": {
-    "build": "tsup",
+    "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "prepublishOnly": "npm run typecheck && npm run build && npm run test"
@@ -30,15 +30,17 @@
     "@modelcontextprotocol/sdk": "^1.12.0",
     "@noble/curves": "^1.8.1",
     "@noble/hashes": "^1.8.0",
+    "proper-lockfile": "^4.1.2",
     "ws": "^8.18.0",
     "zod": "^3.25.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "@types/proper-lockfile": "^4.1.4",
     "@types/ws": "^8.5.13",
-    "tsup": "^8.3.5",
+    "esbuild": "^0.28.2",
     "typescript": "^5.7.0",
-    "vitest": "^5.0.4"
+    "vitest": "^5.0.5"
   },
   "keywords": [
     "mcp",

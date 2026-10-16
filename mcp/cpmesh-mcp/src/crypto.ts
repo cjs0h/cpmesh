@@ -19,17 +19,20 @@ import {
   createCipheriv,
   createDecipheriv,
   randomBytes,
+  randomUUID,
 } from "node:crypto";
 import { p256 } from "@noble/curves/p256";
 import { hkdf } from "@noble/hashes/hkdf";
 import { sha256 } from "@noble/hashes/sha256";
-import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, openSync, closeSync, fsyncSync, renameSync, rmSync } from "node:fs";
 import { dirname } from "node:path";
+import type { DeviceIdentity, StoreGroupKeyEntry } from "./protocol.js";
+import { z } from "zod";
 
 const INFO_SHARED = new TextEncoder().encode("cpmesh-clipboard-v1");
 const INFO_GROUP = new TextEncoder().encode("cpmesh-group-v1");
 const INFO_KEYRING = new TextEncoder().encode("cpnet-keyring-v1");
-const INFO_APPROVAL = new TextEncoder().encode("cpnet-approval-v1");
+const INFO_APPROVAL = new TextEncoder().encode("cpmesh-pairing-fingerprint-v2");
 const SALT_GROUP_KEY_WRAP = new TextEncoder().encode("group-key-wrap");
 
 export class CryptoError extends Error {}
@@ -152,8 +155,8 @@ export function decryptGroupKey(
 // === Approval code ===
 
 /**
- * Derives the 8-digit approval code from an ECDH shared secret.
- * Both sides compute the same code; the server never sees it.
+ * Full 256-bit fingerprint: compare all characters on BOTH devices through an
+ * independent trusted channel. This is not a short authentication-string protocol.
  */
 export function deriveApprovalCode(
   ourPrivateKey: Uint8Array,
@@ -168,9 +171,7 @@ export function deriveApprovalCode(
   const combined =
     lexicographicCompare(a, b) <= 0 ? concat(a, b) : concat(b, a);
   const salt = sha256(combined);
-  const derived = deriveKey(shared, salt, INFO_APPROVAL).subarray(0, 4);
-  const code = readUint32BE(derived) % 100_000_000;
-  return code.toString().padStart(8, "0");
+  return Buffer.from(deriveKey(shared, salt, INFO_APPROVAL)).toString("hex").toUpperCase();
 }
 
 // === ECDSA public-key self-signature ===
@@ -288,6 +289,20 @@ export class KeyPair {
     return compactToDer(compact);
   }
 
+  signMessage(message: Uint8Array): Uint8Array {
+    return compactToDer(normalizeSignature(p256.sign(message, this.privateKey, { prehash: true })));
+  }
+
+  signDeviceChallenge(challenge: string): string {
+    return Buffer.from(this.signMessage(new TextEncoder().encode(`cpmesh-device-proof-v1\n${challenge}`))).toString("base64");
+  }
+
+  static verifyMessage(publicKey: Uint8Array, message: Uint8Array, signature: Uint8Array): boolean {
+    try {
+      return p256.verify(derToCompact(signature), message, publicKey, { prehash: true, lowS: false });
+    } catch { return false; }
+  }
+
   static verifyPublicKeySignature(
     publicKey: Uint8Array,
     signature: Uint8Array,
@@ -338,13 +353,33 @@ export class Keyring {
   }
 
   initGroupKey(): void {
-    this.keysByVersion.set(1, generateGroupKey());
-    this.currentVersion = 1;
+    if (this.hasGroupKey()) throw new CryptoError("refusing to reinitialize an existing keyring");
+    this.addKeyVersion(1, generateGroupKey());
   }
 
   addKeyVersion(version: number, key: Uint8Array): void {
+    if (!Number.isSafeInteger(version) || version < 1 || key.length !== 32) {
+      throw new CryptoError("invalid group key version or length");
+    }
+    const previous = this.keysByVersion.get(version);
+    if (previous && !Buffer.from(previous).equals(Buffer.from(key))) {
+      throw new CryptoError("refusing to replace existing key material");
+    }
     if (version > this.currentVersion) this.currentVersion = version;
     this.keysByVersion.set(version, key);
+  }
+
+  hasVersion(version: number): boolean { return this.keysByVersion.has(version); }
+
+  clone(): Keyring {
+    const copy = new Keyring();
+    for (const [version, key] of this.keysByVersion) copy.addKeyVersion(version, key.slice());
+    return copy;
+  }
+
+  replaceWith(candidate: Keyring): void {
+    this.keysByVersion = candidate.keysByVersion;
+    this.currentVersion = candidate.currentVersion;
   }
 
   private currentKey(): Uint8Array {
@@ -439,14 +474,15 @@ export class Keyring {
     const encrypted = data.subarray(16);
     const kek = deriveKeyFromSecret(devicePrivateKey, salt, INFO_KEYRING);
     const json = new TextDecoder().decode(decrypt(kek, encrypted));
-    const parsed = JSON.parse(json) as {
-      current_version: number;
-      keys: Record<string, string>;
-    };
+    const parsed = z.object({
+      current_version: z.number().int().positive(), keys: z.record(z.string()),
+    }).parse(JSON.parse(json));
     const ring = new Keyring();
-    ring.currentVersion = parsed.current_version;
     for (const [v, b64] of Object.entries(parsed.keys)) {
-      ring.keysByVersion.set(Number(v), new Uint8Array(Buffer.from(b64, "base64")));
+      ring.addKeyVersion(Number(v), new Uint8Array(Buffer.from(b64, "base64")));
+    }
+    if (!ring.hasVersion(parsed.current_version) || ring.currentVersion !== parsed.current_version) {
+      throw new CryptoError("saved keyring has no valid active key");
     }
     return ring;
   }
@@ -479,20 +515,57 @@ function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
   return out;
 }
 
-function readUint32BE(b: Uint8Array): number {
-  return ((b[0]! << 24) | (b[1]! << 16) | (b[2]! << 8) | b[3]!) >>> 0;
-}
-
-/** Writes with 0600 permissions on Unix (best-effort on Windows). */
+/** Atomic replacement, never a partially written private key or keyring. */
 export function writeSecretFile(path: string, data: Buffer): void {
   const dir = dirname(path);
   if (dir) mkdirSync(dir, { recursive: true });
-  writeFileSync(path, data, { mode: 0o600 });
-  if (process.platform !== "win32") {
-    try {
-      chmodSync(path, 0o600);
-    } catch {
-      // best-effort
-    }
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  try {
+    const fd = openSync(temporary, "wx", 0o600);
+    try { writeFileSync(fd, data); fsyncSync(fd); } finally { closeSync(fd); }
+    renameSync(temporary, path);
+  } finally {
+    if (existsSync(temporary)) rmSync(temporary);
   }
+}
+
+export function membershipTranscript(
+  version: number, sender: string, members: DeviceIdentity[], hashes: Record<string, string>,
+): Uint8Array {
+  const id = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+  if (!Number.isInteger(version) || version < 1 || !id.test(sender)
+      || Object.keys(hashes).length !== members.length
+      || members.some((member) => !id.test(member.id) || !hashes[member.id])
+      || Object.values(hashes).some((hash) => !/^[0-9a-f]{64}$/.test(hash))) {
+    throw new CryptoError("invalid wrapped-key commitments");
+  }
+  const ordered = [...members].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+  return new TextEncoder().encode(
+    `cpmesh-membership-v2\n${version}\n${sender}\n` +
+    ordered.map((m) => `${m.id}:${m.public_key}:${hashes[m.id]}\n`).join(""),
+  );
+}
+
+export function wrappedKeyHash(encrypted: Uint8Array): string {
+  return Buffer.from(sha256(encrypted)).toString("hex");
+}
+
+export function signedWraps(
+  pair: KeyPair, sender: string, version: number, groupKey: Uint8Array, members: DeviceIdentity[],
+): StoreGroupKeyEntry[] {
+  if (members.length === 0) throw new CryptoError("empty membership");
+  const wraps: StoreGroupKeyEntry[] = members.map((member) => {
+    const encrypted_key = Buffer.from(encryptGroupKey(
+      groupKey, pair.privateKey, Buffer.from(member.public_key, "base64"),
+    )).toString("base64");
+    return { device_id: member.id, encrypted_key };
+  });
+  const hashes = Object.fromEntries(wraps.map((wrap) => [
+    wrap.device_id, wrappedKeyHash(Buffer.from(wrap.encrypted_key, "base64")),
+  ]));
+  wraps[0]!.membership = {
+    members, wrapped_key_hashes: hashes,
+    signature: Buffer.from(pair.signMessage(membershipTranscript(version, sender, members, hashes))).toString("base64"),
+  };
+  return wraps;
 }

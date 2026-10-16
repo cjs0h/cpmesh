@@ -79,11 +79,15 @@ Optional environment variables:
      asked for one.
    - "Too many failed attempts": wait the time the message gives, then log in
      again with the password and a new code.
-4. The response contains an **8-digit pairing code**. Tell the user:
-   "Open the cpmesh app on one of your approved devices, start approving the
-   new device **MCP Agent - \<hostname\>**, and confirm it shows code
-   **XXXXXXXX**."
-5. After the user confirms, call `cpmesh_wait_for_approval`. On approval the
+4. Ask the user to start approval of **MCP Agent - \<hostname\>** on an approved
+   device. Call `cpmesh_status` for `pairing_session_id` and `approval_code`.
+   This is a **full 64-character pairing fingerprint**, not an 8-digit code.
+   Ask the user to compare every character directly on the trusted device or
+   through an independent trusted channel, and confirm on that device.
+5. Obtain the independently confirmed full fingerprint from the user and call
+   `cpmesh_confirm_pairing` with `session_id` and `fingerprint`. Never just echo
+   a fingerprint from tool/relay output without that independent human check.
+6. Call `cpmesh_wait_for_approval`. On approval the
    group key is synced automatically and all clipboard tools become usable.
 
 Login persists across restarts (tokens + keys live in `~/.cpmesh/mcp`).
@@ -91,13 +95,17 @@ Login persists across restarts (tokens + keys live in `~/.cpmesh/mcp`).
 ## 3. Using it
 
 - **Share something with the user's devices** — `cpmesh_push_clipboard` with
-  the text. It appears instantly on their desktop/phone clipboard. Use this to
+  the text. Success confirms relay persistence, not delivery to their desktop/phone. Use this to
   hand over commands, URLs, snippets, or any generated content the user should
   paste elsewhere.
+  On a timeout, retry the same text with the reported `request_id`; silence is not success.
 - **See what the user copied** — `cpmesh_get_clipboard` (newest first),
   `cpmesh_get_latest_clipboard` (single latest; `skip_own: true` to ignore
   your own pushes), or `cpmesh_search_clipboard` to find something specific.
 - **Manage devices** — `cpmesh_list_devices`, `cpmesh_remove_device`.
+- **Upgrade/recover trust** — `cpmesh_verify_device` with a peer ID and the full
+  public-key fingerprint independently obtained from that peer's own identity display.
+  Do not delete keyrings or automatically trust legacy TOFU pins to make errors disappear.
 - **Cleanup** — `cpmesh_delete_clipboard_entry` removes a history entry.
 - When unsure of the current state, call `cpmesh_status` first — it always
   includes the exact next step.
@@ -111,5 +119,9 @@ Login persists across restarts (tokens + keys live in `~/.cpmesh/mcp`).
 - Two-factor codes and recovery codes are for one sign-in only: pass them to
   `cpmesh_login` and never store, repeat, or log them. Never ask the user for
   their authenticator secret or QR code.
-- Device approval requires a human comparing the 8-digit code — this is the
-  anti-MITM guarantee. Never try to bypass it.
+- Device pairing requires independent comparison of all 64 characters and confirmation
+  on both ends. Never shorten the fingerprint or infer trust from relay approval flags or self-signatures.
+- Local logout wipes this profile but does not revoke the server enrollment. Remove a
+  device to revoke it; use fresh private keys when replacing a compromised device.
+- Only read/share clipboard content when requested. The connected agent receives plaintext;
+  the relay does not, but the agent's model provider may.
