@@ -28,6 +28,8 @@ pub struct AppConfig {
     pub autostart: bool,
     #[serde(default = "default_true")]
     pub notifications_enabled: bool,
+    /// The shortcut that shows cpmesh from any app, as an accelerator; empty when it is
+    /// turned off. Desktop only (see `shortcut.rs`).
     #[serde(default = "default_hotkey")]
     pub global_hotkey: String,
     /// Device status from server (pending/approved/rejected/revoked).
@@ -35,12 +37,21 @@ pub struct AppConfig {
     pub device_status: String,
 }
 
+/// The shortcut that shows cpmesh until another is chosen: ⇧⌘Space on macOS,
+/// Ctrl+Shift+Space elsewhere.
+pub const DEFAULT_GLOBAL_HOTKEY: &str = "CmdOrCtrl+Shift+Space";
+
+/// What versions before the shortcut setting saved. They always registered
+/// [`DEFAULT_GLOBAL_HOTKEY`], which differs from this on macOS (⌘ rather than ⌃).
+/// Settings spells an explicit ⌃ "Control", so this only ever means the old default.
+const LEGACY_DEFAULT_HOTKEY: &str = "Ctrl+Shift+Space";
+
 fn default_true() -> bool {
     true
 }
 
 fn default_hotkey() -> String {
-    "Ctrl+Shift+Space".to_string()
+    DEFAULT_GLOBAL_HOTKEY.to_string()
 }
 
 fn default_status() -> String {
@@ -69,6 +80,18 @@ impl AppConfig {
         !self.server_url.is_empty() && !self.device_id.is_empty()
     }
 
+    /// The config after signing out: the server, account and device registration are
+    /// forgotten, while how cpmesh behaves on this computer stays as it was.
+    pub fn signed_out(&self) -> AppConfig {
+        AppConfig {
+            auto_connect: self.auto_connect,
+            autostart: self.autostart,
+            notifications_enabled: self.notifications_enabled,
+            global_hotkey: self.global_hotkey.clone(),
+            ..AppConfig::default()
+        }
+    }
+
     pub fn load(config_dir: &Path) -> Result<Self, ConfigError> {
         Self::load_with_store(config_dir, &SecureStore::new("cpmesh", config_dir))
     }
@@ -77,7 +100,10 @@ impl AppConfig {
     pub fn load_with_store(config_dir: &Path, store: &SecureStore) -> Result<Self, ConfigError> {
         let path = config_dir.join("config.json");
         let data = fs::read_to_string(&path)?;
-        let config: AppConfig = serde_json::from_str(&data)?;
+        let mut config: AppConfig = serde_json::from_str(&data)?;
+        if config.global_hotkey == LEGACY_DEFAULT_HOTKEY {
+            config.global_hotkey = default_hotkey();
+        }
 
         // Migration: if the old config.json has tokens, load them and strip from file
         #[derive(Deserialize)]
@@ -199,9 +225,54 @@ mod tests {
         assert!(cfg.auto_connect);
         assert!(!cfg.autostart);
         assert!(cfg.notifications_enabled);
-        assert_eq!(cfg.global_hotkey, "Ctrl+Shift+Space");
+        assert_eq!(cfg.global_hotkey, "CmdOrCtrl+Shift+Space");
         assert_eq!(cfg.device_status, "approved");
         assert_eq!(cfg.device_name, hostname());
+    }
+
+    #[test]
+    fn legacy_default_hotkey_becomes_the_default_others_are_kept() {
+        let dir = TempDir::new().unwrap();
+        let store = SecureStore::file_only("cpmesh-test", dir.path());
+        let with_hotkey = |hotkey: &str| {
+            let cfg = AppConfig {
+                global_hotkey: hotkey.into(),
+                ..AppConfig::default()
+            };
+            cfg.save(dir.path()).unwrap();
+            AppConfig::load_with_store(dir.path(), &store)
+                .unwrap()
+                .global_hotkey
+        };
+        assert_eq!(with_hotkey("Ctrl+Shift+Space"), DEFAULT_GLOBAL_HOTKEY);
+        assert_eq!(with_hotkey("Control+Shift+Space"), "Control+Shift+Space");
+        assert_eq!(with_hotkey("CmdOrCtrl+Alt+V"), "CmdOrCtrl+Alt+V");
+        // Turned off
+        assert_eq!(with_hotkey(""), "");
+    }
+
+    #[test]
+    fn signing_out_forgets_the_account_but_keeps_preferences() {
+        let cfg = AppConfig {
+            server_url: "https://cpmesh.example".into(),
+            user_id: "u1".into(),
+            device_id: "d1".into(),
+            device_name: "Laptop".into(),
+            auto_connect: false,
+            autostart: true,
+            notifications_enabled: false,
+            global_hotkey: "CmdOrCtrl+Alt+V".into(),
+            device_status: "pending".into(),
+        };
+        let out = cfg.signed_out();
+        assert!(!out.is_configured());
+        assert!(out.server_url.is_empty() && out.user_id.is_empty() && out.device_id.is_empty());
+        assert_eq!(out.device_name, hostname());
+        assert_eq!(out.device_status, "approved");
+        assert!(!out.auto_connect);
+        assert!(out.autostart);
+        assert!(!out.notifications_enabled);
+        assert_eq!(out.global_hotkey, "CmdOrCtrl+Alt+V");
     }
 
     #[test]

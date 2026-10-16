@@ -32,10 +32,12 @@ export interface HistoryPage {
 
 export interface AppConfig {
 	server_url: string;
+	device_id: string;
 	device_name: string;
 	auto_connect: boolean;
 	autostart: boolean;
 	notifications_enabled: boolean;
+	/** The shortcut that shows cpmesh; change it with `setGlobalShortcut`. */
 	global_hotkey: string;
 	device_status: string;
 }
@@ -223,14 +225,45 @@ export async function getConfig(): Promise<AppConfig> {
 	return invoke('get_config');
 }
 
-export async function updateConfig(updates: Partial<AppConfig>): Promise<void> {
+export async function updateConfig(updates: Partial<Omit<AppConfig, 'global_hotkey'>>): Promise<void> {
 	return invoke('update_config', {
 		serverUrl: updates.server_url,
 		autoConnect: updates.auto_connect,
 		autostart: updates.autostart,
 		notificationsEnabled: updates.notifications_enabled,
-		globalHotkey: updates.global_hotkey
 	});
+}
+
+/** Where this device keeps its settings, keyring and clipboard history. */
+export async function getDataDir(): Promise<string> {
+	return invoke('get_data_dir');
+}
+
+/** The shortcut that shows cpmesh from any app (desktop only). */
+export interface ShortcutStatus {
+	/** Accelerator such as "CmdOrCtrl+Shift+Space"; empty when it's turned off. */
+	shortcut: string;
+	default_shortcut: string;
+	/** Whether pressing it reaches cpmesh right now. */
+	registered: boolean;
+	/** Why the saved shortcut isn't registered. */
+	error: string | null;
+	/** On Linux Wayland sessions: a command that shows cpmesh, to bind in the desktop's keyboard settings. */
+	launch_command: string | null;
+}
+
+export async function getGlobalShortcut(): Promise<ShortcutStatus> {
+	return invoke('get_global_shortcut');
+}
+
+/** Registers and saves a new shortcut, or turns it off with ''. Rejects with the reason when the system refuses it. */
+export async function setGlobalShortcut(shortcut: string): Promise<ShortcutStatus> {
+	return invoke('set_global_shortcut', { shortcut });
+}
+
+/** Puts text on the clipboard, where cpmesh syncs it like anything else copied. */
+export async function copyText(text: string): Promise<void> {
+	return invoke('plugin:clipboard-manager|write_text', { text });
 }
 
 export async function changePassword(currentPassword: string, newPassword: string): Promise<void> {

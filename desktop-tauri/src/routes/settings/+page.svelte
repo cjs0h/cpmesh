@@ -9,6 +9,8 @@
 		changePassword,
 		checkUpdate,
 		downloadAndInstallUpdate,
+		getDataDir,
+		getOwnIdentity,
 		logout,
 		getUserInfo,
 		type AppConfig,
@@ -20,12 +22,15 @@
 	import { isDesktop } from '#lib/platform.js';
 	import { getThemePreference, setThemePreference, type ThemePreference } from '#lib/theme.svelte.js';
 	import { toast } from '#lib/toast.svelte.js';
-	import { errorMessage, forgetServerUrl, isMacLike, serverHost } from '#lib/ui.js';
+	import { errorMessage, forgetServerUrl, isMacLike, isWindowsLike, serverHost } from '#lib/ui.js';
+	import GlobalShortcutSetting from '#lib/components/GlobalShortcutSetting.svelte';
 	import Alert from '#lib/components/ui/Alert.svelte';
 	import Badge from '#lib/components/ui/Badge.svelte';
 	import Button from '#lib/components/ui/Button.svelte';
+	import CopyButton from '#lib/components/ui/CopyButton.svelte';
 	import Dialog from '#lib/components/ui/Dialog.svelte';
 	import Field from '#lib/components/ui/Field.svelte';
+	import Fingerprint from '#lib/components/ui/Fingerprint.svelte';
 	import Kbd from '#lib/components/ui/Kbd.svelte';
 	import PageHeader from '#lib/components/ui/PageHeader.svelte';
 	import Segmented from '#lib/components/ui/Segmented.svelte';
@@ -61,6 +66,13 @@
 	let downloadingUpdate = $state(false);
 
 	let signingOut = $state(false);
+
+	// This device
+	let dataDir = $state('');
+	let fingerprintOpen = $state(false);
+	let fingerprint = $state('');
+	let fingerprintError = $state('');
+	const revealLabel = isMacLike() ? 'Show in Finder' : isWindowsLike() ? 'Show in Explorer' : 'Show folder';
 
 	const authProvider = $derived(user?.auth_provider || 'local');
 	const displayName = $derived(user?.full_name || user?.username || '');
@@ -170,6 +182,27 @@
 		}
 	}
 
+	// Read when first shown: on Linux, reading the keys can ask to unlock the keyring
+	async function showFingerprint() {
+		fingerprintOpen = true;
+		if (fingerprint) return;
+		fingerprintError = '';
+		try {
+			fingerprint = (await getOwnIdentity()).fingerprint;
+		} catch (e) {
+			fingerprintError = errorMessage(e);
+		}
+	}
+
+	async function revealDataDir() {
+		try {
+			const { revealItemInDir } = await import('@tauri-apps/plugin-opener');
+			await revealItemInDir(dataDir);
+		} catch (e) {
+			toast.error('Couldn’t open the folder', errorMessage(e));
+		}
+	}
+
 	async function signOut(options: { switchServer: boolean }) {
 		signingOut = true;
 		// Before logout: its event can mount the sign-in screen before this resumes
@@ -188,7 +221,7 @@
 	async function handleSwitchServer() {
 		const confirmed = await confirmAction({
 			title: 'Switch to another server?',
-			description: `This signs this device out of ${serverHost(config?.server_url)} and removes its keys here. You’ll sign in to the new server next, and approve this device there.`,
+			description: `This signs this device out of ${serverHost(config?.server_url)}. You’ll sign in to the new server next, and approve this device there.`,
 			confirmLabel: 'Sign out and switch',
 		});
 		if (confirmed) await signOut({ switchServer: true });
@@ -197,7 +230,8 @@
 	async function handleSignOut() {
 		const confirmed = await confirmAction({
 			title: 'Sign out of cpmesh?',
-			description: 'This device disconnects and forgets its keys and settings. To use it again, sign in and approve it from another device.',
+			description:
+				'This device stops syncing until you sign in again. Its keys, clipboard history and preferences stay on it, so it can rejoin the same account without another approval.',
 			confirmLabel: 'Sign out',
 			tone: 'danger',
 		});
@@ -225,6 +259,11 @@
 		getVersion()
 			.then((v) => (appVersion = v))
 			.catch(() => {});
+		if (desktop) {
+			getDataDir()
+				.then((dir) => (dataDir = dir))
+				.catch(() => {});
+		}
 		return () => {
 			disposed = true;
 			unlisten?.();
@@ -358,14 +397,12 @@
 
 		{#if desktop}
 			<SettingsGroup title="Keyboard shortcuts">
-				<SettingRow label="Show cpmesh from anywhere">
-					{#snippet control()}<Kbd keys={['mod', 'shift', 'Space']} />{/snippet}
-				</SettingRow>
+				<GlobalShortcutSetting />
 				<SettingRow label="Switch between sections">
 					{#snippet control()}<Kbd keys={['mod', '1']} /><span class="text-xs text-dim">to</span><Kbd keys={['mod', '4']} />{/snippet}
 				</SettingRow>
 				<SettingRow label="Search history">
-					{#snippet control()}<Kbd keys={['mod', 'F']} />{/snippet}
+					{#snippet control()}<Kbd keys={['mod', 'F']} /><span class="text-xs text-dim">or</span><Kbd keys={['/']} />{/snippet}
 				</SettingRow>
 				<SettingRow label="Open settings">
 					{#snippet control()}<Kbd keys={['mod', ',']} />{/snippet}
@@ -379,7 +416,26 @@
 					<Button size="sm" loading={signingOut} onclick={handleSwitchServer}>Switch server…</Button>
 				{/snippet}
 			</SettingRow>
-			<SettingRow label="This device" description={config.device_name || status?.device_name || '—'} />
+		</SettingsGroup>
+
+		<SettingsGroup title="This device">
+			<SettingRow label="Name" description={config.device_name || status?.device_name || '—'} />
+			{#if config.device_id}
+				<SettingRow label="Device ID">
+					<p class="mt-0.5 font-mono text-xs break-all text-muted">{config.device_id}</p>
+					{#snippet control()}<CopyButton text={config?.device_id ?? ''} label="Copy the device ID" />{/snippet}
+				</SettingRow>
+			{/if}
+			<SettingRow label="Fingerprint" description="Read it from here when another device asks you to compare.">
+				{#snippet control()}<Button size="sm" icon="fingerprint" onclick={showFingerprint}>Show</Button>{/snippet}
+			</SettingRow>
+			{#if desktop && dataDir}
+				<SettingRow label="Data folder">
+					<p class="mt-0.5 text-xs leading-relaxed text-muted">This device’s settings, encrypted keyring and clipboard history.</p>
+					<p class="mt-1 font-mono text-xs break-all text-muted">{dataDir}</p>
+					{#snippet control()}<Button size="sm" onclick={revealDataDir}>{revealLabel}</Button>{/snippet}
+				</SettingRow>
+			{/if}
 		</SettingsGroup>
 
 		<SettingsGroup title="About">
@@ -409,7 +465,7 @@
 		</SettingsGroup>
 
 		<SettingsGroup>
-			<SettingRow label="Sign out" description="Disconnect this device and remove its keys and settings.">
+			<SettingRow label="Sign out" description="Stop syncing until you sign in again. This device keeps its keys, clipboard history and preferences.">
 				{#snippet control()}
 					<Button size="sm" variant="danger-soft" icon="log-out" loading={signingOut} onclick={handleSignOut}>Sign out</Button>
 				{/snippet}
@@ -417,6 +473,23 @@
 		</SettingsGroup>
 	</div>
 {/if}
+
+<Dialog
+	bind:open={fingerprintOpen}
+	title="This device’s fingerprint"
+	description="Read it from this screen when another device asks you to compare. Every character has to match."
+>
+	{#if fingerprint}
+		<Fingerprint value={fingerprint} label="This device’s fingerprint" />
+	{:else if fingerprintError}
+		<Alert tone="danger" title="Couldn’t read this device’s keys">{fingerprintError}</Alert>
+	{:else}
+		<Skeleton class="h-[92px] w-full rounded-lg" />
+	{/if}
+	{#snippet footer()}
+		<Button variant="primary" onclick={() => (fingerprintOpen = false)}>Done</Button>
+	{/snippet}
+</Dialog>
 
 <Dialog
 	bind:open={passwordOpen}

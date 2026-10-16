@@ -117,6 +117,17 @@ describe('shortcutKeys', () => {
 		vi.stubGlobal('navigator', { platform: 'Win32', userAgent: '' });
 		expect(shortcutKeys(['mod', 'alt', 'K'])).toEqual(['Ctrl', 'Alt', 'K']);
 	});
+
+	it('spells Control and the Super key for each platform', () => {
+		vi.stubGlobal('navigator', { platform: 'MacIntel', userAgent: '' });
+		expect(shortcutKeys(['ctrl', 'alt', 'super'])).toEqual(['⌃', '⌥', '⌘']);
+		vi.stubGlobal('navigator', { platform: 'Win32', userAgent: '' });
+		expect(shortcutKeys(['ctrl', 'super'])).toEqual(['Ctrl', 'Win']);
+		vi.stubGlobal('navigator', { platform: 'Linux x86_64', userAgent: '' });
+		expect(shortcutKeys(['ctrl', 'super'])).toEqual(['Ctrl', 'Super']);
+		// The platform can also be given
+		expect(shortcutKeys(['mod', 'shift'], true)).toEqual(['⌘', '⇧']);
+	});
 });
 
 describe('remembered server', () => {

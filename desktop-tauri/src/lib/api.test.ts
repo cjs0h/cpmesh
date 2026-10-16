@@ -65,6 +65,16 @@ describe('Tauri command wrappers', () => {
 		['clearHistory', () => api.clearHistory(), 'clear_history', undefined],
 		['syncHistory', () => api.syncHistory(), 'sync_history', undefined],
 		['getConfig', () => api.getConfig(), 'get_config', undefined],
+		['getDataDir', () => api.getDataDir(), 'get_data_dir', undefined],
+		['getGlobalShortcut', () => api.getGlobalShortcut(), 'get_global_shortcut', undefined],
+		[
+			'setGlobalShortcut',
+			() => api.setGlobalShortcut('CmdOrCtrl+Alt+V'),
+			'set_global_shortcut',
+			{ shortcut: 'CmdOrCtrl+Alt+V' },
+		],
+		['setGlobalShortcut (turn off)', () => api.setGlobalShortcut(''), 'set_global_shortcut', { shortcut: '' }],
+		['copyText', () => api.copyText('d-1'), 'plugin:clipboard-manager|write_text', { text: 'd-1' }],
 		[
 			'changePassword',
 			() => api.changePassword('old', 'new'),
@@ -179,14 +189,12 @@ describe('updateConfig', () => {
 			auto_connect: false,
 			autostart: true,
 			notifications_enabled: false,
-			global_hotkey: 'Alt+V',
 		});
 		expect(invoke).toHaveBeenCalledWith('update_config', {
 			serverUrl: 'https://s',
 			autoConnect: false,
 			autostart: true,
 			notificationsEnabled: false,
-			globalHotkey: 'Alt+V',
 		});
 	});
 
@@ -198,7 +206,6 @@ describe('updateConfig', () => {
 			autoConnect: undefined,
 			autostart: true,
 			notificationsEnabled: undefined,
-			globalHotkey: undefined,
 		});
 	});
 });

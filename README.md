@@ -115,7 +115,9 @@ your recovery codes (see [Two-factor authentication](#two-factor-authentication)
 
 Then open the desktop app, enter your server URL and click Connect: sign in with your password and the code from your
 authenticator app, or choose **Sign in with browser** to use a passkey or SSO. The app runs in your system tray, so
-closing the window hides it instead of quitting.
+closing the window hides it instead of quitting. Press `Ctrl+Shift+Space` (`⇧⌘Space` on macOS) to bring it back from
+any app, or change or turn off that shortcut under **Settings → Keyboard shortcuts**. Wayland desktops may not pass app
+shortcuts on; there, Settings shows a command to bind in your desktop's own keyboard settings instead.
 
 ## Components
 
