@@ -5,6 +5,7 @@
 		removeDevice,
 		getPendingDevices,
 		beginDeviceApproval,
+		pollDeviceApproval,
 		confirmDeviceApproval,
 		rejectPendingDevice,
 		getOwnIdentity,
@@ -90,6 +91,29 @@
 		}
 	}
 
+	let sasPollTimer: ReturnType<typeof setInterval> | null = null;
+
+	function stopSasPolling() {
+		if (sasPollTimer) {
+			clearInterval(sasPollTimer);
+			sasPollTimer = null;
+		}
+	}
+
+	// The 8-digit code exists only after the pending device contributed its nonce
+	// and we opened our commitment; poll until then.
+	async function pollSas() {
+		if (!approvingDeviceId || !approvalSession) return;
+		try {
+			const updated = await pollDeviceApproval(approvingDeviceId, approvalSession.session_id);
+			approvalSession = updated;
+			if (updated.sas) stopSasPolling();
+		} catch (e) {
+			approvalError = friendlyError(String(e));
+			stopSasPolling();
+		}
+	}
+
 	async function handleBeginApproval(device: PendingDevice) {
 		approvalError = '';
 		approvingDeviceId = device.id;
@@ -97,6 +121,8 @@
 		approving = true;
 		try {
 			approvalSession = await beginDeviceApproval(device.id);
+			stopSasPolling();
+			sasPollTimer = setInterval(pollSas, 1500);
 		} catch (e) {
 			approvalError = friendlyError(String(e));
 			console.error('Begin approval failed:', e);
@@ -104,11 +130,11 @@
 	}
 
 	async function handleConfirmApproval() {
-		if (!approvingDeviceId || !approvalSession || confirming) return;
+		if (!approvingDeviceId || !approvalSession?.sas || confirming) return;
 		approvalError = '';
 		confirming = true;
 		try {
-			await confirmDeviceApproval(approvingDeviceId, approvalSession.session_id, approvalSession.approval_code);
+			await confirmDeviceApproval(approvingDeviceId, approvalSession.session_id, approvalSession.sas);
 			closeApprovalModal();
 			successMessage = 'Device approved successfully.';
 			setTimeout(() => { successMessage = ''; }, 3000);
@@ -136,6 +162,7 @@
 	}
 
 	function closeApprovalModal() {
+		stopSasPolling();
 		approvalSession = null;
 		approvingDeviceId = null;
 		approvingDeviceName = '';
@@ -165,7 +192,7 @@
 			.catch((e) => { error = String(e); });
 		let unlisten: UnlistenFn | undefined;
 		listen('device-status-changed', () => loadDevices()).then((u) => { unlisten = u; });
-		return () => { unlisten?.(); };
+		return () => { unlisten?.(); stopSasPolling(); };
 	});
 </script>
 
@@ -265,17 +292,28 @@
 			<h2>Approve "{approvingDeviceName}"</h2>
 
 			{#if approvalSession}
-				<p class="modal-desc">
-					Compare all 64 characters directly on the new device, or through an independent trusted channel. Confirm on both devices.
-				</p>
-				<div class="approval-code">{approvalSession.approval_code}</div>
+				{#if approvalSession.sas}
+					<p class="modal-desc">
+						The new device shows a pairing code too. Approve only if all eight digits are identical on both screens.
+					</p>
+					<div class="approval-code sas">{approvalSession.sas}</div>
+					<details class="full-code">
+						<summary>Full 64-character code (stronger manual check)</summary>
+						<code>{approvalSession.approval_code}</code>
+					</details>
+				{:else}
+					<p class="modal-desc">
+						Waiting for "{approvingDeviceName}" to join the pairing exchange. Keep its Waiting for Approval screen open.
+					</p>
+					<p class="loading">Exchanging pairing codes...</p>
+				{/if}
 				{#if approvalError}
 					<p class="error">{approvalError}</p>
 				{/if}
 				<div class="modal-actions">
 					<button onclick={closeApprovalModal} disabled={confirming}>Cancel</button>
-					<button class="primary" onclick={handleConfirmApproval} disabled={confirming}>
-						{confirming ? 'Approving...' : 'All characters match - approve'}
+					<button class="primary" onclick={handleConfirmApproval} disabled={confirming || !approvalSession.sas}>
+						{confirming ? 'Approving...' : 'Both devices show this code - approve'}
 					</button>
 				</div>
 			{:else if approvalError}
@@ -425,6 +463,25 @@
 		border: 1px solid var(--border);
 		border-radius: var(--radius, 0.5rem);
 		margin-bottom: 1rem;
+	}
+
+	.approval-code.sas {
+		font-size: 2rem;
+		letter-spacing: 0.3em;
+	}
+
+	.full-code {
+		text-align: left;
+		margin-bottom: 1rem;
+		font-size: 0.75rem;
+		color: var(--text-secondary);
+	}
+
+	.full-code code {
+		display: block;
+		margin-top: 0.5rem;
+		overflow-wrap: anywhere;
+		font-size: 0.75rem;
 	}
 
 	.modal-actions {

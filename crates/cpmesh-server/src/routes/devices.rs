@@ -26,13 +26,16 @@ pub(crate) fn verify_device_signature(public_key: &[u8], message: &[u8], signatu
     .is_ok()
 }
 
+/// A validated `(encryption_key, encryption_key_sig)` pair.
+pub(crate) type CertifiedEncryptionKey<'a> = (&'a [u8], &'a [u8]);
+
 /// Checks an identity-certified encryption key: both fields present, a 65-byte
 /// SEC1 point distinct from the identity key, and a valid certification.
 pub(crate) fn validated_encryption_key<'a>(
     identity_key: &[u8],
     encryption_key: Option<&'a [u8]>,
     encryption_key_sig: Option<&'a [u8]>,
-) -> Result<Option<(&'a [u8], &'a [u8])>, &'static str> {
+) -> Result<Option<CertifiedEncryptionKey<'a>>, &'static str> {
     match (encryption_key, encryption_key_sig) {
         (None, None) => Ok(None),
         (Some(key), Some(sig)) => {

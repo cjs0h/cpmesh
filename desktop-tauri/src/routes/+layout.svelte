@@ -93,9 +93,9 @@
 	}
 
 	async function handleConfirmPairing() {
-		if (!approvalStatus?.session_id || !approvalStatus.approval_code) return;
+		if (!approvalStatus?.session_id || !approvalStatus.sas) return;
 		try {
-			await confirmPairing(approvalStatus.session_id, approvalStatus.approval_code);
+			await confirmPairing(approvalStatus.session_id, approvalStatus.sas);
 			await pollApprovalStatus();
 		} catch (e) { approvalError = String(e); }
 	}
@@ -146,13 +146,23 @@
 			{#if approvalError}
 				<p class="approval-error">{approvalError}</p>
 				<button class="logout-btn" onclick={() => { approvalError = ''; startApprovalPolling(); }}>Retry</button>
-			{:else if approvalStatus?.approval_code}
-				<p class="code-label">Full pairing fingerprint</p>
-				<div class="approval-code">{approvalStatus.approval_code}</div>
-				<p class="code-hint">Compare all 64 characters directly on the approving device, or through an independent trusted channel. Confirm on both devices.</p>
+			{:else if approvalStatus?.sas}
+				<p class="code-label">Pairing code</p>
+				<div class="approval-code sas">{approvalStatus.sas}</div>
+				<p class="code-hint">The approving device shows a pairing code too. Confirm on both devices only if all eight digits are identical.</p>
+				<details class="full-code">
+					<summary>Full 64-character code (stronger manual check)</summary>
+					<code>{approvalStatus.approval_code}</code>
+				</details>
 				<button class="primary" onclick={handleConfirmPairing} disabled={approvalStatus.locally_verified}>
-					{approvalStatus.locally_verified ? 'Fingerprint verified' : 'All characters match - trust approver'}
+					{approvalStatus.locally_verified ? 'Approver verified' : 'Both devices show this code - trust approver'}
 				</button>
+			{:else if approvalStatus?.approval_code}
+				<div class="waiting-indicator">
+					<span class="spinner"></span>
+					Exchanging pairing codes with the approving device...
+				</div>
+				<p class="code-hint">Keep this screen open; the 8-digit code appears on both devices in a moment.</p>
 			{:else}
 				<div class="waiting-steps">
 					<p class="steps-label">To approve this device:</p>
@@ -451,6 +461,27 @@
 		border: 1px solid var(--border);
 		border-radius: var(--radius, 0.5rem);
 		margin-bottom: 0.5rem;
+	}
+
+	.approval-code.sas {
+		font-size: 2rem;
+		letter-spacing: 0.3em;
+		text-align: center;
+	}
+
+	.full-code {
+		text-align: left;
+		margin-bottom: 1rem;
+		font-size: 0.75rem;
+		color: var(--text-secondary);
+	}
+
+	.full-code code {
+		display: block;
+		margin-top: 0.5rem;
+		overflow-wrap: anywhere;
+		font-size: 0.75rem;
+		color: var(--text-primary, inherit);
 	}
 
 	.code-hint {

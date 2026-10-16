@@ -310,7 +310,7 @@ export const toolGroups: McpToolGroup[] = [
     tools: [
       { name: 'cpmesh_status', desc: 'Login and approval state, the pairing code if pending, the group-key version and the exact next step.' },
       { name: 'cpmesh_login', desc: 'Sign in and register the agent with proof of key possession.' },
-      { name: 'cpmesh_confirm_pairing', desc: 'Confirm the full pairing fingerprint independently compared on your trusted device.' },
+      { name: 'cpmesh_confirm_pairing', desc: 'Confirm the 8-digit pairing code (or the full 64-character code) compared on your trusted device.' },
       { name: 'cpmesh_verify_device', desc: 'Verify an existing peer using its full public-key fingerprint after an upgrade or recovery.' },
       { name: 'cpmesh_wait_for_approval', desc: 'Waits until you approve the device, then syncs the encryption key.' },
       { name: 'cpmesh_logout', desc: 'Signs out and wipes the local device key, keyring and session.' },

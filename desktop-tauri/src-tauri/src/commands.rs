@@ -1690,6 +1690,8 @@ pub async fn confirm_device_approval(
         result.map_err(|e| e.to_string())?;
         return Err("Approval was not confirmed; keys were not activated".into());
     }
+    drop(guard);
+    drop(api);
     ctx.pairing.lock().await.remove(&session_id);
     Ok(())
 }
@@ -1731,64 +1733,78 @@ pub async fn get_my_approval_status(
         let kp = device_keys(&ctx)?.identity;
         let peer = KeyPair::parse_public_key(approver_pub_bytes).map_err(|e| e.to_string())?;
         let fingerprint = derive_approval_code(&kp.public, &peer);
-        let mut candidates = ctx.pairing.lock().await;
-        if candidates.get(session_id).is_some_and(|old| {
-            old.peer.public_key != *approver_pub_bytes || old.peer.id != *approver_id
-        }) {
-            return Err("Pairing identity changed; do not approve this session".into());
-        }
-        let candidate = candidates
-            .entry(session_id.clone())
-            .or_insert(PairingCandidate {
-                peer: DeviceIdentity {
-                    id: approver_id.clone(),
-                    public_key: approver_pub_bytes.clone(),
-                },
-                peer_encryption: None,
-                fingerprint,
-                nonce: None,
-                commit: None,
-                sas: None,
-                started: Instant::now(),
-                incoming: true,
-            });
-        // The commitment is remembered as first seen; the relay cannot swap it later.
-        if let Some(commit) = &resp.approver_commit {
-            let commit = nonce32(commit)?;
-            match candidate.commit {
-                None => candidate.commit = Some(commit),
-                Some(seen) if seen != commit => {
+        // Phase 1 (pairing lock only): record the session and the commitment as
+        // first seen; the relay cannot swap either later.
+        let needs_nonce = {
+            let mut candidates = ctx.pairing.lock().await;
+            if candidates.get(session_id).is_some_and(|old| {
+                old.peer.public_key != *approver_pub_bytes || old.peer.id != *approver_id
+            }) {
+                return Err("Pairing identity changed; do not approve this session".into());
+            }
+            let candidate = candidates
+                .entry(session_id.clone())
+                .or_insert(PairingCandidate {
+                    peer: DeviceIdentity {
+                        id: approver_id.clone(),
+                        public_key: approver_pub_bytes.clone(),
+                    },
+                    peer_encryption: None,
+                    fingerprint,
+                    nonce: None,
+                    commit: None,
+                    sas: None,
+                    started: Instant::now(),
+                    incoming: true,
+                });
+            match (&resp.approver_commit, candidate.commit) {
+                (Some(commit), None) => candidate.commit = Some(nonce32(commit)?),
+                (Some(commit), Some(seen)) if seen != nonce32(commit)? => {
                     return Err("Pairing commitment changed; do not approve this session".into());
                 }
-                Some(_) => {}
+                _ => {}
             }
-            if candidate.nonce.is_none() {
-                // Contribute our nonce only after the approver committed to theirs.
-                let nonce = random_nonce();
-                let api = ctx.api.lock().await;
-                api.submit_pending_nonce(session_id, &nonce)
-                    .await
-                    .map_err(|e| e.to_string())?;
+            candidate.commit.is_some() && candidate.nonce.is_none()
+        };
+        // Phase 2 (API lock only): contribute our nonce, but only after the
+        // approver committed to theirs.
+        let submitted = if needs_nonce {
+            let nonce = random_nonce();
+            let api = ctx.api.lock().await;
+            api.submit_pending_nonce(session_id, &nonce)
+                .await
+                .map_err(|e| e.to_string())?;
+            Some(nonce)
+        } else {
+            None
+        };
+        // Phase 3 (pairing lock only): store the nonce and derive the code once the
+        // approver has opened its commitment.
+        let mut candidates = ctx.pairing.lock().await;
+        if let Some(candidate) = candidates.get_mut(session_id) {
+            if let Some(nonce) = submitted
+                && candidate.nonce.is_none()
+            {
                 candidate.nonce = Some(nonce);
             }
-        }
-        if candidate.sas.is_none()
-            && let (Some(approver_nonce), Some(commit), Some(nonce)) =
-                (&resp.approver_nonce, candidate.commit, candidate.nonce)
-        {
-            let approver_nonce = nonce32(approver_nonce)?;
-            if sas_commitment(&approver_nonce) != commit {
-                return Err(
-                    "Pairing commitment does not match the revealed nonce; do not approve this session"
-                        .into(),
-                );
+            if candidate.sas.is_none()
+                && let (Some(approver_nonce), Some(commit), Some(nonce)) =
+                    (&resp.approver_nonce, candidate.commit, candidate.nonce)
+            {
+                let approver_nonce = nonce32(approver_nonce)?;
+                if sas_commitment(&approver_nonce) != commit {
+                    return Err(
+                        "Pairing commitment does not match the revealed nonce; do not approve this session"
+                            .into(),
+                    );
+                }
+                candidate.sas = Some(sas_code(
+                    &approver_nonce,
+                    &nonce,
+                    &kp.public_key_bytes(),
+                    approver_pub_bytes,
+                ));
             }
-            candidate.sas = Some(sas_code(
-                &approver_nonce,
-                &nonce,
-                &kp.public_key_bytes(),
-                approver_pub_bytes,
-            ));
         }
     }
     let candidates = ctx.pairing.lock().await;

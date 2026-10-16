@@ -39,10 +39,16 @@ describe('Tauri command wrappers', () => {
 			{ pendingDeviceId: 'p1' },
 		],
 		[
+			'pollDeviceApproval',
+			() => api.pollDeviceApproval('p1', 's1'),
+			'poll_device_approval',
+			{ pendingDeviceId: 'p1', sessionId: 's1' },
+		],
+		[
 			'confirmDeviceApproval',
-			() => api.confirmDeviceApproval('p1', 's1', 'A'.repeat(64)),
+			() => api.confirmDeviceApproval('p1', 's1', '1234 5678'),
 			'confirm_device_approval',
-			{ pendingDeviceId: 'p1', sessionId: 's1', fingerprint: 'A'.repeat(64) },
+			{ pendingDeviceId: 'p1', sessionId: 's1', fingerprint: '1234 5678' },
 		],
 		[
 			'rejectPendingDevice',
