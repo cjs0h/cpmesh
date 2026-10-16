@@ -14,8 +14,9 @@
 # Optional: pass --aab to build Android App Bundle instead of APK
 set -euo pipefail
 
-VERSION="0.1.0"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# The app version, kept in step with releases by scripts/release/set-version.mjs
+VERSION="$(grep -m1 '"version"' "$ROOT/desktop-tauri/src-tauri/tauri.conf.json" | sed 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')"
 BUILD_AAB=false
 
 for arg in "$@"; do

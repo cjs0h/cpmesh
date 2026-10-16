@@ -3,8 +3,9 @@
 # Run from the project root: ./scripts/build-linux.sh
 set -euo pipefail
 
-VERSION="0.1.0"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# The app version, kept in step with releases by scripts/release/set-version.mjs
+VERSION="$(grep -m1 '"version"' "$ROOT/desktop-tauri/src-tauri/tauri.conf.json" | sed 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')"
 
 echo "=== Building cpmesh $VERSION for Linux ==="
 

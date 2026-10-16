@@ -7,8 +7,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$VERSION = "0.1.0"
 $ROOT = (Resolve-Path "$PSScriptRoot\..").Path
+# The app version, kept in step with releases by scripts/release/set-version.mjs
+$VERSION = (Get-Content "$ROOT\desktop-tauri\src-tauri\tauri.conf.json" -Raw | ConvertFrom-Json).version
 
 Write-Host "=== Building cpmesh $VERSION for Android ===" -ForegroundColor Cyan
 

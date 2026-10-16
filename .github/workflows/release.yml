@@ -86,9 +86,12 @@ jobs:
             echo "tag=v$version"
             echo "notes=$notes"
           } >> "$GITHUB_OUTPUT"
-          declared="$(node -p "require('./desktop-tauri/src-tauri/tauri.conf.json').version")"
-          if [ "$declared" != "$version" ]; then
-            echo "::notice::Building $version while the repository declares $declared. Run 'node scripts/release/set-version.mjs $version' to bump it in the repository."
+          # Release only commits that declare the version, so a build from the repository never reports an
+          # older version than the latest release (its update check would offer that release otherwise)
+          if ! node scripts/release/set-version.mjs --check "$version"; then
+            declared="$(node -p "require('./desktop-tauri/src-tauri/tauri.conf.json').version")"
+            echo "::error title=Version not bumped::This commit declares version $declared, not $version. Run 'node scripts/release/set-version.mjs $version', commit the result, then tag that commit v$version (replacing the tag if it was already pushed) or run this workflow on its branch."
+            exit 1
           fi
 
       - name: Check Android signing secrets
@@ -189,9 +192,6 @@ jobs:
         working-directory: desktop-tauri
         run: npm ci
 
-      - name: Set app version
-        run: node scripts/release/set-version.mjs "$VERSION"
-
       - name: Build
         working-directory: desktop-tauri
         env:
@@ -270,9 +270,6 @@ jobs:
       - name: Install frontend dependencies
         working-directory: desktop-tauri
         run: npm ci
-
-      - name: Set app version
-        run: node scripts/release/set-version.mjs "$VERSION"
 
       - name: Build APK
         working-directory: desktop-tauri
