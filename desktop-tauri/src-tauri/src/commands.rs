@@ -98,6 +98,8 @@ pub struct AppContext {
     history_sync: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pending_push: Mutex<Option<PendingPush>>,
     key_operations: Mutex<()>,
+    /// Set once this process confirmed the relay lists our current encryption key.
+    encryption_key_published: AtomicBool,
     rotation_pending: AtomicBool,
 }
 
@@ -169,6 +171,7 @@ impl AppContext {
             pending_push: Mutex::new(None),
             key_operations: Mutex::new(()),
             rotation_pending: AtomicBool::new(false),
+            encryption_key_published: AtomicBool::new(false),
         }
     }
 
@@ -940,6 +943,7 @@ async fn prepare_connection(ctx: &AppContext, config: &AppConfig) -> Result<(), 
             &config.device_id,
         )
         .await?;
+        ctx.encryption_key_published.store(true, Ordering::SeqCst);
     }
     refresh_keys(ctx).await?;
     let mut config = ctx.config.write().await;
@@ -1715,6 +1719,17 @@ pub async fn reject_pending_device(
 pub async fn get_my_approval_status(
     ctx: State<'_, AppContext>,
 ) -> Result<MyApprovalStatusInfo, String> {
+    // A device that registered before protocol 3 has no encryption key on the
+    // relay yet; the approver needs it to wrap the group key for us.
+    if !ctx.encryption_key_published.load(Ordering::SeqCst) {
+        let api = ctx.api.lock().await;
+        let exchange = ctx.exchange.lock().await;
+        if let Some(exchange) = exchange.as_ref() {
+            let own_id = ctx.config.read().await.device_id.clone();
+            crate::key_sync::publish_encryption_key(exchange, &api, &own_id).await?;
+            ctx.encryption_key_published.store(true, Ordering::SeqCst);
+        }
+    }
     let resp = {
         let api = ctx.api.lock().await;
         api.get_my_approval_status()
@@ -2319,6 +2334,7 @@ pub async fn logout(
     ctx.pending_mfa.lock().await.take();
     ctx.pairing.lock().await.clear();
     ctx.pending_push.lock().await.take();
+    ctx.encryption_key_published.store(false, Ordering::SeqCst);
 
     // Clear tokens from secure storage
     let token_store = TokenStore::new(&ctx.config_dir);

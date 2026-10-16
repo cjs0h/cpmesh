@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 import WebSocket from "ws";
-import { clipboardAckSchema, type ClipboardPushPayload, type ClipboardReceipt } from "./protocol.js";
+import {
+  clipboardAckSchema, clipboardNewSchema, PROTOCOL_VERSION,
+  type ClipboardEntry, type ClipboardPushPayload, type ClipboardReceipt,
+} from "./protocol.js";
 
 export class WsError extends Error {
   constructor(message: string, readonly code?: string, readonly uncertain = false) { super(message); }
@@ -21,6 +24,8 @@ export class WsClient {
   private connectionKey = "";
   private pending = new Map<string, Pending>();
   onKeyChange: ((rotate: boolean) => Promise<void>) | null = null;
+  /** Live `clipboard_new` broadcasts; the handler authenticates them (signature + replay guard). */
+  onClipboardNew: ((entry: ClipboardEntry) => Promise<void>) | null = null;
   keyError: string | null = null;
 
   constructor(private readonly ackTimeoutMs = 10_000) {}
@@ -41,7 +46,7 @@ export class WsClient {
     this.close();
     const generation = this.generation;
     this.connectionKey = key;
-    const headers: Record<string, string> = { Authorization: "Bearer " + accessToken, "X-Cpmesh-Protocol": "2" };
+    const headers: Record<string, string> = { Authorization: "Bearer " + accessToken, "X-Cpmesh-Protocol": PROTOCOL_VERSION };
     if (fingerprint) headers["X-Device-Fingerprint"] = fingerprint;
     const ws = new WebSocket(url, { headers, handshakeTimeout: 10_000, maxPayload: 36 * 1024 * 1024 });
     this.ws = ws;
@@ -54,9 +59,9 @@ export class WsClient {
       };
       this.cancelConnect = () => fail(new WsError("WebSocket connection cancelled"));
       ws.once("upgrade", (response) => {
-        protocolAccepted = response.headers["x-cpmesh-protocol"] === "2";
+        protocolAccepted = response.headers["x-cpmesh-protocol"] === PROTOCOL_VERSION;
         if (!protocolAccepted) {
-          fail(new WsError("Server upgrade required: WebSocket protocol 2 was not confirmed", "protocol_upgrade_required"));
+          fail(new WsError(`Server upgrade required: WebSocket protocol ${PROTOCOL_VERSION} was not confirmed`, "protocol_upgrade_required"));
           ws.terminate();
         }
       });
@@ -106,6 +111,13 @@ export class WsClient {
       this.pending.delete(ack.request_id);
       if (ack.status === "accepted") pending.resolve(ack);
       else pending.reject(new WsError(`${ack.code}: ${ack.message}`, ack.code, ack.code === "temporarily_unavailable"));
+    } else if (value.type === "clipboard_new" && "payload" in value) {
+      const parsed = clipboardNewSchema.safeParse(value.payload);
+      if (!parsed.success) { console.error("[cpmesh-mcp] Invalid clipboard broadcast"); return; }
+      const work = this.onClipboardNew?.(parsed.data.entry);
+      if (work) void work.catch((error: unknown) => {
+        console.error("[cpmesh-mcp] Rejected live clipboard entry:", error instanceof Error ? error.message : String(error));
+      });
     } else if (value.type === "group_key_updated" || value.type === "rotation_needed") {
       const work = this.onKeyChange?.(value.type === "rotation_needed");
       if (work) void work.then(() => { this.keyError = null; }).catch((error: unknown) => {

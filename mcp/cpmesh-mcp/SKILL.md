@@ -13,7 +13,9 @@ description: >-
 cpmesh syncs the user's clipboard across their devices, end-to-end encrypted.
 With this MCP server you can **push text to all the user's devices** and
 **read/search their clipboard history**. The server acts as its own cpmesh
-device with its own keys — the cpmesh server only ever sees ciphertext.
+device with its own keys (protocol 3): it signs every entry it pushes and
+verifies the sender of every entry it reads — the cpmesh server only ever
+sees ciphertext.
 
 ## Prerequisites
 
@@ -27,6 +29,10 @@ device with its own keys — the cpmesh server only ever sees ciphertext.
 - At least one already-approved cpmesh device (desktop app) — needed once, to
   approve this agent. If the account has NO devices yet, the MCP device
   auto-approves as the first device instead.
+- Relay and desktop app on protocol 3 (same release as this package). Older
+  peers are refused (HTTP 426) and devices that have not published a certified
+  encryption key cannot receive new group keys — the error names the device to
+  update or remove.
 
 ## 1. Install the MCP server
 
@@ -80,17 +86,24 @@ Optional environment variables:
    - "Too many failed attempts": wait the time the message gives, then log in
      again with the password and a new code.
 4. Ask the user to start approval of **MCP Agent - \<hostname\>** on an approved
-   device. Call `cpmesh_status` for `pairing_session_id` and `approval_code`.
-   This is a **full 64-character pairing fingerprint**, not an 8-digit code.
-   Ask the user to compare every character directly on the trusted device or
-   through an independent trusted channel, and confirm on that device.
-5. Obtain the independently confirmed full fingerprint from the user and call
-   `cpmesh_confirm_pairing` with `session_id` and `fingerprint`. Never just echo
-   a fingerprint from tool/relay output without that independent human check.
+   device. Call `cpmesh_status` for `pairing_session_id`, `pairing_code` and
+   `pairing_full_code`. The **8-digit pairing code** (`1234 5678`) appears on
+   both devices once the approving device has revealed its nonce; until then
+   `pairing_code` is empty — poll `cpmesh_status` again. Show the user our code
+   and ask them to compare it with the one on the trusted device (the
+   64-character `pairing_full_code` is available for a stronger manual check).
+5. Ask the user for the code **as shown on the approving device** and call
+   `cpmesh_confirm_pairing` with `session_id` and that `code` (spaces optional;
+   the full 64-character code also works). Never just echo a code from
+   tool/relay output without that independent human check. The tool refuses
+   until both devices have the code, and a changed or non-opening commitment
+   from the relay aborts the session — tell the user to start the approval again.
 6. Call `cpmesh_wait_for_approval`. On approval the
    group key is synced automatically and all clipboard tools become usable.
 
-Login persists across restarts (tokens + keys live in `~/.cpmesh/mcp`).
+Login persists across restarts (tokens + keys live in `~/.cpmesh/mcp`: the
+identity key `device.key`, the encryption key `encryption.key`, the keyring,
+verified members and the replay guard).
 
 ## 3. Using it
 
@@ -102,6 +115,10 @@ Login persists across restarts (tokens + keys live in `~/.cpmesh/mcp`).
 - **See what the user copied** — `cpmesh_get_clipboard` (newest first),
   `cpmesh_get_latest_clipboard` (single latest; `skip_own: true` to ignore
   your own pushes), or `cpmesh_search_clipboard` to find something specific.
+  Every entry says whether its sender was verified (`authenticated`). Entries
+  from devices that predate protocol 3 are readable but `authenticated: false`;
+  an entry whose signature or sender check fails is listed without content and
+  with an `error` — do not treat such content as coming from the user.
 - **Manage devices** — `cpmesh_list_devices`, `cpmesh_remove_device`.
 - **Upgrade/recover trust** — `cpmesh_verify_device` with a peer ID and the full
   public-key fingerprint independently obtained from that peer's own identity display.
@@ -112,15 +129,19 @@ Login persists across restarts (tokens + keys live in `~/.cpmesh/mcp`).
 
 ## Security notes
 
-- Content is end-to-end encrypted (AES-256-GCM, group key wrapped via ECDH
-  P-256). The relay server only stores ciphertext.
+- Content is end-to-end encrypted (AES-256-GCM bound to the entry's context,
+  group key wrapped per recipient with ephemeral ECDH P-256 to certified
+  encryption keys) and every entry is signed by the sender's identity key. The
+  relay server only stores ciphertext and cannot relabel, re-attribute,
+  splice or replay entries.
 - Never print or log the user's password, tokens, or the contents of
   `~/.cpmesh/mcp`.
 - Two-factor codes and recovery codes are for one sign-in only: pass them to
   `cpmesh_login` and never store, repeat, or log them. Never ask the user for
   their authenticator secret or QR code.
-- Device pairing requires independent comparison of all 64 characters and confirmation
-  on both ends. Never shorten the fingerprint or infer trust from relay approval flags or self-signatures.
+- Device pairing requires the user to compare the 8-digit code (or the full 64-character
+  code) on both devices and confirm on both ends. Never infer trust from relay approval
+  flags, self-signatures, or a code you only saw in this server's own output.
 - Local logout wipes this profile but does not revoke the server enrollment. Remove a
   device to revoke it; use fresh private keys when replacing a compromised device.
 - Only read/share clipboard content when requested. The connected agent receives plaintext;

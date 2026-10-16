@@ -11,8 +11,10 @@ import type {
   GroupKeysResponse,
   MfaChallenge,
   MfaVerifyResponse,
+  PublishEncryptionKeyRequest,
   RegisterDeviceRequest,
   RegisterDeviceResponse,
+  SasNonceRequest,
   StoreGroupKeyEntry,
   UserInfo,
 } from "./protocol.js";
@@ -272,8 +274,18 @@ export class CpmeshApi {
     });
   }
 
+  /** Identity keys plus the certified encryption keys of every device on the account. */
   async getDeviceKeys(): Promise<{ devices: DeviceInfo[] }> {
     return this.request<{ devices: DeviceInfo[] }>("/api/devices/keys");
+  }
+
+  /** Publishes (or re-publishes) this device's certified static encryption key; 204 on success. */
+  async publishEncryptionKey(encryptionKey: Uint8Array, encryptionKeySig: Uint8Array): Promise<void> {
+    const body: PublishEncryptionKeyRequest = {
+      encryption_key: Buffer.from(encryptionKey).toString("base64"),
+      encryption_key_sig: Buffer.from(encryptionKeySig).toString("base64"),
+    };
+    await this.request("/api/devices/me/encryption-key", { method: "PUT", body });
   }
 
   // === Group keys ===
@@ -310,6 +322,13 @@ export class CpmeshApi {
 
   async getMyApprovalStatus(): Promise<ApprovalStatusResponse> {
     return this.request<ApprovalStatusResponse>("/api/device-approvals/me");
+  }
+
+  /** Pending side of pairing: contributes its 32-byte SAS nonce after seeing the approver's commitment; 204 on success. */
+  async submitPendingNonce(sessionId: string, nonce: Uint8Array): Promise<void> {
+    if (nonce.length !== 32) throw new Error("SAS nonce must be 32 bytes");
+    const body: SasNonceRequest = { session_id: sessionId, nonce: Buffer.from(nonce).toString("base64") };
+    await this.request("/api/device-approvals/me/nonce", { method: "POST", body });
   }
 
   // === Clipboard ===

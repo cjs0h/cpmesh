@@ -52,13 +52,39 @@ describe("CpmeshApi", () => {
       name: "MCP",
       public_key: "cHVi",
       public_key_sig: "c2ln",
+      encryption_key: "ZW5j",
+      encryption_key_sig: "ZW5jc2ln",
       fingerprint: "fp",
     }, () => "cHJvb2Y=");
     expect(res.device.id).toBe("d1");
     expect(api.access).toBe("device-token");
     expect(api.refresh).toBe("device-refresh");
-    expect(JSON.parse(calls[1]!.init!.body as string).proof).toEqual({ challenge: "session-challenge", signature: "cHJvb2Y=" });
+    const body = JSON.parse(calls[1]!.init!.body as string);
+    expect(body.proof).toEqual({ challenge: "session-challenge", signature: "cHJvb2Y=" });
+    expect(body).toMatchObject({ encryption_key: "ZW5j", encryption_key_sig: "ZW5jc2ln" });
     expect((calls[0]!.init!.headers as Record<string, string>).Authorization).toBe("Bearer old");
+  });
+
+  it("publishes the certified encryption key and the pending SAS nonce as base64 bodies", async () => {
+    const calls = mockFetch((url, init) =>
+      url.endsWith("/api/devices/me/encryption-key") && init?.method === "PUT" ? { status: 204, body: undefined }
+        : url.endsWith("/api/device-approvals/me/nonce") && init?.method === "POST" ? { status: 204, body: undefined }
+        : { status: 404, body: { error: "nf" } },
+    );
+    const api = new CpmeshApi("https://srv");
+    api.setTokens("device-token", "refresh");
+    const key = new Uint8Array(65).fill(4), sig = new Uint8Array([0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01]);
+    await expect(api.publishEncryptionKey(key, sig)).resolves.toBeUndefined();
+    expect(JSON.parse(calls[0]!.init!.body as string)).toEqual({
+      encryption_key: Buffer.from(key).toString("base64"), encryption_key_sig: Buffer.from(sig).toString("base64"),
+    });
+    const nonce = new Uint8Array(32).fill(7);
+    await expect(api.submitPendingNonce("00000000-0000-4000-8000-000000000001", nonce)).resolves.toBeUndefined();
+    expect(JSON.parse(calls[1]!.init!.body as string)).toEqual({
+      session_id: "00000000-0000-4000-8000-000000000001", nonce: Buffer.from(nonce).toString("base64"),
+    });
+    await expect(api.submitPendingNonce("00000000-0000-4000-8000-000000000001", nonce.subarray(1))).rejects.toThrow("32 bytes");
+    expect(calls).toHaveLength(2);
   });
 
   it("surfaces server error messages as ApiError", async () => {
