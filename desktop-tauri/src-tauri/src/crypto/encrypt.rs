@@ -73,6 +73,13 @@ pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError>
     encrypt_with_aad(key, plaintext, &[])
 }
 
+/// A fresh 96-bit nonce from the operating system's CSPRNG.
+fn random_nonce() -> [u8; 12] {
+    let mut nonce = GcmNonce::default();
+    fill_random(nonce.as_mut_slice());
+    nonce.0
+}
+
 /// AES-256-GCM with associated data: the ciphertext only opens in the same
 /// context (`aad`) it was sealed in. Layout: nonce(12) || ciphertext || tag(16).
 pub fn encrypt_with_aad(
@@ -80,9 +87,7 @@ pub fn encrypt_with_aad(
     plaintext: &[u8],
     aad: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    let mut nonce_bytes = [0u8; 12];
-    fill_random(&mut nonce_bytes);
-    encrypt_with_nonce(key, &nonce_bytes, plaintext, aad)
+    encrypt_with_nonce(key, &random_nonce(), plaintext, aad)
 }
 
 /// Deterministic variant for golden vectors; callers must never reuse a nonce
@@ -204,18 +209,17 @@ pub fn wrap_group_key_v3(
     recipient_encryption_key: &PublicKey,
     aad: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    let mut nonce = [0u8; 12];
-    fill_random(&mut nonce);
-    wrap_group_key_v3_deterministic(
+    wrap_group_key_v3_with(
         group_key,
         &SecretKey::generate(),
-        &nonce,
         recipient_encryption_key,
-        aad,
+        |key| encrypt_with_aad(key, group_key, aad),
     )
 }
 
-/// [`wrap_group_key_v3`] with caller-supplied ephemeral key and nonce (vectors).
+/// [`wrap_group_key_v3`] with caller-supplied ephemeral key and nonce. Used by
+/// tests and by the MCP golden-vector generator, never in production paths.
+#[allow(dead_code)]
 pub fn wrap_group_key_v3_deterministic(
     group_key: &[u8],
     ephemeral_private: &SecretKey,
@@ -223,6 +227,25 @@ pub fn wrap_group_key_v3_deterministic(
     recipient_encryption_key: &PublicKey,
     aad: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
+    wrap_group_key_v3_with(
+        group_key,
+        ephemeral_private,
+        recipient_encryption_key,
+        |key| encrypt_with_nonce(key, nonce, group_key, aad),
+    )
+}
+
+/// Derives the wrap key for `ephemeral_private` → recipient and prefixes the
+/// sealed group key with the ephemeral public key.
+fn wrap_group_key_v3_with(
+    group_key: &[u8],
+    ephemeral_private: &SecretKey,
+    recipient_encryption_key: &PublicKey,
+    seal: impl FnOnce(&[u8; 32]) -> Result<Vec<u8>, CryptoError>,
+) -> Result<Vec<u8>, CryptoError> {
+    if group_key.len() != 32 {
+        return Err(CryptoError::Encrypt("group key must be 32 bytes".into()));
+    }
     let ephemeral_public = ephemeral_private.public_key();
     let key = derive_wrap_key_v3(
         ephemeral_private,
@@ -230,7 +253,7 @@ pub fn wrap_group_key_v3_deterministic(
         &ephemeral_public,
         recipient_encryption_key,
     )?;
-    let sealed = encrypt_with_nonce(&key, nonce, group_key, aad)?;
+    let sealed = seal(&key)?;
     let mut blob = super::keys::public_key_to_bytes(&ephemeral_public);
     blob.extend_from_slice(&sealed);
     Ok(blob)
@@ -355,7 +378,7 @@ mod tests {
 
     #[test]
     fn aad_binds_ciphertext_to_its_context() {
-        let key = [7u8; 32];
+        let key = generate_group_key();
         let sealed = encrypt_with_aad(&key, b"secret", b"context-a").unwrap();
         assert_eq!(
             decrypt_with_aad(&key, &sealed, b"context-a").unwrap(),
@@ -403,7 +426,7 @@ mod tests {
     fn v3_wrap_is_deterministic_given_ephemeral_key_and_nonce() {
         let recipient = crate::crypto::keys::KeyPair::generate();
         let ephemeral = SecretKey::generate();
-        let nonce = [9u8; 12];
+        let nonce = random_nonce();
         let group_key = generate_group_key();
         let a = wrap_group_key_v3_deterministic(
             &group_key,

@@ -426,19 +426,18 @@ mod tests {
         assert!(exch_a.decrypt_payload(&enc_v1, 2, b"a").is_err());
     }
 
+    /// Bytes that are not a ciphertext produced by this keyring.
+    fn garbage(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 7 + 3) as u8).collect()
+    }
+
     #[test]
     fn test_encrypt_without_group_key() {
         let exch = KeyExchange::new(DeviceKeys::generate());
         assert!(!exch.has_group_key());
         assert!(exch.encrypt_payload(b"test", b"").is_err());
-        assert!(
-            exch.decrypt_payload(b"0123456789abcdef_ciphertext", 1, b"")
-                .is_err()
-        );
-        assert!(
-            exch.decrypt_payload_legacy(b"0123456789abcdef_ciphertext", 1)
-                .is_err()
-        );
+        assert!(exch.decrypt_payload(&garbage(44), 1, b"").is_err());
+        assert!(exch.decrypt_payload_legacy(&garbage(44), 1).is_err());
     }
 
     #[test]
@@ -446,7 +445,7 @@ mod tests {
         let mut exch = KeyExchange::new(DeviceKeys::generate());
         exch.init_group_key();
         assert!(matches!(
-            exch.decrypt_payload(&[0u8; 15], 1, b""),
+            exch.decrypt_payload(&garbage(15), 1, b""),
             Err(CryptoError::CiphertextTooShort)
         ));
     }
