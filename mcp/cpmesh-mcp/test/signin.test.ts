@@ -261,7 +261,7 @@ describe("SignInFlow", () => {
   it("asks for the password when no sign-in is waiting for a code", async () => {
     fakeServer();
     await expect(signIn({ code: TOTP })).rejects.toThrow(
-      /No sign-in for "alice" is waiting for a two-factor code: call cpmesh_login with the password and the code/,
+      /No sign-in for this account is waiting for a two-factor code: call cpmesh_login with the password and the code/,
     );
     await expect(signIn({})).rejects.toThrow(/^No password/);
   });
