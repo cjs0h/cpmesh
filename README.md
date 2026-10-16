@@ -37,10 +37,10 @@ Desktop App                  Browser
 ```
 
 **Encryption flow:**
-1. Each device generates an ECDH P-256 key pair. The public key is registered with the server.
-2. The first device creates a random 256-bit group key and encrypts it for every other device using ECDH.
+1. Each device generates an ECDH P-256 key pair and proves possession with a single-use, session-bound challenge before receiving device-bound access and refresh tokens.
+2. The first device creates a random 256-bit group key and stores an encrypted copy to itself. Other devices join only after full-fingerprint verification on both ends; an authenticated membership transition rotates the key and wraps it for the approved members.
 3. All clipboard data is encrypted with the group key (AES-256-GCM via HKDF derivation) before leaving the device.
-4. The server relays encrypted blobs. It cannot decrypt anything.
+4. Clients authenticate key senders and signed membership locally, not from relay-provided approval flags or self-signatures. The relay stores ciphertext; content type, encrypted size, device identity and timing remain visible to it.
 
 ## Quick Start
 
@@ -85,10 +85,12 @@ The server listens on port `8080` inside the container. The default Docker Compo
 The server can also be built and run directly:
 
 ```bash
-# Requires Rust 1.94+ and a running PostgreSQL instance
+# Requires Rust 1.94+, Node.js 22.12+ and a running PostgreSQL instance
 cp .env.example .env
 ./scripts/generate-dev-jwt.sh
 # Fill the required values in .env, then:
+npm --prefix web ci
+npm --prefix web run build    # web/dist is embedded by RustEmbed at compile time
 cargo build --release -p cpmesh-server
 ./target/release/cpmesh-server
 ```
@@ -152,9 +154,10 @@ server if you self-host.
 On first use the agent asks for your credentials and the 6-digit code from your
 authenticator app (or a recovery code; the MCP server cannot use passkeys, so add
 an authenticator app under **Settings → Two-factor authentication** if a passkey
-is your only second factor), then walks you through the 8-digit device-approval
-pairing (you confirm the code on an already-approved
-device). Full agent instructions live in
+is your only second factor), then walks you through full-fingerprint device pairing.
+Compare all 64 hexadecimal characters through an independent trusted channel and confirm on
+both devices; the agent uses `cpmesh_confirm_pairing` before waiting for approval.
+Full agent instructions live in
 [`mcp/cpmesh-mcp/SKILL.md`](mcp/cpmesh-mcp/SKILL.md) — install that file into
 your agent's skills directory (e.g. `~/.agents/skills/cpmesh/`), or let the
 agent pull them from the `cpmesh_skill` MCP prompt. See
@@ -183,6 +186,40 @@ sensitive admin actions, need a recent sign-in: the dashboard asks you to confir
 Administrators can reset a member's two-factor authentication (for a lost phone); the member sets it up again at their
 next sign-in and gets an email about it.
 
+Changing a password ends all sessions, including the initiating session and live sockets. Refresh
+and step-up preserve the original session issuance time, so an in-flight refresh cannot evade revocation.
+
+## Secure-sync upgrade and compatibility
+
+Upgrade the relay, desktop apps and MCP package together, and reload the web dashboard. This is an
+intentional protocol boundary, not a transparent mixed-version rollout. Existing ciphertext, ECDH
+wrapping and encrypted-keyring byte formats are unchanged, but unsafe authorization paths are not retained.
+
+Before upgrading, back up each device's private key, encrypted keyring and local history. Legacy
+`pinned_keys.json` files were trust-on-first-use and are **not** silently promoted to authenticated
+membership. On an existing mesh, use the desktop **Devices** page or MCP `cpmesh_verify_device` to
+compare a peer's complete public-key fingerprint directly with that peer's own identity display.
+After verification, clients rotate to an authenticated membership and learn later approved members
+through signed transitions. Do not delete keyring files to bypass a verification error: a missing
+wrapped copy is not evidence of a new mesh, and lost historical key material cannot be regenerated.
+
+Device WebSockets negotiate `X-Cpmesh-Protocol: 2` in both directions. Older devices receive HTTP 426;
+updated clients refuse relays that do not confirm this version. Browser metadata sockets and the public
+download/update endpoints remain available, including to apps downloading an upgrade. Registration and
+reconnection require a session-bound proof; an unbound refresh token cannot select an approved device ID.
+The legacy group-key GET remains readable, but legacy writes and short-code approval return HTTP 426.
+
+Removing a device closes its socket and blocks old-key writes until rotation. Clients persist verified
+epochs and revocation records, reject known rollbacks/re-admissions, and retain historical keys. Removal
+cannot erase plaintext or keys a device already copied. For a lost or compromised device, use fresh
+private keys when enrolling its replacement; do not reuse the compromised profile. A relay can still
+withhold traffic, and this protocol is not a ratcheting protocol with retroactive erasure.
+
+Clipboard pushes carry a UUID `request_id`. A `clipboard_ack` confirms database persistence and returns
+the canonical entry ID, or reports rejection/uncertain persistence. It is **not** proof that another device
+received the clipboard. Retries reuse the identical request and ID; relay receipts survive history deletion
+for at least 24 hours, and MCP retains up to 32 encrypted requests/receipts for restart-safe retries.
+
 ## Admin console
 
 Staff accounts see the admin console in the web dashboard. It requires a session confirmed with a second factor, and
@@ -196,8 +233,8 @@ what each person can do depends on their role:
 | Owner | Admin, plus change roles and act on other staff accounts |
 
 The `INITIAL_ADMIN` account (and anyone who was an admin before roles existed) is an owner. The server always keeps at
-least one owner. Every change made in the console is recorded in the audit log, which also shows sign-ins and security
-changes per user.
+least one owner. Mutation handlers await their audit writes; failures are reported in server logs rather than
+discarded silently. The audit log also shows sign-ins and security changes per user.
 
 **Settings** can override `REGISTRATION_OPEN` and show an announcement banner at runtime. **API tokens** let automation
 publish releases without an interactive sign-in: a token (scope `releases:write`) only works on the downloads and
@@ -218,6 +255,7 @@ On a public deployment, consider also putting `/api/admin/` behind an access pro
 Every component ships with an automated test suite; see [CONTRIBUTING.md](CONTRIBUTING.md#testing) for details.
 
 ```bash
+npm --prefix web ci && npm --prefix web run build  # required before Cargo on a clean checkout
 cargo test --workspace                       # server + shared proto (unit, router and wire-format tests)
 cd desktop-tauri/src-tauri && cargo test     # desktop crypto, history, config and protocol tests
 cd web && npm test                           # web dashboard (Vitest)
@@ -227,6 +265,8 @@ cd mcp/cpmesh-mcp && npm test                # MCP server crypto, API client and
 
 The PostgreSQL-backed integration tests in `crates/cpmesh-server/tests/db.rs` run only when
 `TEST_DATABASE_URL` points at a database you can create schemas in; otherwise they are skipped.
+MCP CI also runs the published executable against the real relay, including mandatory MFA, proof of
+possession, acknowledgements, idempotent retry, restart and bounded streaming downloads.
 
 ## Configuration
 
@@ -273,9 +313,15 @@ JWT signing uses explicit RS256 key material in every environment. `JWT_PUBLIC_K
 
 | Type | Max Size | Description |
 |------|----------|-------------|
-| Text | 1 MB | Plain text, URLs, code snippets |
-| Image | 10 MB | PNG screenshots and images |
-| File | 25 MB | Arbitrary file data with metadata |
+| Text | 1 MiB | Plain text, URLs, code snippets |
+| Image | 10 MiB | Encoded PNG screenshots and images |
+| File | 25 MiB | Arbitrary file data with metadata |
+
+The relay allows the 44-byte encryption overhead in addition to these limits and caps encoded metadata
+at 16 KiB. Device queues hold at most eight messages, share a 64 MiB per-user byte budget, and have a
+five-second write deadline. Slow consumers disconnect and recover from persisted history. Ciphertext
+history pages are byte-bounded; the browser requests size/metadata projections instead of ciphertext.
+Installer downloads stream with single byte-range support and cache validators.
 
 ## License
 
