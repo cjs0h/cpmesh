@@ -330,6 +330,7 @@ fn device_info_defaults_and_optional_base64() {
     assert!(info.last_seen.is_none());
     assert!(!info.online);
     assert_eq!(info.status, DeviceStatus::Approved);
+    assert_eq!(info.has_current_key, None, "older servers do not say");
 
     let info: DeviceInfo = serde_json::from_value(json!({
         "id":"d","name":"Laptop","public_key":"BAEC","public_key_sig":null,
@@ -346,6 +347,15 @@ fn device_info_defaults_and_optional_base64() {
     assert_eq!(json["public_key"], "BAEC");
     assert!(json.get("public_key_sig").is_none());
     assert_eq!(json["status"], "revoked");
+    assert!(json.get("has_current_key").is_none());
+
+    let keyless: DeviceInfo =
+        serde_json::from_str(r#"{"id":"d","name":"Mac","has_current_key":false}"#).unwrap();
+    assert_eq!(keyless.has_current_key, Some(false));
+    assert_eq!(
+        serde_json::to_value(&keyless).unwrap()["has_current_key"],
+        false
+    );
 }
 
 #[test]

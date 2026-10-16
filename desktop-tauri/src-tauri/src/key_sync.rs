@@ -673,6 +673,7 @@ pub(crate) mod tests {
                 last_seen: None,
                 online: false,
                 status: DeviceStatus::Approved,
+                has_current_key: None,
             }],
         }));
         let api = fake_relay(relay.clone(), own.clone()).await;
@@ -742,6 +743,7 @@ pub(crate) mod tests {
             last_seen: None,
             online: false,
             status: DeviceStatus::Approved,
+            has_current_key: None,
         };
         relay.lock().unwrap().devices.push(peer.clone());
         let mut exchange = KeyExchange::new(keys);
@@ -805,6 +807,7 @@ pub(crate) mod tests {
             last_seen: None,
             online: false,
             status: DeviceStatus::Approved,
+            has_current_key: None,
         };
         relay.lock().unwrap().devices.push(outdated);
         let members = other_members(&api, &own.id, dir.path()).await.unwrap();
@@ -855,6 +858,7 @@ pub(crate) mod tests {
                 last_seen: None,
                 online: false,
                 status: DeviceStatus::Approved,
+                has_current_key: None,
             }],
         })
     }

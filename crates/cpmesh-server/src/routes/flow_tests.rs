@@ -635,6 +635,116 @@ async fn pairing_uses_committed_short_codes_and_certified_encryption_keys() {
     }).await;
 }
 
+#[tokio::test]
+async fn approved_devices_missing_the_current_key_are_flagged_and_can_pair_to_receive_it() {
+    use aws_lc_rs::signature::KeyPair as _;
+    use base64::Engine;
+    use cpmesh_proto::models as proto;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    with_app(Options::default(), |app| async move {
+        let db = &app.state.db;
+        let user = app.member("keyless").await;
+        let grant = SessionGrant::signed_in(user.id, true);
+        let a_key = device_key();
+        let a = db.create_device(user.id, "A", a_key.public_key().as_ref(), None, "approved", None).await.unwrap();
+        let a_access = app.state.auth.issue_access(&grant.with_device(Some(a.id))).unwrap();
+        assert!(db.rotate_group_key(user.id, a.id, 0, 1, &[(a.id, vec![1; proto::WRAP_V3_LEN])], 24).await.unwrap());
+        // D is approved but holds no wrap of the current key, as older servers could
+        // leave a device after re-registering it.
+        let d_key = device_key();
+        let d = db.create_device(user.id, "D", d_key.public_key().as_ref(), None, "approved", Some("fp-d")).await.unwrap();
+        let d_access = app.state.auth.issue_access(&grant.with_device(Some(d.id))).unwrap();
+
+        let flag = |devices: &Value, id: uuid::Uuid| {
+            devices.as_array().unwrap().iter().find(|x| x["id"] == id.to_string()).unwrap()["has_current_key"].clone()
+        };
+        let (status, keys) = app.call("GET", "/api/devices/keys", Some(&a_access), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(flag(&keys["devices"], a.id), true);
+        assert_eq!(flag(&keys["devices"], d.id), false);
+        let (status, listed) = app.call("GET", "/api/devices", Some(&d_access), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(flag(&listed, d.id), false, "D can see that it lacks the key");
+        let (status, current) = app.call("GET", "/api/group-keys/current?since_version=0", Some(&d_access), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(current["current_version"], 1);
+        assert_eq!(current["keys"], json!([]));
+
+        // A verifies D with the committed short code, as for a new device.
+        let begin = async |target: uuid::Uuid| {
+            app.call_with_headers("POST", &format!("/api/device-approvals/{target}/begin"), Some(&a_access),
+                &[("x-cpmesh-pairing", "3")], Some(json!({"commit": b64.encode(proto::sas_commitment(&[7u8; 32]))}))).await
+        };
+        assert_eq!(begin(a.id).await.0, StatusCode::BAD_REQUEST, "a device cannot pair with itself");
+        let (status, session) = begin(d.id).await;
+        assert_eq!(status, StatusCode::OK, "{session}");
+        assert_eq!(session["pending_public_key"], b64.encode(d_key.public_key().as_ref()));
+        let session_id = session["session_id"].as_str().unwrap().to_string();
+        let (status, me) = app.call("GET", "/api/device-approvals/me", Some(&d_access), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(me["status"], "approved");
+        assert_eq!(me["session_id"], session_id);
+        assert_eq!(me["approver_device_id"], a.id.to_string());
+        assert_eq!(me["approver_public_key"], b64.encode(a_key.public_key().as_ref()));
+        let (status, _) = app.call("POST", "/api/device-approvals/me/nonce", Some(&d_access),
+            Some(json!({"session_id": session_id, "nonce": b64.encode([8u8; 32])}))).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = app.call("POST", &format!("/api/device-approvals/{}/reveal", d.id), Some(&a_access),
+            Some(json!({"session_id": session_id, "nonce": b64.encode([7u8; 32])}))).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        // Pairing never changes an approved device's status.
+        let (status, _) = app.call("POST", &format!("/api/device-approvals/{}/approve", d.id), Some(&a_access),
+            Some(json!({"session_id": session_id, "expected_current_version": 1, "new_version": 2, "wrapped_keys": []}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // A shares the key by rotating to every approved member.
+        let members = vec![
+            proto::DeviceIdentity { id: a.id.to_string(), public_key: a_key.public_key().as_ref().to_vec() },
+            proto::DeviceIdentity { id: d.id.to_string(), public_key: d_key.public_key().as_ref().to_vec() },
+        ];
+        let wraps = [(a.id.to_string(), vec![3u8; proto::WRAP_V3_LEN]), (d.id.to_string(), vec![4u8; proto::WRAP_V3_LEN])];
+        let hashes: std::collections::BTreeMap<String, String> = wraps.iter()
+            .map(|(id, wrap)| (id.clone(), proto::wrapped_key_hash(wrap))).collect();
+        let transcript = proto::membership_transcript(2, &a.id.to_string(), &members, &hashes).unwrap();
+        let rotation = json!({
+            "expected_current_version": 1, "new_version": 2,
+            "wrapped_keys": [
+                {"device_id": wraps[0].0, "encrypted_key": b64.encode(&wraps[0].1), "membership": {
+                    "members": members, "wrapped_key_hashes": hashes, "signature": b64.encode(device_sign(&a_key, &transcript))}},
+                {"device_id": wraps[1].0, "encrypted_key": b64.encode(&wraps[1].1)},
+            ],
+        });
+        let (status, body) = app.call("POST", "/api/group-keys/rotate", Some(&a_access), Some(rotation)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, keys) = app.call("GET", "/api/devices/keys", Some(&a_access), None).await;
+        assert_eq!(flag(&keys["devices"], d.id), true);
+        let (status, current) = app.call("GET", "/api/group-keys/current?since_version=0", Some(&d_access), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(current["current_version"], 2);
+        assert_eq!(current["keys"][0]["from_device_id"], a.id.to_string());
+        assert!(current["keys"][0]["membership"].is_object());
+
+        // Signing in again with D's identity keeps its approval and its wrap; a new
+        // identity behind D's fingerprint is refused instead of replacing D's keys.
+        let web = app.state.auth.issue_access(&grant).unwrap();
+        for (key, expected) in [(&d_key, StatusCode::OK), (&device_key(), StatusCode::CONFLICT)] {
+            let (_, challenge) = app.call("POST", "/api/devices/challenge", Some(&web), None).await;
+            let registration = device_registration(key, challenge["challenge"].as_str().unwrap(), "fp-d");
+            let (status, registered) = app.call("POST", "/api/devices", Some(&web), Some(registration)).await;
+            assert_eq!(status, expected, "{registered}");
+            if expected == StatusCode::CONFLICT {
+                assert_eq!(registered["code"], "device_keys_changed");
+                assert_eq!(registered["device_id"], d.id.to_string());
+            }
+        }
+        let (_, keys) = app.call("GET", "/api/devices/keys", Some(&a_access), None).await;
+        let listed_d = keys["devices"].as_array().unwrap().iter().find(|x| x["id"] == d.id.to_string()).unwrap();
+        assert_eq!(listed_d["status"], "approved");
+        assert_eq!(listed_d["has_current_key"], true);
+        assert_eq!(keys["devices"].as_array().unwrap().len(), 2);
+    }).await;
+}
+
 struct TestApp {
     router: Router,
     state: Arc<AppState>,

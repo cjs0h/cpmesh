@@ -3964,6 +3964,7 @@ mod tests {
             last_seen: None,
             online: false,
             status,
+            has_current_key: None,
         }
     }
 
