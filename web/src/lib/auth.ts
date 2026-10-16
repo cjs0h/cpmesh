@@ -94,3 +94,51 @@ export function loginPageUrl(request: AppSignIn | null): string {
   const params = new URLSearchParams({ client_redirect: request.clientRedirect, code_challenge: request.codeChallenge });
   return `#/login?${params}`;
 }
+
+/**
+ * Where an AI agent asks for access. They need a session; signed out, they show the
+ * sign-in form and continue once the user has signed in.
+ */
+const CONSENT_ROUTES = ['/authorize', '/activate'];
+const RETURN_KEY = 'cpmesh_return_to';
+/** A single sign-on that takes longer than this doesn't go back to the agent's page. */
+const RETURN_TTL_MS = 30 * 60_000;
+
+/** The agent's consent page in `hash` (`#/authorize?…`, `#/activate?…`), with its query; null for other pages. */
+export function returnPathFrom(hash: string | null | undefined): string | null {
+  const route = (hash ?? '').replace(/^#/, '');
+  return CONSENT_ROUTES.includes(route.split('?')[0]) ? `#${route}` : null;
+}
+
+/** Where to sign in again when the session ends: the agent's consent page the user is on, else the sign-in page. */
+export function signInLocation(hash: string = window.location.hash): string {
+  return returnPathFrom(hash) ?? '#/login';
+}
+
+/** Keeps the agent's consent page across the single sign-on round trip (this tab only). */
+export function rememberReturnPath(path: string) {
+  try {
+    sessionStorage.setItem(RETURN_KEY, JSON.stringify({ path, at: Date.now() }));
+  } catch {
+    // Storage unavailable: the user starts again from the agent
+  }
+}
+
+/** The consent page a single sign-on started from, if recent. It is forgotten once read. */
+export function takeReturnPath(now: number = Date.now()): string | null {
+  let stored: string | null;
+  try {
+    stored = sessionStorage.getItem(RETURN_KEY);
+    sessionStorage.removeItem(RETURN_KEY);
+  } catch {
+    return null;
+  }
+  if (!stored) return null;
+  try {
+    const { path, at } = JSON.parse(stored);
+    if (typeof path !== 'string' || typeof at !== 'number' || at > now || now - at > RETURN_TTL_MS) return null;
+    return returnPathFrom(path);
+  } catch {
+    return null;
+  }
+}

@@ -6,11 +6,15 @@
     agentSetups,
     envVars,
     examplePrompts,
+    firstRunSteps,
     MCP_PACKAGE,
     MCP_SOURCE_URL,
     normalizeServerUrl,
     DEFAULT_SERVER_URL,
+    prerequisites,
+    securityNotes,
     toolGroups,
+    troubleshooting,
   } from '../../lib/mcp';
 
   /**
@@ -22,6 +26,9 @@
 
   let serverUrl = $state(DEFAULT_SERVER_URL);
   const setups = $derived(agentSetups(serverUrl));
+  const steps = $derived(firstRunSteps(serverUrl));
+  const help = $derived(troubleshooting(serverUrl));
+  const toolCount = toolGroups.reduce((count, group) => count + group.tools.length, 0);
   let selectedId = $state('claude-code');
   const selected = $derived(setups.find((s) => s.id === selectedId) ?? setups[0]);
 
@@ -51,34 +58,6 @@
     { icon: 'clipboard', title: 'Read what you copied', desc: 'The agent can pick up what you just copied on another device without you pasting it into chat.' },
     { icon: 'search', title: 'Search your history', desc: 'Find something you copied earlier across all your devices, decrypted locally.' },
     { icon: 'monitor', title: 'See your devices', desc: 'List paired devices with their online state, and remove the ones you no longer use.' },
-  ];
-
-  const prerequisites = [
-    { icon: 'terminal', title: 'Node.js 18.19 or newer', desc: 'Your agent starts the server with npx. Nothing else to install.' },
-    { icon: 'user', title: 'A cpmesh account', desc: 'Your cpmesh.com username and password with an authenticator app for two-factor sign-in, or an account on your own relay.' },
-    { icon: 'laptop', title: 'One approved device', desc: 'The desktop or Android app, used once to approve the agent.' },
-  ];
-
-  const pairing = [
-    { title: 'Ask your agent to connect', desc: 'Say "Connect to cpmesh". The agent calls cpmesh_status, then asks for your username, password and the 6-digit code from your authenticator app, and calls cpmesh_login.' },
-    { title: 'Get the pairing code', desc: 'Start approval in Devices on a trusted device, then ask the agent for cpmesh_status. Both the trusted device and the agent show the same 8-digit pairing code (a 64-character full code is available for a stronger check).' },
-    { title: 'Confirm on both ends', desc: 'Only if the codes are identical, confirm on the trusted device and give the code to the agent for cpmesh_confirm_pairing.' },
-    { title: 'Start using it', desc: 'The agent calls cpmesh_wait_for_approval, receives the encryption key and is ready. Sign-in persists across restarts.' },
-  ];
-
-  const security = [
-    'The agent is a real cpmesh device with its own identity and encryption keys. Clips are encrypted with AES-256-GCM, bound to their context and signed before they leave your machine, and the relay only stores ciphertext.',
-    'Pairing requires a person to compare the 8-digit code on both ends: each side commits to its contribution before seeing the other, so a relay that substitutes a key cannot make the codes agree. Do not skip confirmation.',
-    'Peer identities require explicit verification or a signed transition from a verified member. A relay-provided self-signature or approval flag does not establish trust.',
-    'State lives in ~/.cpmesh/mcp (files are 0600 on macOS and Linux). Remove the agent from Devices to revoke access. cpmesh_logout only wipes its local profile.',
-  ];
-
-  const troubleshooting = [
-    { q: 'The agent does not see any cpmesh tools', a: 'Restart the client after editing its config, and check that "npx -y cpmesh-mcp" works in a terminal. Most clients have an MCP panel that shows server errors.' },
-    { q: 'npx is not found on Windows', a: 'Some clients cannot start npx directly. Use "command": "cmd" with "args": ["/c", "npx", "-y", "cpmesh-mcp"].' },
-    { q: 'Not sure what state it is in', a: 'Ask the agent to run cpmesh_status. It always replies with the next step to take.' },
-    { q: 'I have no devices yet', a: 'The agent becomes your first device. It is approved automatically and creates your encryption key.' },
-    { q: 'The agent says two-factor authentication must be set up', a: 'Sign in to the web dashboard once and set up an authenticator app under Settings → Two-factor authentication. Agents cannot use passkeys, so add an authenticator app even if you also use a passkey.' },
   ];
 </script>
 
@@ -112,7 +91,7 @@
   {:else}
     <div class="mb-6 flex flex-wrap gap-2">
       <Button size="sm" variant="secondary" onclick={() => scrollToId('setup')}>Setup</Button>
-      <Button size="sm" variant="secondary" onclick={() => scrollToId('pairing')}>Pairing</Button>
+      <Button size="sm" variant="secondary" onclick={() => scrollToId('pairing')}>First run</Button>
       <Button size="sm" variant="secondary" onclick={() => scrollToId('tools')}>Tools</Button>
       <Button size="sm" variant="ghost" href={MCP_SOURCE_URL} external icon="github">Source</Button>
     </div>
@@ -223,11 +202,11 @@
     </div>
   </section>
 
-  <!-- Pairing -->
+  <!-- First run: sign-in, then pairing -->
   <section class="mt-16 space-y-8 md:mt-20">
-    {@render heading('pairing', 'First run', 'Pair the agent once', 'The agent signs in like any new device. You approve it from a device you already trust, exactly like adding a new laptop.')}
+    {@render heading('pairing', 'First run', 'Connect the agent once', 'You approve the agent in your browser, then pair it from a device you already trust, exactly like adding a new laptop.')}
     <ol class="cell-grid grid-cols-1 bg-surface md:grid-cols-2 lg:grid-cols-4">
-      {#each pairing as step, i (step.title)}
+      {#each steps as step, i (step.title)}
         <li class="px-6 py-6">
           <span class="font-mono text-xs text-dim">0{i + 1}</span>
           <h3 class="mt-3 text-[15px] font-medium text-fg">{step.title}</h3>
@@ -255,7 +234,7 @@
 
   <!-- Tools -->
   <section class="mt-16 space-y-8 md:mt-20">
-    {@render heading('tools', 'Reference', 'Tools', 'Eleven tools, plus a cpmesh_skill prompt that gives the agent these instructions at runtime.')}
+    {@render heading('tools', 'Reference', 'Tools', `${toolCount} tools, plus a cpmesh_skill prompt that gives the agent these instructions at runtime.`)}
     <div class="grid gap-4 lg:grid-cols-3">
       {#each toolGroups as group (group.title)}
         <div class="overflow-hidden rounded-lg border border-border bg-surface">
@@ -307,7 +286,7 @@
     <div class="space-y-6">
       {@render heading('security', 'Security', 'Same encryption as your other devices')}
       <ul class="space-y-3">
-        {#each security as item (item)}
+        {#each securityNotes as item (item)}
           <li class="flex gap-3 text-sm leading-relaxed text-muted">
             <span class="mt-0.5 shrink-0 text-fg"><Icon name="shield-check" size={16} strokeWidth={1.75} /></span>
             <span>{item}</span>
@@ -318,7 +297,7 @@
     <div class="space-y-6">
       {@render heading('troubleshooting', 'Help', 'Troubleshooting')}
       <dl class="divide-y divide-border rounded-lg border border-border bg-surface">
-        {#each troubleshooting as t (t.q)}
+        {#each help as t (t.q)}
           <div class="px-4 py-3.5">
             <dt class="text-sm font-medium text-fg">{t.q}</dt>
             <dd class="mt-1 text-[13px] leading-relaxed text-muted">{t.a}</dd>

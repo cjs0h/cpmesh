@@ -104,11 +104,13 @@ export function jsonResponse(status: number, body: unknown, statusText = ''): Re
 beforeEach(() => {
   if (typeof document === 'undefined') {
     vi.stubGlobal('localStorage', new MemoryStorage());
+    vi.stubGlobal('sessionStorage', new MemoryStorage());
     const location = makeLocation();
     vi.stubGlobal('location', location);
     vi.stubGlobal('window', { location });
   } else {
     localStorage.clear();
+    sessionStorage.clear();
   }
   FakeWebSocket.reset();
   vi.stubGlobal('WebSocket', FakeWebSocket);

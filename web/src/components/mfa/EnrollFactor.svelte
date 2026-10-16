@@ -50,7 +50,7 @@
       <Icon name="chevron-right" size={16} class="text-dim" />
     </button>
     <p class="text-xs leading-relaxed text-dim">
-      The desktop app and AI agents (MCP) ask for a code from an authenticator app, so we recommend setting one up. You can add more methods later in Settings.
+      The desktop app asks for a code from an authenticator app, so we recommend setting one up. You can add more methods later in Settings.
     </p>
   </div>
 {/if}

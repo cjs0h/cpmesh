@@ -153,7 +153,7 @@
                 Authenticator app
                 {#if status.totp}<Badge tone="mint">Set up</Badge>{/if}
               </p>
-              <p class="mt-0.5 text-[13px] text-muted">6-digit codes from an app. The desktop app and AI agents (MCP) use these too.</p>
+              <p class="mt-0.5 text-[13px] text-muted">6-digit codes from an app. The desktop app uses these too.</p>
             </div>
           </div>
           <div class="shrink-0 sm:pl-3">

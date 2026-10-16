@@ -114,6 +114,19 @@ describe('api()', () => {
     expect(fetch).toHaveBeenCalledTimes(2);
   });
 
+  it("keeps an AI agent's consent page when the session expires, so signing in continues there", async () => {
+    const consent = '#/activate?user_code=BCDF-GHJK';
+    window.location.hash = consent;
+    setTokens('expired', 'refresh-1');
+    fetchMock()
+      .mockResolvedValueOnce(jsonResponse(401, { error: 'invalid or expired token' }))
+      .mockResolvedValueOnce(jsonResponse(401, { error: 'invalid refresh token' }));
+
+    await expect(api('/api/me')).rejects.toThrow('Session expired');
+    expect(getAccessToken()).toBeNull();
+    expect(window.location.hash).toBe(consent);
+  });
+
   it('surfaces a network failure without deleting the session', async () => {
     setTokens('expired', 'refresh-1');
     fetchMock()

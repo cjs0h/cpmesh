@@ -1,4 +1,4 @@
-import { getAccessToken, getRefreshToken, setTokens, clearTokens, authGeneration } from './auth';
+import { getAccessToken, getRefreshToken, setTokens, clearTokens, authGeneration, signInLocation } from './auth';
 
 let refreshPromise: Promise<boolean> | null = null;
 
@@ -52,7 +52,7 @@ async function refreshOnce(rejected: string): Promise<boolean> {
     if (generation !== authGeneration() || getRefreshToken() !== refreshToken) return false;
     if (!data || typeof data.access_token !== 'string' || typeof data.refresh_token !== 'string') {
       clearTokens();
-      window.location.hash = '#/login';
+      window.location.hash = signInLocation();
       throw new Error('Invalid refresh response');
     }
     // The presented refresh token is now spent: keep the rotated one
@@ -137,7 +137,8 @@ export async function api<T = unknown>(path: string, options: RequestInit = {}):
       res = await fetch(path, { ...options, headers });
     } else {
       clearTokens();
-      window.location.hash = '#/login';
+      // An agent's consent page asks to sign in again and keeps its request
+      window.location.hash = signInLocation();
       throw new Error('Session expired');
     }
   }
