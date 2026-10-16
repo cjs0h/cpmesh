@@ -24,6 +24,7 @@ End-to-end encrypted clipboard sync on a relay the user runs themselves. The rel
 - A web dashboard (`web/`) served by the same server handles account management, passkeys and two-factor setup; the desktop app hands browser sign-ins back through the `cpmesh://` deep link.
 - Every sign-in is confirmed with a second factor (authenticator code, recovery code, or passkey in the browser).
 - New devices wait in a pending state until an approved device verifies the fingerprint and approves them.
+- An approved device without the current encryption key (for example one an older relay re-registered) gets it in the app: on a device that has the key, Devices → Share key, then the same 8-digit pairing code on both (the device without the key shows it under Settings → Encryption keys). Devices that keep new keys from every member (not verified here, changed identity, not updated) are listed with Verify and Remove, also in the approval dialog.
 
 ## Capabilities and Constraints
 

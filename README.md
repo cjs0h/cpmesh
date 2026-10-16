@@ -260,11 +260,19 @@ a folder in its data folder (`backups/` or `archive/`), and **Settings → Encry
 | Keys of another account, when signing in to another server or account | At sign-in: archive them in `archive/<server>_<user>_<time>/`; they come back when that account signs in on this computer again |
 | Keys this device can't open, because its device key changed | At sign-in: set them aside; restore them later with the old `device.key` |
 | "This computer is already registered with different keys" (HTTP 409) | At sign-in: replace that registration. If it was the account's only approved device, the app warns that it held the only copy of the encryption key, and removes devices waiting for approval along with it (they can ask again): only a registration on an account without devices is approved by itself |
-| "This device doesn't have your account's current encryption key" | **Settings → Encryption keys** (also offered by a banner): verify this device on another device that still has the key, which then shares it; restore it from a backup (one cpmesh made, or a folder with `keyring.enc` and the `device.key` that was next to it), re-encrypted for this device and checked against your clipboard history; or, as a last resort, start new encryption keys |
+| "This device doesn't have your account's current encryption key" | **Settings → Encryption keys** (also offered by a banner): get it from another device that still has the key, which then shares it — there, choose **Share key** next to this device on the **Devices** page and compare the 8-digit pairing code both screens show, or verify this device with its full fingerprint and then verify that device here in turn; restore it from a backup (one cpmesh made, or a folder with `keyring.enc` and the `device.key` that was next to it), re-encrypted for this device and checked against your clipboard history; or, as a last resort, start new encryption keys |
 
 Starting new encryption keys needs every other approved device verified on this device or removed, since each one gets
 the new key. Clips synced before stay unreadable on devices without the old key, though restoring a backup later still
 opens them. It is never automatic, and it replaces resetting `group_key_versions` in the database by hand.
+
+A device can also be approved yet lack the current key because an older relay re-registered it, which dropped its
+copies; current relays refuse changed keys instead and never drop them. The relay marks such devices, so a device that
+has the key shows **Needs the key** and **Share key** next to them on its **Devices** page. Keys still go only to devices
+verified on the sending device; the relay's mark only offers the action. Every new key (approving a device, sharing the
+key, starting new keys, the scheduled change) must reach all approved devices, so the **Devices** page and the approval
+dialog list any device that isn't verified on this one, changed its identity, was removed earlier or is too old to
+receive keys, with **Verify** and **Remove** next to each.
 
 ## Admin console
 

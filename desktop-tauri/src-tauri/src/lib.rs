@@ -165,6 +165,8 @@ pub fn run() {
             commands::confirm_pairing,
             commands::get_own_identity,
             commands::verify_device_identity,
+            commands::get_device_trust,
+            commands::confirm_key_share,
             commands::get_history,
             commands::search_history,
             commands::copy_entry,
