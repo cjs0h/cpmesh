@@ -23,6 +23,14 @@ pub enum ApiError {
         code: Option<String>,
         message: String,
     },
+    /// Registration refused: the account has this computer (same hardware fingerprint)
+    /// registered with other device keys.
+    #[error("Server error (409): {message}")]
+    DeviceKeysChanged {
+        message: String,
+        /// That registration; servers before this version don't say.
+        device_id: Option<String>,
+    },
 }
 
 /// How a sign-in continues after the password, when the account needs a second factor.
@@ -811,6 +819,19 @@ fn parse_error_body(status: u16, body: &str) -> ApiError {
             .get("code")
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        // Servers before the code only had the message
+        if status == 409
+            && (code.as_deref() == Some("device_keys_changed")
+                || msg.starts_with("device keys changed"))
+        {
+            return ApiError::DeviceKeysChanged {
+                message: msg.to_string(),
+                device_id: err_obj
+                    .get("device_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            };
+        }
         // Older errors put a code in `error` and the readable text in `message`
         // (e.g. {"error": "email_not_verified", "message": "Please verify..."})
         if let Some(readable) = err_obj.get("message").and_then(|v| v.as_str())
@@ -943,10 +964,55 @@ pub(crate) mod tests {
 
     #[derive(Debug)]
     pub(crate) struct Recorded {
-        method: String,
-        path: String,
+        pub(crate) method: String,
+        pub(crate) path: String,
         authorization: Option<String>,
-        body: String,
+        pub(crate) body: String,
+    }
+
+    /// Reads one request from `stream`.
+    async fn read_request(stream: tokio::net::TcpStream) -> (Recorded, tokio::net::TcpStream) {
+        let mut reader = BufReader::new(stream);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).await.unwrap();
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or_default().to_string();
+        let path = parts.next().unwrap_or_default().to_string();
+
+        let (mut authorization, mut length) = (None, 0);
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let line = line.trim_end();
+            if line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                match name.to_ascii_lowercase().as_str() {
+                    "authorization" => authorization = Some(value.trim().to_string()),
+                    "content-length" => length = value.trim().parse().unwrap(),
+                    _ => {}
+                }
+            }
+        }
+        let mut body_bytes = vec![0; length];
+        reader.read_exact(&mut body_bytes).await.unwrap();
+        let request = Recorded {
+            method,
+            path,
+            authorization,
+            body: String::from_utf8(body_bytes).unwrap(),
+        };
+        (request, reader.into_inner())
+    }
+
+    async fn respond(mut stream: tokio::net::TcpStream, status: u16, body: &str) {
+        let response = format!(
+            "HTTP/1.1 {status} Scripted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.shutdown().await.ok();
     }
 
     /// Serves `responses` in order, one per connection, recording each request.
@@ -960,48 +1026,30 @@ pub(crate) mod tests {
         tokio::spawn(async move {
             for (status, body) in responses {
                 let (stream, _) = listener.accept().await.unwrap();
-                let mut reader = BufReader::new(stream);
-                let mut request_line = String::new();
-                reader.read_line(&mut request_line).await.unwrap();
-                let mut parts = request_line.split_whitespace();
-                let method = parts.next().unwrap_or_default().to_string();
-                let path = parts.next().unwrap_or_default().to_string();
-
-                let (mut authorization, mut length) = (None, 0);
-                loop {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).await.unwrap();
-                    let line = line.trim_end();
-                    if line.is_empty() {
-                        break;
-                    }
-                    if let Some((name, value)) = line.split_once(':') {
-                        match name.to_ascii_lowercase().as_str() {
-                            "authorization" => authorization = Some(value.trim().to_string()),
-                            "content-length" => length = value.trim().parse().unwrap(),
-                            _ => {}
-                        }
-                    }
-                }
-                let mut body_bytes = vec![0; length];
-                reader.read_exact(&mut body_bytes).await.unwrap();
-                recorded.lock().unwrap().push(Recorded {
-                    method,
-                    path,
-                    authorization,
-                    body: String::from_utf8(body_bytes).unwrap(),
-                });
-
-                let response = format!(
-                    "HTTP/1.1 {status} Scripted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let mut stream = reader.into_inner();
-                stream.write_all(response.as_bytes()).await.unwrap();
-                stream.shutdown().await.ok();
+                let (request, stream) = read_request(stream).await;
+                recorded.lock().unwrap().push(request);
+                respond(stream, status, body).await;
             }
         });
         (base_url, log)
+    }
+
+    /// A stateful fake relay: answers each request with `handler`, for as long as the
+    /// test runs.
+    pub(crate) async fn serve_with(
+        handler: impl Fn(&Recorded) -> (u16, String) + Send + Sync + 'static,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handler = Arc::new(handler);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (request, stream) = read_request(stream).await;
+                let (status, body) = handler(&request);
+                respond(stream, status, &body).await;
+            }
+        });
+        base_url
     }
 
     #[derive(Default)]
@@ -1228,6 +1276,51 @@ pub(crate) mod tests {
                 other => panic!("unexpected error: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn a_registration_conflicting_with_old_device_keys_is_recognized() {
+        // This server names the registration…
+        match parse_error_body(
+            409,
+            r#"{"error":"device keys changed: this device is already registered as “Linux - box” with different keys.","code":"device_keys_changed","device_id":"11111111-1111-4111-8111-111111111111","device_name":"Linux - box"}"#,
+        ) {
+            ApiError::DeviceKeysChanged { message, device_id } => {
+                assert!(message.starts_with("device keys changed"));
+                assert_eq!(
+                    device_id.as_deref(),
+                    Some("11111111-1111-4111-8111-111111111111")
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        // …earlier servers only said what happened
+        let err = parse_error_body(
+            409,
+            r#"{"error":"device keys changed; remove the old device and pair the replacement"}"#,
+        );
+        assert!(
+            matches!(
+                err,
+                ApiError::DeviceKeysChanged {
+                    device_id: None,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Server error (409): device keys changed; remove the old device and pair the replacement"
+        );
+        // Other conflicts stay what they were
+        assert!(matches!(
+            parse_error_body(
+                409,
+                r#"{"error":"maximum number of devices reached for your subscription"}"#
+            ),
+            ApiError::Server { status: 409, .. }
+        ));
     }
 
     #[test]

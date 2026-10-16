@@ -239,53 +239,18 @@ impl KeyExchange {
 
     /// Load the keyring from an encrypted file.
     pub fn load_keyring(&mut self, path: &Path) -> Result<(), CryptoError> {
-        let data =
-            std::fs::read(path).map_err(|e| CryptoError::Decrypt(format!("read keyring: {e}")))?;
-        if data.len() < 16 {
-            return Err(CryptoError::CiphertextTooShort);
-        }
-
-        let salt = &data[..16];
-        let encrypted = &data[16..];
-
-        let private_bytes = self.keys.identity.private.to_bytes();
-        let kek =
-            super::encrypt::derive_key_from_secret(&private_bytes, salt, b"cpnet-keyring-v1")?;
-        let plaintext = decrypt(&kek, encrypted)?;
-
-        #[derive(serde::Deserialize)]
-        struct SavedKeyring {
-            current_version: i32,
-            keys: BTreeMap<i32, String>,
-        }
-        let keyring_data: SavedKeyring = serde_json::from_slice(&plaintext)
-            .map_err(|e| CryptoError::Decrypt(format!("deserialize keyring: {e}")))?;
-
-        let mut restored = BTreeMap::new();
-        for (version, value) in keyring_data.keys {
-            let key = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, value)
-                .map_err(|e| CryptoError::Decrypt(format!("invalid saved key: {e}")))?;
-            if version < 1
-                || key.len() != 32
-                || version > keyring_data.current_version
-                || self
-                    .keys_by_version
-                    .get(&version)
-                    .is_some_and(|existing| *existing != key)
-            {
-                return Err(CryptoError::Decrypt(
-                    "invalid or conflicting saved keyring".into(),
-                ));
-            }
-            restored.insert(version, key);
-        }
-        if !restored.contains_key(&keyring_data.current_version) {
+        let saved = read_keyring(path, &self.keys.identity)?;
+        if saved.keys.iter().any(|(version, key)| {
+            self.keys_by_version
+                .get(version)
+                .is_some_and(|existing| existing.as_slice() != key.as_slice())
+        }) {
             return Err(CryptoError::Decrypt(
-                "saved keyring has no active key".into(),
+                "invalid or conflicting saved keyring".into(),
             ));
         }
-        for (version, key) in restored {
-            self.add_key_version(version, key)?;
+        for (version, key) in &saved.keys {
+            self.add_key_version(*version, key.to_vec())?;
         }
 
         Ok(())
@@ -300,6 +265,57 @@ impl KeyExchange {
     pub fn keys(&self) -> &DeviceKeys {
         &self.keys
     }
+}
+
+/// The group keys of a saved keyring, by version.
+pub struct SavedKeys {
+    pub keys: BTreeMap<i32, zeroize::Zeroizing<Vec<u8>>>,
+}
+
+/// Opens a keyring file with the identity key that saved it. Used to load this
+/// device's keyring and to read backups made under an earlier identity.
+pub fn read_keyring(path: &Path, identity: &KeyPair) -> Result<SavedKeys, CryptoError> {
+    let data =
+        std::fs::read(path).map_err(|e| CryptoError::Decrypt(format!("read keyring: {e}")))?;
+    if data.len() < 16 {
+        return Err(CryptoError::CiphertextTooShort);
+    }
+
+    let salt = &data[..16];
+    let encrypted = &data[16..];
+
+    let private_bytes = identity.private.to_bytes();
+    let kek = super::encrypt::derive_key_from_secret(&private_bytes, salt, b"cpnet-keyring-v1")?;
+    let plaintext = zeroize::Zeroizing::new(decrypt(&kek, encrypted)?);
+
+    #[derive(serde::Deserialize)]
+    struct SavedKeyring {
+        current_version: i32,
+        keys: BTreeMap<i32, String>,
+    }
+    let keyring_data: SavedKeyring = serde_json::from_slice(&plaintext)
+        .map_err(|e| CryptoError::Decrypt(format!("deserialize keyring: {e}")))?;
+
+    let mut keys = BTreeMap::new();
+    for (version, mut value) in keyring_data.keys {
+        let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &value);
+        value.zeroize();
+        let key = zeroize::Zeroizing::new(
+            decoded.map_err(|e| CryptoError::Decrypt(format!("invalid saved key: {e}")))?,
+        );
+        if version < 1 || key.len() != 32 || version > keyring_data.current_version {
+            return Err(CryptoError::Decrypt(
+                "invalid or conflicting saved keyring".into(),
+            ));
+        }
+        keys.insert(version, key);
+    }
+    if !keys.contains_key(&keyring_data.current_version) {
+        return Err(CryptoError::Decrypt(
+            "saved keyring has no active key".into(),
+        ));
+    }
+    Ok(SavedKeys { keys })
 }
 
 #[cfg(test)]

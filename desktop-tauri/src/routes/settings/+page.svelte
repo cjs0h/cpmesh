@@ -33,6 +33,7 @@
 	import SettingsGroup from '#lib/components/ui/SettingsGroup.svelte';
 	import Skeleton from '#lib/components/ui/Skeleton.svelte';
 	import Switch from '#lib/components/ui/Switch.svelte';
+	import EncryptionKeys from '#lib/components/EncryptionKeys.svelte';
 
 	const desktop = isDesktop();
 	const status = $derived(getStatusValue());
@@ -188,7 +189,7 @@
 	async function handleSwitchServer() {
 		const confirmed = await confirmAction({
 			title: 'Switch to another server?',
-			description: `This signs this device out of ${serverHost(config?.server_url)} and removes its keys here. You’ll sign in to the new server next, and approve this device there.`,
+			description: `This signs this device out of ${serverHost(config?.server_url)}. You’ll sign in to the new server next, and approve this device there.`,
 			confirmLabel: 'Sign out and switch',
 		});
 		if (confirmed) await signOut({ switchServer: true });
@@ -197,7 +198,8 @@
 	async function handleSignOut() {
 		const confirmed = await confirmAction({
 			title: 'Sign out of cpmesh?',
-			description: 'This device disconnects and forgets its keys and settings. To use it again, sign in and approve it from another device.',
+			description:
+				'This device stops syncing until you sign in again. Its keys, clipboard history and preferences stay on it, so it can rejoin the same account without another approval.',
 			confirmLabel: 'Sign out',
 			tone: 'danger',
 		});
@@ -295,6 +297,8 @@
 				{/snippet}
 			</SettingRow>
 		</SettingsGroup>
+
+		<EncryptionKeys />
 
 		<SettingsGroup title="Appearance">
 			<SettingRow label="Theme" description="Follow your system, or keep cpmesh light or dark.">
@@ -409,7 +413,7 @@
 		</SettingsGroup>
 
 		<SettingsGroup>
-			<SettingRow label="Sign out" description="Disconnect this device and remove its keys and settings.">
+			<SettingRow label="Sign out" description="Stop syncing until you sign in again. This device keeps its keys, clipboard history and preferences.">
 				{#snippet control()}
 					<Button size="sm" variant="danger-soft" icon="log-out" loading={signingOut} onclick={handleSignOut}>Sign out</Button>
 				{/snippet}
