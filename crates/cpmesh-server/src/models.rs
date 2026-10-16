@@ -52,6 +52,13 @@ pub struct Device {
     pub approved_at: Option<DateTime<Utc>>,
     pub approved_by_device_id: Option<uuid::Uuid>,
     pub fingerprint: Option<String>,
+    /// Protocol v3: static ECDH key certified by `public_key` (the identity key).
+    #[serde(default)]
+    #[sqlx(default)]
+    pub encryption_key: Option<Vec<u8>>,
+    #[serde(default)]
+    #[sqlx(default)]
+    pub encryption_key_sig: Option<Vec<u8>>,
 }
 
 fn default_device_status() -> String {
@@ -196,6 +203,12 @@ pub struct DeviceApprovalSession {
     pub status: String,
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+    #[sqlx(default)]
+    pub approver_commit: Option<Vec<u8>>,
+    #[sqlx(default)]
+    pub pending_nonce: Option<Vec<u8>>,
+    #[sqlx(default)]
+    pub approver_nonce: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, FromRow)]

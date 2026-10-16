@@ -174,8 +174,16 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             axum::routing::get(approval::handle_my_approval_status),
         )
         .route(
+            "/api/device-approvals/me/nonce",
+            axum::routing::post(approval::handle_pending_nonce),
+        )
+        .route(
             "/api/devices",
             axum::routing::post(devices::handle_register_device),
+        )
+        .route(
+            "/api/devices/me/encryption-key",
+            axum::routing::put(devices::handle_publish_encryption_key),
         )
         // Hands a fresh web sign-in to the desktop app ("Sign in with browser")
         .route(
@@ -233,6 +241,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/device-approvals/{pending_device_id}/begin",
             axum::routing::post(approval::handle_begin_approval),
+        )
+        .route(
+            "/api/device-approvals/{pending_device_id}/session",
+            axum::routing::get(approval::handle_approval_session),
+        )
+        .route(
+            "/api/device-approvals/{pending_device_id}/reveal",
+            axum::routing::post(approval::handle_reveal_nonce),
         )
         .route(
             "/api/device-approvals/{pending_device_id}/approve",

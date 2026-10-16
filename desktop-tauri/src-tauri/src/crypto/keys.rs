@@ -18,11 +18,61 @@ pub enum KeyError {
     InvalidKey(String),
 }
 
-/// Holds an ECDH P-256 key pair for E2E encryption.
-#[derive(Clone)]
+/// Holds a P-256 key pair. Used as the device identity key (ECDSA only in
+/// protocol v3) and, as a second independent instance, as the static ECDH
+/// encryption key.
+#[derive(Clone, Debug)]
 pub struct KeyPair {
     pub private: SecretKey,
     pub public: PublicKey,
+}
+
+/// The two long-term keys of a device: the identity key signs, the encryption
+/// key receives ECDH wraps. Keeping them separate means no key is ever used by
+/// two algorithms.
+#[derive(Clone, Debug)]
+pub struct DeviceKeys {
+    pub identity: KeyPair,
+    pub encryption: KeyPair,
+}
+
+impl DeviceKeys {
+    #[cfg(test)]
+    pub fn generate() -> Self {
+        DeviceKeys {
+            identity: KeyPair::generate(),
+            encryption: KeyPair::generate(),
+        }
+    }
+
+    /// Certifies the encryption key with the identity key so peers can verify it
+    /// against the fingerprint they pinned, rather than trusting the relay.
+    pub fn certify_encryption_key(&self) -> Vec<u8> {
+        self.identity
+            .sign_message(&cpmesh_proto::models::encryption_key_transcript(
+                &self.identity.public_key_bytes(),
+                &self.encryption.public_key_bytes(),
+            ))
+    }
+}
+
+/// Verifies that `encryption_key` was certified by the holder of `identity`.
+pub fn verify_encryption_key(
+    identity: &PublicKey,
+    encryption_key: &[u8],
+    signature: &[u8],
+) -> Result<PublicKey, KeyError> {
+    let key = KeyPair::parse_public_key(encryption_key)?;
+    KeyPair::verify_message(
+        identity,
+        &cpmesh_proto::models::encryption_key_transcript(
+            &public_key_to_bytes(identity),
+            encryption_key,
+        ),
+        signature,
+    )
+    .map_err(|_| KeyError::InvalidKey("encryption key certification is invalid".into()))?;
+    Ok(key)
 }
 
 impl KeyPair {
@@ -31,6 +81,25 @@ impl KeyPair {
         let private = SecretKey::generate();
         let public = private.public_key();
         KeyPair { private, public }
+    }
+
+    /// Rebuilds a key pair from its 32-byte private scalar.
+    pub fn from_scalar_bytes(bytes: &[u8]) -> Result<Self, KeyError> {
+        if bytes.len() != 32 {
+            return Err(KeyError::InvalidKey(format!(
+                "private scalar must be 32 bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let private = SecretKey::from_slice(bytes)
+            .map_err(|e| KeyError::InvalidKey(format!("invalid private key: {e}")))?;
+        let public = private.public_key();
+        Ok(KeyPair { private, public })
+    }
+
+    /// The 32-byte private scalar, for storage in the OS credential store.
+    pub fn scalar_bytes(&self) -> zeroize::Zeroizing<[u8; 32]> {
+        zeroize::Zeroizing::new(self.private.to_bytes().into())
     }
 
     /// Returns the public key as uncompressed SEC1 bytes for transmission.
@@ -44,7 +113,9 @@ impl KeyPair {
             .map_err(|e| KeyError::InvalidKey(format!("invalid public key point: {e}")))
     }
 
-    /// Saves the private key to a PEM file.
+    /// Saves the private key to a legacy PEM file (tests only; production keys
+    /// live in the OS credential store, see `device_keys`).
+    #[cfg(test)]
     pub fn save_private_key(&self, path: &Path) -> Result<(), KeyError> {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
@@ -56,7 +127,7 @@ impl KeyPair {
         Ok(())
     }
 
-    /// Loads a private key from a PEM file.
+    /// Loads a private key from a legacy PEM file (imported once into the store).
     pub fn load_private_key(path: &Path) -> Result<SecretKey, KeyError> {
         let data = fs::read_to_string(path)?;
         let pem_data =
@@ -71,7 +142,8 @@ impl KeyPair {
             .map_err(|e| KeyError::InvalidKey(format!("invalid private key: {e}")))
     }
 
-    /// Loads an existing key pair or generates a new one.
+    /// Loads an existing key pair or generates a new one (legacy PEM, tests only).
+    #[cfg(test)]
     pub fn load_or_generate(key_path: &Path) -> Result<Self, KeyError> {
         if key_path.exists() {
             let private = Self::load_private_key(key_path)?;
@@ -159,41 +231,15 @@ pub fn public_key_to_bytes(public_key: &PublicKey) -> Vec<u8> {
     public_key.to_sec1_point(false).as_bytes().to_vec()
 }
 
-/// Full 256-bit pairing fingerprint, compared through an independent trusted
-/// channel on BOTH devices. Never shorten this to a short authentication string:
-/// without a commitment protocol a short comparison admits birthday attacks.
-pub fn derive_approval_code(
-    our_private: &SecretKey,
-    peer_public: &PublicKey,
-    our_public: &PublicKey,
-) -> Result<String, super::encrypt::CryptoError> {
-    use hkdf::Hkdf;
-    use p256::ecdh::diffie_hellman;
-
-    // ECDH shared secret
-    let shared_secret = diffie_hellman(our_private.to_nonzero_scalar(), peer_public.as_affine());
-    let secret_bytes = shared_secret.raw_secret_bytes();
-
-    // Salt = SHA256(sorted concatenation of both public keys)
-    // Sort to ensure both sides produce the same salt regardless of who is approver/pending
-    let our_bytes = public_key_to_bytes(our_public);
-    let peer_bytes = public_key_to_bytes(peer_public);
-
-    let combined = if our_bytes <= peer_bytes {
-        [our_bytes.as_slice(), peer_bytes.as_slice()].concat()
-    } else {
-        [peer_bytes.as_slice(), our_bytes.as_slice()].concat()
-    };
-
-    let salt = Sha256::digest(&combined);
-
-    // HKDF derivation
-    let hk = Hkdf::<Sha256>::new(Some(&salt), secret_bytes);
-    let mut derived = [0u8; 32];
-    hk.expand(b"cpmesh-pairing-fingerprint-v2", &mut derived)
-        .map_err(|_| super::encrypt::CryptoError::Hkdf)?;
-
-    Ok(derived.iter().map(|b| format!("{b:02X}")).collect())
+/// Full 256-bit pairing code over both identity keys, compared through an
+/// independent trusted channel on BOTH devices. It is a plain hash: in protocol
+/// v3 the identity key never performs ECDH. Never shorten this without the
+/// committed short-authentication-string protocol (`cpmesh_proto::models::sas_code`).
+pub fn derive_approval_code(our_public: &PublicKey, peer_public: &PublicKey) -> String {
+    cpmesh_proto::models::pairing_fingerprint(
+        &public_key_to_bytes(our_public),
+        &public_key_to_bytes(peer_public),
+    )
 }
 
 pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
@@ -374,8 +420,8 @@ mod tests {
     fn pairing_fingerprint_is_symmetric_and_full_256_bits() {
         let a = KeyPair::generate();
         let b = KeyPair::generate();
-        let code_a = derive_approval_code(&a.private, &b.public, &a.public).unwrap();
-        let code_b = derive_approval_code(&b.private, &a.public, &b.public).unwrap();
+        let code_a = derive_approval_code(&a.public, &b.public);
+        let code_b = derive_approval_code(&b.public, &a.public);
         assert_eq!(code_a, code_b);
         assert_eq!(code_a.len(), 64);
         assert!(code_a.chars().all(|c| c.is_ascii_hexdigit()));
@@ -386,8 +432,50 @@ mod tests {
         let a = KeyPair::generate();
         let b = KeyPair::generate();
         let c = KeyPair::generate();
-        let code_ab = derive_approval_code(&a.private, &b.public, &a.public).unwrap();
-        let code_ac = derive_approval_code(&a.private, &c.public, &a.public).unwrap();
+        let code_ab = derive_approval_code(&a.public, &b.public);
+        let code_ac = derive_approval_code(&a.public, &c.public);
         assert_ne!(code_ab, code_ac);
+    }
+
+    #[test]
+    fn scalar_roundtrip_preserves_the_key() {
+        let kp = KeyPair::generate();
+        let restored = KeyPair::from_scalar_bytes(kp.scalar_bytes().as_ref()).unwrap();
+        assert_eq!(kp.public_key_bytes(), restored.public_key_bytes());
+        assert!(KeyPair::from_scalar_bytes(&[0u8; 32]).is_err());
+        assert!(KeyPair::from_scalar_bytes(&[1u8; 31]).is_err());
+    }
+
+    #[test]
+    fn encryption_key_certification_binds_identity_and_key() {
+        let keys = DeviceKeys::generate();
+        let sig = keys.certify_encryption_key();
+        let verified = verify_encryption_key(
+            &keys.identity.public,
+            &keys.encryption.public_key_bytes(),
+            &sig,
+        )
+        .unwrap();
+        assert_eq!(
+            public_key_to_bytes(&verified),
+            keys.encryption.public_key_bytes()
+        );
+        // Identity and encryption keys are distinct.
+        assert_ne!(
+            keys.identity.public_key_bytes(),
+            keys.encryption.public_key_bytes()
+        );
+        // A relay cannot swap in its own encryption key…
+        let mallory = KeyPair::generate();
+        assert!(
+            verify_encryption_key(&keys.identity.public, &mallory.public_key_bytes(), &sig)
+                .is_err()
+        );
+        // …nor present a key certified by a different identity.
+        assert!(
+            verify_encryption_key(&mallory.public, &keys.encryption.public_key_bytes(), &sig)
+                .is_err()
+        );
+        assert!(verify_encryption_key(&keys.identity.public, &[4u8; 65], &sig).is_err());
     }
 }

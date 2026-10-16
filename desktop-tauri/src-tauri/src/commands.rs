@@ -12,8 +12,11 @@ use crate::api::client::{
     ApiClient, ApiError, LoginOutcome, MfaChallenge, MfaMethod, MfaStage, MfaVerified,
 };
 use crate::config::{AppConfig, TokenStore};
+use crate::crypto::entry::EntryContext;
 use crate::crypto::exchange::KeyExchange;
 use crate::crypto::keys::{KeyPair, derive_approval_code};
+use crate::crypto::verify::{KeyVerifier, ReplayGuard};
+use crate::device_keys::DeviceKeyStore;
 use crate::history::History;
 use crate::proto::models::*;
 use crate::state::AppState;
@@ -101,9 +104,36 @@ pub struct AppContext {
 #[derive(Clone)]
 struct PairingCandidate {
     peer: DeviceIdentity,
+    /// The pending device's certified encryption key, as shown by the relay when
+    /// the session began; verified against the pinned identity before wrapping.
+    peer_encryption: Option<(Vec<u8>, Vec<u8>)>,
+    /// Full 256-bit pairing code over both identity keys.
     fingerprint: String,
+    /// Our SAS nonce (approver: committed; pending: submitted after the commitment).
+    nonce: Option<[u8; 32]>,
+    /// The approver's commitment as first seen by the pending device.
+    commit: Option<[u8; 32]>,
+    /// Short authentication string, available once both nonces are known.
+    sas: Option<String>,
     started: Instant,
     incoming: bool,
+}
+
+fn random_nonce() -> [u8; 32] {
+    let mut nonce = [0u8; 32];
+    crate::crypto::encrypt::fill_random(&mut nonce);
+    nonce
+}
+
+fn nonce32(bytes: &[u8]) -> Result<[u8; 32], String> {
+    bytes
+        .try_into()
+        .map_err(|_| "Pairing nonce has the wrong length".to_string())
+}
+
+/// Loads this device's long-term keys from the credential store.
+fn device_keys(ctx: &AppContext) -> Result<crate::crypto::keys::DeviceKeys, String> {
+    DeviceKeyStore::new(&ctx.config_dir).load_or_generate()
 }
 
 impl AppContext {
@@ -510,13 +540,11 @@ async fn finish_sign_in(
     // Generate stable device fingerprint using the account's user_id
     let fingerprint = crate::fingerprint::generate_device_fingerprint(&user_id).ok();
 
-    // Generate device key pair
-    let key_path = AppConfig::key_path(&ctx.config_dir);
-    let kp =
-        KeyPair::load_or_generate(&key_path).map_err(|e| format!("Key generation failed: {e}"))?;
-    // Register device with fingerprint
+    // Load or generate the device keys (identity + encryption) from the credential store
+    let keys = device_keys(ctx).map_err(|e| format!("Key generation failed: {e}"))?;
+    // Register device with fingerprint and the certified encryption key
     let reg_resp = api
-        .register_device(&device_name, &kp, fingerprint)
+        .register_device(&device_name, &keys, fingerprint)
         .await
         .map_err(|e| format!("Device registration failed: {e}"))?;
 
@@ -524,7 +552,7 @@ async fn finish_sign_in(
     let device_status = reg_resp.device.status.to_string();
 
     // Restore first; connect() is the sole network key-initialization path.
-    let exchange = crate::key_sync::restore(kp, &ctx.config_dir)?;
+    let exchange = crate::key_sync::restore(keys, &ctx.config_dir)?;
 
     // Save tokens to secure storage
     let token_store = TokenStore::new(&ctx.config_dir);
@@ -701,35 +729,20 @@ pub async fn connect(
                 }
                 WsEvent::ClipboardNew(payload) => {
                     let ctx: tauri::State<'_, AppContext> = handle.state::<AppContext>();
-                    // Decrypt the entry
-                    let exchange_guard = ctx.exchange.lock().await;
-                    if let Some(exchange) = exchange_guard.as_ref() {
-                        let kv = payload.entry.key_version;
-                        if let Ok(data) =
-                            exchange.decrypt_payload(&payload.entry.encrypted_data, kv)
-                        {
-                            let mut meta = Metadata::default();
-                            if !payload.entry.metadata.is_empty()
-                                && let Ok(meta_encrypted) =
-                                    base64::engine::general_purpose::STANDARD
-                                        .decode(&payload.entry.metadata)
-                                && let Ok(meta_bytes) =
-                                    exchange.decrypt_payload(&meta_encrypted, kv)
-                                && let Ok(m) = serde_json::from_slice(&meta_bytes)
-                            {
-                                meta = m;
-                            }
-
-                            let plain = PlainEntry {
-                                id: payload.entry.id,
-                                device_id: payload.entry.device_id,
-                                device_name: payload.entry.device_name,
-                                content_type: payload.entry.content_type,
-                                data,
-                                metadata: meta,
-                                created_at: payload.entry.created_at,
-                            };
-
+                    // Authenticate, replay-check and decrypt the entry
+                    match authenticate_entry(&ctx, &payload.entry, true).await {
+                        Err(reason) => {
+                            log::warn!(
+                                "Rejected clipboard entry {} from {}: {reason}",
+                                payload.entry.id,
+                                payload.entry.device_id
+                            );
+                            let _ = handle.emit(
+                                "sync-error",
+                                format!("Rejected an unauthenticated clipboard entry: {reason}"),
+                            );
+                        }
+                        Ok(plain) => {
                             // Store in local history
                             if let Some(history) = ctx.history.lock().await.as_ref() {
                                 let _ = history.add(&plain);
@@ -890,11 +903,11 @@ pub async fn connect(
 
 async fn prepare_connection(ctx: &AppContext, config: &AppConfig) -> Result<(), String> {
     crate::key_sync::bind_account(&ctx.config_dir, &config.server_url, &config.user_id, config)?;
-    let path = AppConfig::key_path(&ctx.config_dir);
-    if !path.exists() {
+    let store = DeviceKeyStore::new(&ctx.config_dir);
+    if !store.has_identity() {
         return Err("Device key is missing; restore it or pair a replacement device".into());
     }
-    let pair = KeyPair::load_or_generate(&path).map_err(|e| e.to_string())?;
+    let keys = store.load_or_generate()?;
     {
         let mut api = ctx.api.lock().await;
         api.connection_token(false).await.ok_or(SESSION_EXPIRED)?;
@@ -902,7 +915,7 @@ async fn prepare_connection(ctx: &AppContext, config: &AppConfig) -> Result<(), 
             let registration = api
                 .register_device(
                     &config.device_name,
-                    &pair,
+                    &keys,
                     crate::fingerprint::generate_device_fingerprint(&config.user_id).ok(),
                 )
                 .await
@@ -915,7 +928,18 @@ async fn prepare_connection(ctx: &AppContext, config: &AppConfig) -> Result<(), 
         }
     }
     if ctx.exchange.lock().await.is_none() {
-        *ctx.exchange.lock().await = Some(crate::key_sync::restore(pair, &ctx.config_dir)?);
+        *ctx.exchange.lock().await = Some(crate::key_sync::restore(keys, &ctx.config_dir)?);
+    }
+    {
+        // Peers wrap new group keys to the encryption key the relay lists for us.
+        let api = ctx.api.lock().await;
+        let exchange = ctx.exchange.lock().await;
+        crate::key_sync::publish_encryption_key(
+            exchange.as_ref().expect("keyring restored"),
+            &api,
+            &config.device_id,
+        )
+        .await?;
     }
     refresh_keys(ctx).await?;
     let mut config = ctx.config.write().await;
@@ -929,12 +953,12 @@ async fn refresh_keys(ctx: &AppContext) -> Result<(), String> {
     let api = ctx.api.lock().await;
     let mut exchange = ctx.exchange.lock().await;
     if exchange.is_none() {
-        let path = AppConfig::key_path(&ctx.config_dir);
-        if !path.exists() {
+        let store = DeviceKeyStore::new(&ctx.config_dir);
+        if !store.has_identity() {
             return Err("Device key is missing".into());
         }
-        let pair = KeyPair::load_or_generate(&path).map_err(|e| e.to_string())?;
-        *exchange = Some(crate::key_sync::restore(pair, &ctx.config_dir)?);
+        let keys = store.load_or_generate()?;
+        *exchange = Some(crate::key_sync::restore(keys, &ctx.config_dir)?);
     }
     let exchange = exchange.as_mut().expect("keyring restored");
     let due = crate::key_sync::synchronize(exchange, &api, &own_id, &ctx.config_dir).await?;
@@ -1022,20 +1046,34 @@ async fn send_local_clipboard(
     if pending.as_ref().is_none_or(|p| p.hash != hash) {
         let guard = ctx.exchange.lock().await;
         let exchange = guard.as_ref().ok_or("Encryption not initialized")?;
-        let (encrypted_data, key_version) =
-            exchange.encrypt_payload(data).map_err(|e| e.to_string())?;
+        let sender_id = ctx.config.read().await.device_id.clone();
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let sent_at = chrono::Utc::now().timestamp_millis();
         let metadata = serde_json::to_vec(metadata).map_err(|e| e.to_string())?;
-        let (metadata, _) = exchange
-            .encrypt_payload(&metadata)
-            .map_err(|e| e.to_string())?;
+        let sealed = crate::crypto::entry::seal_entry(
+            exchange,
+            exchange.key_pair(),
+            &EntryContext {
+                key_version: exchange.current_version,
+                content_type,
+                sender_id: &sender_id,
+                request_id: &request_id,
+                sent_at,
+            },
+            data,
+            &metadata,
+        )
+        .map_err(|e| e.to_string())?;
         *pending = Some(PendingPush {
             hash,
             payload: ClipboardPushPayload {
-                request_id: Some(uuid::Uuid::new_v4().to_string()),
+                request_id: Some(request_id),
                 content_type: content_type.clone(),
-                encrypted_data,
-                metadata: Some(base64::engine::general_purpose::STANDARD.encode(metadata)),
-                key_version,
+                encrypted_data: sealed.encrypted_data,
+                metadata: Some(base64::engine::general_purpose::STANDARD.encode(sealed.metadata)),
+                key_version: sealed.key_version,
+                sent_at: Some(sent_at),
+                sender_signature: Some(sealed.signature),
             },
         });
     }
@@ -1277,6 +1315,7 @@ async fn clipboard_monitor(handle: tauri::AppHandle, ws: Arc<WsConnection>) {
             data,
             metadata: meta,
             created_at: receipt.created_at,
+            authenticated: true,
         };
         drop(config);
 
@@ -1439,7 +1478,10 @@ pub struct PendingDeviceEntry {
 #[derive(Serialize)]
 pub struct ApprovalSessionInfo {
     pub session_id: String,
+    /// Full 64-character pairing code over both identity keys.
     pub approval_code: String,
+    /// Eight-digit short authentication string once both nonces are exchanged.
+    pub sas: Option<String>,
     pub expires_at: String,
 }
 
@@ -1447,6 +1489,7 @@ pub struct ApprovalSessionInfo {
 pub struct MyApprovalStatusInfo {
     pub status: String,
     pub approval_code: Option<String>,
+    pub sas: Option<String>,
     pub session_id: Option<String>,
     pub locally_verified: bool,
 }
@@ -1474,29 +1517,27 @@ pub async fn begin_device_approval(
     ctx: State<'_, AppContext>,
     pending_device_id: String,
 ) -> Result<ApprovalSessionInfo, String> {
+    // Commit to our SAS nonce before the pending device contributes its own.
+    let nonce = random_nonce();
+    let commit = sas_commitment(&nonce);
     // Lock API briefly to call begin_approval, then release
     let session = {
         let api = ctx.api.lock().await;
-        api.begin_approval(&pending_device_id)
+        api.begin_approval(&pending_device_id, &commit)
             .await
             .map_err(|e| e.to_string())?
     };
-    if session.pairing_version != 2 || session.pending_device_id != pending_device_id {
-        return Err(
-            "Update both clients and the server before using full-fingerprint pairing".into(),
-        );
+    if session.pairing_version != PAIRING_VERSION || session.pending_device_id != pending_device_id
+    {
+        return Err("Update both clients and the server before pairing".into());
     }
 
     // Cache exactly the identity displayed to the user, not a later relay lookup.
-    let key_path = AppConfig::key_path(&ctx.config_dir);
-    let kp =
-        KeyPair::load_or_generate(&key_path).map_err(|e| format!("Failed to load key: {e}"))?;
-
+    let kp = device_keys(&ctx)?.identity;
     let pending_pub = KeyPair::parse_public_key(&session.pending_public_key)
         .map_err(|e| format!("Invalid pending device public key: {e}"))?;
 
-    let code = derive_approval_code(&kp.private, &pending_pub, &kp.public)
-        .map_err(|e| format!("Failed to derive approval code: {e}"))?;
+    let code = derive_approval_code(&kp.public, &pending_pub);
     ctx.pairing.lock().await.insert(
         session.session_id.clone(),
         PairingCandidate {
@@ -1504,7 +1545,13 @@ pub async fn begin_device_approval(
                 id: pending_device_id,
                 public_key: session.pending_public_key,
             },
+            peer_encryption: session
+                .pending_encryption_key
+                .zip(session.pending_encryption_key_sig),
             fingerprint: code.clone(),
+            nonce: Some(nonce),
+            commit: Some(commit),
+            sas: None,
             started: Instant::now(),
             incoming: false,
         },
@@ -1513,7 +1560,62 @@ pub async fn begin_device_approval(
     Ok(ApprovalSessionInfo {
         session_id: session.session_id,
         approval_code: code,
+        sas: None,
         expires_at: session.expires_at.to_rfc3339(),
+    })
+}
+
+/// Approver: once the pending device has contributed its nonce, reveal ours and
+/// compute the short authentication string shown on both screens.
+#[tauri::command]
+pub async fn poll_device_approval(
+    ctx: State<'_, AppContext>,
+    pending_device_id: String,
+    session_id: String,
+) -> Result<ApprovalSessionInfo, String> {
+    let candidate = ctx
+        .pairing
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned()
+        .ok_or("Pairing session is missing; start again")?;
+    if candidate.incoming || candidate.peer.id != pending_device_id {
+        return Err("Pairing session changed; start again".into());
+    }
+    let state = {
+        let api = ctx.api.lock().await;
+        api.approval_session(&pending_device_id)
+            .await
+            .map_err(|e| e.to_string())?
+    };
+    if state.session_id != session_id {
+        return Err("Pairing session changed; start again".into());
+    }
+    let mut sas = candidate.sas.clone();
+    if sas.is_none()
+        && let (Some(pending_nonce), Some(nonce)) = (&state.pending_nonce, candidate.nonce)
+    {
+        let pending_nonce = nonce32(pending_nonce)?;
+        // Our nonce was committed first; it is only opened after theirs arrived.
+        if state.approver_nonce.is_none() {
+            let api = ctx.api.lock().await;
+            api.reveal_approval_nonce(&pending_device_id, &session_id, &nonce)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        let own = device_keys(&ctx)?.identity.public_key_bytes();
+        let code = sas_code(&nonce, &pending_nonce, &own, &candidate.peer.public_key);
+        if let Some(entry) = ctx.pairing.lock().await.get_mut(&session_id) {
+            entry.sas = Some(code.clone());
+        }
+        sas = Some(code);
+    }
+    Ok(ApprovalSessionInfo {
+        session_id,
+        approval_code: candidate.fingerprint,
+        sas,
+        expires_at: state.expires_at.to_rfc3339(),
     })
 }
 
@@ -1533,10 +1635,13 @@ pub async fn confirm_device_approval(
         .ok_or("Start pairing again")?;
     if candidate.incoming
         || candidate.peer.id != pending_device_id
-        || candidate.fingerprint != normalize_fingerprint(&fingerprint)
+        || !code_matches(&candidate, &fingerprint)
         || candidate.started.elapsed() > MFA_TICKET_TTL
     {
-        return Err("Pairing fingerprint or session changed; start again".into());
+        return Err("Pairing code or session changed; start again".into());
+    }
+    if candidate.sas.is_none() {
+        return Err("Wait until both devices show the same 8-digit code".into());
     }
     let _operation = ctx.key_operations.lock().await;
     let own_id = ctx.config.read().await.device_id.clone();
@@ -1546,7 +1651,24 @@ pub async fn confirm_device_approval(
     crate::key_sync::synchronize(exchange, &api, &own_id, &ctx.config_dir).await?;
     let mut members =
         crate::key_sync::trusted_members(exchange, &api, &own_id, &ctx.config_dir).await?;
-    members.push(candidate.peer);
+    // The new member's encryption key must be certified by the identity we just
+    // compared; fall back to the relay listing only to find that certification.
+    let peer_encryption = match candidate.peer_encryption {
+        Some(pair) => Some(pair),
+        None => api
+            .get_device_keys()
+            .await
+            .map_err(|e| e.to_string())?
+            .devices
+            .into_iter()
+            .find(|d| d.id == pending_device_id)
+            .and_then(|d| d.encryption_key.zip(d.encryption_key_sig)),
+    };
+    members.push(crate::crypto::membership::certified_target(
+        candidate.peer,
+        peer_encryption.as_ref().map(|(key, _)| key.as_slice()),
+        peer_encryption.as_ref().map(|(_, sig)| sig.as_slice()),
+    )?);
     let (new_version, wrapped_keys) =
         crate::crypto::membership::stage_rotation(exchange, &own_id, &members)?;
     let result = api
@@ -1603,31 +1725,71 @@ pub async fn get_my_approval_status(
         &resp.approver_public_key,
         &resp.approver_device_id,
     ) {
-        if resp.pairing_version != 2 {
+        if resp.pairing_version != PAIRING_VERSION {
             return Err("Update the approving client and server".into());
         }
-        let kp = KeyPair::load_or_generate(&AppConfig::key_path(&ctx.config_dir))
-            .map_err(|e| e.to_string())?;
+        let kp = device_keys(&ctx)?.identity;
         let peer = KeyPair::parse_public_key(approver_pub_bytes).map_err(|e| e.to_string())?;
-        let fingerprint =
-            derive_approval_code(&kp.private, &peer, &kp.public).map_err(|e| e.to_string())?;
+        let fingerprint = derive_approval_code(&kp.public, &peer);
         let mut candidates = ctx.pairing.lock().await;
         if candidates.get(session_id).is_some_and(|old| {
             old.peer.public_key != *approver_pub_bytes || old.peer.id != *approver_id
         }) {
             return Err("Pairing identity changed; do not approve this session".into());
         }
-        candidates
+        let candidate = candidates
             .entry(session_id.clone())
             .or_insert(PairingCandidate {
                 peer: DeviceIdentity {
                     id: approver_id.clone(),
                     public_key: approver_pub_bytes.clone(),
                 },
+                peer_encryption: None,
                 fingerprint,
+                nonce: None,
+                commit: None,
+                sas: None,
                 started: Instant::now(),
                 incoming: true,
             });
+        // The commitment is remembered as first seen; the relay cannot swap it later.
+        if let Some(commit) = &resp.approver_commit {
+            let commit = nonce32(commit)?;
+            match candidate.commit {
+                None => candidate.commit = Some(commit),
+                Some(seen) if seen != commit => {
+                    return Err("Pairing commitment changed; do not approve this session".into());
+                }
+                Some(_) => {}
+            }
+            if candidate.nonce.is_none() {
+                // Contribute our nonce only after the approver committed to theirs.
+                let nonce = random_nonce();
+                let api = ctx.api.lock().await;
+                api.submit_pending_nonce(session_id, &nonce)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                candidate.nonce = Some(nonce);
+            }
+        }
+        if candidate.sas.is_none()
+            && let (Some(approver_nonce), Some(commit), Some(nonce)) =
+                (&resp.approver_nonce, candidate.commit, candidate.nonce)
+        {
+            let approver_nonce = nonce32(approver_nonce)?;
+            if sas_commitment(&approver_nonce) != commit {
+                return Err(
+                    "Pairing commitment does not match the revealed nonce; do not approve this session"
+                        .into(),
+                );
+            }
+            candidate.sas = Some(sas_code(
+                &approver_nonce,
+                &nonce,
+                &kp.public_key_bytes(),
+                approver_pub_bytes,
+            ));
+        }
     }
     let candidates = ctx.pairing.lock().await;
     let candidate = resp
@@ -1651,13 +1813,27 @@ pub async fn get_my_approval_status(
         verifier.has_peer(&own_id)
     };
     let approval_code = candidate.map(|(_, c)| c.fingerprint.clone());
+    let sas = candidate.and_then(|(_, c)| c.sas.clone());
     let session_id = candidate.map(|(id, _)| id.clone());
     Ok(MyApprovalStatusInfo {
         status: resp.status.to_string(),
         approval_code,
+        sas,
         session_id,
         locally_verified,
     })
+}
+
+/// Accepts either the 8-digit short code or the full 64-character pairing code.
+fn code_matches(candidate: &PairingCandidate, entered: &str) -> bool {
+    let normalized = normalize_fingerprint(entered);
+    if normalized.len() == 8 && normalized.chars().all(|c| c.is_ascii_digit()) {
+        return candidate
+            .sas
+            .as_ref()
+            .is_some_and(|sas| normalize_fingerprint(sas) == normalized);
+    }
+    normalized == candidate.fingerprint
 }
 
 fn normalize_fingerprint(value: &str) -> String {
@@ -1680,10 +1856,13 @@ pub async fn confirm_pairing(
         .get(&session_id)
         .ok_or("Pairing session is missing; start again")?;
     if !candidate.incoming
-        || candidate.fingerprint != normalize_fingerprint(&fingerprint)
+        || !code_matches(candidate, &fingerprint)
         || candidate.started.elapsed() > MFA_TICKET_TTL
     {
-        return Err("Pairing fingerprint or session expired; start again".into());
+        return Err("Pairing code or session expired; start again".into());
+    }
+    if candidate.sas.is_none() {
+        return Err("Wait until both devices show the same 8-digit code".into());
     }
     let key = KeyPair::parse_public_key(&candidate.peer.public_key).map_err(|e| e.to_string())?;
     let mut verifier =
@@ -1701,8 +1880,7 @@ pub struct OwnIdentity {
 
 #[tauri::command]
 pub async fn get_own_identity(ctx: State<'_, AppContext>) -> Result<OwnIdentity, String> {
-    let pair = KeyPair::load_or_generate(&AppConfig::key_path(&ctx.config_dir))
-        .map_err(|e| e.to_string())?;
+    let pair = device_keys(&ctx)?.identity;
     Ok(OwnIdentity {
         device_id: ctx.config.read().await.device_id.clone(),
         fingerprint: KeyPair::fingerprint(&pair.public),
@@ -1855,6 +2033,126 @@ pub async fn clear_history(ctx: State<'_, AppContext>) -> Result<(), String> {
     Ok(())
 }
 
+/// Verifies a relay-delivered entry before it is trusted: the sender must be a
+/// pinned member whose signature covers the entry's context and both ciphertexts,
+/// and live entries must carry a strictly increasing sender clock. Legacy
+/// (pre-v3, unsigned) entries are readable for history only, never auto-pasted.
+async fn authenticate_entry(
+    ctx: &AppContext,
+    entry: &ClipboardEntry,
+    live: bool,
+) -> Result<PlainEntry, String> {
+    let metadata_bytes = if entry.metadata.is_empty() {
+        Vec::new()
+    } else {
+        base64::engine::general_purpose::STANDARD
+            .decode(&entry.metadata)
+            .map_err(|e| format!("invalid metadata encoding: {e}"))?
+    };
+    let plain = |data: Vec<u8>, metadata: Metadata, authenticated: bool| PlainEntry {
+        id: entry.id.clone(),
+        device_id: entry.device_id.clone(),
+        device_name: entry.device_name.clone(),
+        content_type: entry.content_type.clone(),
+        data,
+        metadata,
+        created_at: entry.created_at,
+        authenticated,
+    };
+
+    let (Some(request_id), Some(sent_at), Some(signature)) =
+        (&entry.request_id, entry.sent_at, &entry.sender_signature)
+    else {
+        if live {
+            return Err("entry is not signed; update the sending device".into());
+        }
+        let exchange_guard = ctx.exchange.lock().await;
+        let exchange = exchange_guard
+            .as_ref()
+            .ok_or("Encryption not initialized")?;
+        let data = exchange
+            .decrypt_payload_legacy(&entry.encrypted_data, entry.key_version)
+            .map_err(|e| format!("decrypt failed: {e}"))?;
+        let mut metadata = Metadata::default();
+        if !metadata_bytes.is_empty()
+            && let Ok(bytes) = exchange.decrypt_payload_legacy(&metadata_bytes, entry.key_version)
+            && let Ok(m) = serde_json::from_slice(&bytes)
+        {
+            metadata = m;
+        }
+        return Ok(plain(data, metadata, false));
+    };
+
+    // The sender must be a member we pinned ourselves, not merely one the relay lists.
+    let mut verifier = KeyVerifier::new(&ctx.config_dir).map_err(|e| e.to_string())?;
+    let sender_key = match verifier.public_key_of(&entry.device_id) {
+        Some(key) => key,
+        None => {
+            // A hash-only pin from before v3: the relay's listing is accepted only
+            // when it matches that pin.
+            let devices = {
+                let api = ctx.api.lock().await;
+                api.get_device_keys().await.map_err(|e| e.to_string())?
+            };
+            let listed = devices
+                .devices
+                .iter()
+                .find(|d| d.id == entry.device_id)
+                .and_then(|d| d.public_key.as_deref())
+                .ok_or("sender is not a known device")?;
+            let key = KeyPair::parse_public_key(listed).map_err(|e| e.to_string())?;
+            verifier
+                .record_public_key(&entry.device_id, &key)
+                .map_err(|e| format!("sender is not a verified member: {e}"))?;
+            key
+        }
+    };
+    verifier
+        .verify_sender_at(&entry.device_id, &sender_key, entry.key_version)
+        .map_err(|e| format!("sender is not a verified member: {e}"))?;
+
+    let context = EntryContext {
+        key_version: entry.key_version,
+        content_type: &entry.content_type,
+        sender_id: &entry.device_id,
+        request_id,
+        sent_at,
+    };
+    crate::crypto::entry::verify_entry_signature(
+        &sender_key,
+        &context,
+        &entry.encrypted_data,
+        &metadata_bytes,
+        signature,
+    )
+    .map_err(|_| "sender signature is invalid")?;
+
+    if live {
+        ReplayGuard::new(&ctx.config_dir)
+            .map_err(|e| e.to_string())?
+            .accept(&entry.device_id, sent_at)
+            .map_err(|e| e.to_string())?;
+    }
+
+    let exchange_guard = ctx.exchange.lock().await;
+    let exchange = exchange_guard
+        .as_ref()
+        .ok_or("Encryption not initialized")?;
+    let (data, metadata_json) = crate::crypto::entry::open_entry(
+        exchange,
+        &context,
+        &entry.encrypted_data,
+        &metadata_bytes,
+    )
+    .map_err(|e| format!("decrypt failed: {e}"))?;
+    let metadata = if metadata_json.is_empty() {
+        Metadata::default()
+    } else {
+        serde_json::from_slice(&metadata_json).unwrap_or_default()
+    };
+    Ok(plain(data, metadata, true))
+}
+
 /// Fetches clipboard history from the server, decrypts, and stores locally.
 #[tauri::command]
 pub async fn sync_history(ctx: State<'_, AppContext>) -> Result<usize, String> {
@@ -1881,49 +2179,14 @@ pub async fn sync_history(ctx: State<'_, AppContext>) -> Result<usize, String> {
                 .map_err(|e| format!("Failed to fetch history: {e}"))?
         };
 
-        // Decrypt entries — hold exchange lock only for decryption
-        let plain_entries = {
-            let exchange_guard = ctx.exchange.lock().await;
-            let exchange = exchange_guard
-                .as_ref()
-                .ok_or("Encryption not initialized")?;
-
-            let mut entries = Vec::new();
-            for entry in &resp.entries {
-                let kv = entry.key_version;
-                let data = match exchange.decrypt_payload(&entry.encrypted_data, kv) {
-                    Ok(d) => d,
-                    Err(_) => match exchange.decrypt_payload_legacy(&entry.encrypted_data) {
-                        Ok(d) => d,
-                        Err(e) => {
-                            debug!("Skipping entry {} (decrypt failed: {e})", entry.id);
-                            continue;
-                        }
-                    },
-                };
-
-                let mut meta = Metadata::default();
-                if !entry.metadata.is_empty()
-                    && let Ok(meta_encrypted) =
-                        base64::engine::general_purpose::STANDARD.decode(&entry.metadata)
-                    && let Ok(meta_bytes) = exchange.decrypt_payload(&meta_encrypted, kv)
-                    && let Ok(m) = serde_json::from_slice(&meta_bytes)
-                {
-                    meta = m;
-                }
-
-                entries.push(PlainEntry {
-                    id: entry.id.clone(),
-                    device_id: entry.device_id.clone(),
-                    device_name: entry.device_name.clone(),
-                    content_type: entry.content_type.clone(),
-                    data,
-                    metadata: meta,
-                    created_at: entry.created_at,
-                });
+        // Authenticate and decrypt entries; unverifiable ones are skipped
+        let mut plain_entries = Vec::new();
+        for entry in &resp.entries {
+            match authenticate_entry(&ctx, entry, false).await {
+                Ok(plain) => plain_entries.push(plain),
+                Err(e) => debug!("Skipping entry {} ({e})", entry.id),
             }
-            entries
-        };
+        }
 
         // Store entries — hold history lock only for insertion
         {
@@ -2417,6 +2680,7 @@ mod tests {
             data: "€".repeat(27).into_bytes(),
             metadata: Metadata::default(),
             created_at: chrono::Utc::now(),
+            authenticated: true,
         };
         assert_eq!(notification_body(&entry), "€".repeat(27));
         entry.data = "€".repeat(81).into_bytes();
@@ -2493,6 +2757,7 @@ mod tests {
             data: data.to_vec(),
             metadata,
             created_at: chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            authenticated: true,
         }
     }
 

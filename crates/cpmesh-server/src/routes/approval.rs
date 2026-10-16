@@ -34,6 +34,8 @@ pub async fn handle_list_pending(
             name: d.name.clone(),
             public_key: d.public_key.clone(),
             public_key_sig: d.public_key_sig.clone(),
+            encryption_key: d.encryption_key.clone(),
+            encryption_key_sig: d.encryption_key_sig.clone(),
             created_at: d.created_at,
         })
         .collect();
@@ -84,14 +86,129 @@ pub async fn handle_my_approval_status(
     json_response(
         StatusCode::OK,
         proto::ApprovalStatusResponse {
-            pairing_version: 2,
+            pairing_version: proto::PAIRING_VERSION,
             status: device.status.parse().unwrap(),
             approver_device_id,
             approver_public_key,
             approver_public_key_sig,
             session_id,
+            approver_commit: session.as_ref().and_then(|s| s.approver_commit.clone()),
+            pending_nonce: session.as_ref().and_then(|s| s.pending_nonce.clone()),
+            approver_nonce: session.as_ref().and_then(|s| s.approver_nonce.clone()),
         },
     )
+}
+
+/// POST /api/device-approvals/me/nonce — pending device contributes its SAS nonce
+/// after seeing the approver's commitment.
+pub async fn handle_pending_nonce(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<AuthClaims>,
+    axum::Json(req): axum::Json<proto::SasNonceRequest>,
+) -> Response {
+    let Some(device_id) = claims.device_id else {
+        return json_error("device context required", StatusCode::BAD_REQUEST);
+    };
+    let Ok(session_id) = uuid::Uuid::parse_str(&req.session_id) else {
+        return json_error("invalid session_id", StatusCode::BAD_REQUEST);
+    };
+    if req.nonce.len() != 32 {
+        return json_error("nonce must be 32 bytes", StatusCode::BAD_REQUEST);
+    }
+    match state
+        .db
+        .set_pending_nonce(session_id, device_id, &req.nonce)
+        .await
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => json_error(
+            "no active approval session accepts this nonce",
+            StatusCode::CONFLICT,
+        ),
+        Err(e) => super::middleware::ApiError::internal(e).into_response(),
+    }
+}
+
+/// GET /api/device-approvals/{pending_device_id}/session — approver polls for the
+/// pending device's nonce.
+pub async fn handle_approval_session(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<AuthClaims>,
+    Path(pending_device_id): Path<uuid::Uuid>,
+) -> Response {
+    let Some(approver_device_id) = claims.device_id else {
+        return json_error("device context required", StatusCode::BAD_REQUEST);
+    };
+    let session = match state.db.get_approval_session(pending_device_id).await {
+        Ok(Some(s)) if s.approver_device_id == approver_device_id => s,
+        Ok(_) => {
+            return json_error(
+                "no active approval session for this device",
+                StatusCode::NOT_FOUND,
+            );
+        }
+        Err(e) => return super::middleware::ApiError::internal(e).into_response(),
+    };
+    json_response(
+        StatusCode::OK,
+        proto::ApprovalSessionState {
+            session_id: session.id.to_string(),
+            pending_nonce: session.pending_nonce,
+            approver_nonce: session.approver_nonce,
+            expires_at: session.expires_at,
+        },
+    )
+}
+
+/// POST /api/device-approvals/{pending_device_id}/reveal — approver opens its
+/// commitment once the pending nonce exists. The server checks the opening too,
+/// although clients never rely on the relay for that.
+pub async fn handle_reveal_nonce(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<AuthClaims>,
+    Path(pending_device_id): Path<uuid::Uuid>,
+    axum::Json(req): axum::Json<proto::SasNonceRequest>,
+) -> Response {
+    let Some(approver_device_id) = claims.device_id else {
+        return json_error("device context required", StatusCode::BAD_REQUEST);
+    };
+    let Ok(session_id) = uuid::Uuid::parse_str(&req.session_id) else {
+        return json_error("invalid session_id", StatusCode::BAD_REQUEST);
+    };
+    let Ok(nonce) = <[u8; 32]>::try_from(req.nonce.as_slice()) else {
+        return json_error("nonce must be 32 bytes", StatusCode::BAD_REQUEST);
+    };
+    let session = match state.db.get_approval_session(pending_device_id).await {
+        Ok(Some(s)) if s.approver_device_id == approver_device_id && s.id == session_id => s,
+        Ok(_) => {
+            return json_error(
+                "no active approval session for this device",
+                StatusCode::NOT_FOUND,
+            );
+        }
+        Err(e) => return super::middleware::ApiError::internal(e).into_response(),
+    };
+    if session.approver_commit.as_deref() != Some(proto::sas_commitment(&nonce).as_slice()) {
+        return json_error(
+            "nonce does not open the commitment",
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    if session.pending_nonce.is_none() {
+        return json_error(
+            "the pending device has not contributed its nonce yet",
+            StatusCode::CONFLICT,
+        );
+    }
+    match state
+        .db
+        .set_approver_nonce(session_id, approver_device_id, &nonce)
+        .await
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => json_error("approval session changed", StatusCode::CONFLICT),
+        Err(e) => super::middleware::ApiError::internal(e).into_response(),
+    }
 }
 
 /// POST /api/device-approvals/{pending_device_id}/begin — start approval session.
@@ -100,17 +217,23 @@ pub async fn handle_begin_approval(
     Extension(claims): Extension<AuthClaims>,
     Path(pending_device_id): Path<uuid::Uuid>,
     headers: axum::http::HeaderMap,
+    body: Option<axum::Json<proto::BeginApprovalRequest>>,
 ) -> Response {
     if headers
         .get("x-cpmesh-pairing")
         .and_then(|v| v.to_str().ok())
-        != Some("2")
+        .and_then(|v| v.parse::<u32>().ok())
+        != Some(proto::PAIRING_VERSION)
     {
         return json_error(
-            "update your client: full-fingerprint pairing is required",
+            "update your client: committed short-code pairing is required",
             StatusCode::UPGRADE_REQUIRED,
         );
     }
+    let commit = match body {
+        Some(axum::Json(req)) if req.commit.len() == 32 => req.commit,
+        _ => return json_error("a 32-byte commit is required", StatusCode::BAD_REQUEST),
+    };
     let approver_device_id = match claims.device_id {
         Some(d) => d,
         None => return json_error("device context required", StatusCode::BAD_REQUEST),
@@ -139,7 +262,7 @@ pub async fn handle_begin_approval(
     // Create approval session (10 minute TTL)
     let session = match state
         .db
-        .create_approval_session(pending_device_id, approver_device_id, 600)
+        .create_approval_session(pending_device_id, approver_device_id, 600, &commit)
         .await
     {
         Ok(s) => s,
@@ -154,11 +277,13 @@ pub async fn handle_begin_approval(
     json_response(
         StatusCode::OK,
         proto::ApprovalSessionResponse {
-            pairing_version: 2,
+            pairing_version: proto::PAIRING_VERSION,
             session_id: session.id.to_string(),
             pending_device_id: pending_device_id.to_string(),
             pending_public_key: pending_device.public_key,
             pending_public_key_sig: pending_device.public_key_sig,
+            pending_encryption_key: pending_device.encryption_key,
+            pending_encryption_key_sig: pending_device.encryption_key_sig,
             expires_at: session.expires_at,
         },
     )

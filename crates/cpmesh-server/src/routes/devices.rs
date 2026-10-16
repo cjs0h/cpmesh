@@ -16,6 +16,42 @@ use cpmesh_proto::models as proto;
 
 const MAX_DEVICES_PER_USER: usize = 10;
 
+/// ECDSA-P256-SHA256 (DER) by a device identity key.
+pub(crate) fn verify_device_signature(public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
+    aws_lc_rs::signature::UnparsedPublicKey::new(
+        &aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1,
+        public_key,
+    )
+    .verify(message, signature)
+    .is_ok()
+}
+
+/// Checks an identity-certified encryption key: both fields present, a 65-byte
+/// SEC1 point distinct from the identity key, and a valid certification.
+pub(crate) fn validated_encryption_key<'a>(
+    identity_key: &[u8],
+    encryption_key: Option<&'a [u8]>,
+    encryption_key_sig: Option<&'a [u8]>,
+) -> Result<Option<(&'a [u8], &'a [u8])>, &'static str> {
+    match (encryption_key, encryption_key_sig) {
+        (None, None) => Ok(None),
+        (Some(key), Some(sig)) => {
+            if key.len() != 65 || key[0] != 0x04 || key == identity_key {
+                return Err("encryption_key must be a distinct uncompressed P-256 point");
+            }
+            if !verify_device_signature(
+                identity_key,
+                &proto::encryption_key_transcript(identity_key, key),
+                sig,
+            ) {
+                return Err("encryption_key_sig is not a valid certification by public_key");
+            }
+            Ok(Some((key, sig)))
+        }
+        _ => Err("encryption_key and encryption_key_sig must be sent together"),
+    }
+}
+
 pub async fn handle_device_challenge(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<AuthClaims>,
@@ -45,6 +81,14 @@ pub async fn handle_register_device(
             StatusCode::BAD_REQUEST,
         );
     }
+    let encryption = match validated_encryption_key(
+        &req.public_key,
+        req.encryption_key.as_deref(),
+        req.encryption_key_sig.as_deref(),
+    ) {
+        Ok(encryption) => encryption,
+        Err(message) => return json_error(message, StatusCode::BAD_REQUEST),
+    };
 
     let Some(proof) = &req.proof else {
         return json_error(
@@ -107,6 +151,17 @@ pub async fn handle_register_device(
         }
         if device.status == "revoked" || device.status == "rejected" {
             return json_error("device is revoked or rejected", StatusCode::FORBIDDEN);
+        }
+        // An updated client re-registering with the same identity publishes its
+        // encryption key here (the certification was verified above).
+        if let Some((key, sig)) = encryption
+            && device.encryption_key.as_deref() != Some(key)
+            && let Err(e) = state
+                .db
+                .set_device_encryption_key(device.id, claims.user_id, key, sig)
+                .await
+        {
+            return super::middleware::ApiError::internal(e).into_response();
         }
         let (access_token, refresh_token) = match state
             .auth
@@ -320,6 +375,8 @@ pub async fn handle_get_device_keys(
             name: d.name.clone(),
             public_key: Some(d.public_key.clone()),
             public_key_sig: d.public_key_sig.clone(),
+            encryption_key: d.encryption_key.clone(),
+            encryption_key_sig: d.encryption_key_sig.clone(),
             last_seen: None,
             online: false,
             status: d.status.parse().unwrap(),
@@ -327,6 +384,44 @@ pub async fn handle_get_device_keys(
         .collect();
 
     json_response(StatusCode::OK, proto::DeviceKeysResponse { devices: infos })
+}
+
+/// PUT /api/devices/me/encryption-key — publish or replace this device's
+/// identity-certified encryption key. Open to pending devices so an approver can
+/// wrap the group key for them.
+pub async fn handle_publish_encryption_key(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<AuthClaims>,
+    axum::Json(req): axum::Json<proto::PublishEncryptionKeyRequest>,
+) -> Response {
+    let Some(device_id) = claims.device_id else {
+        return json_error("device context required", StatusCode::BAD_REQUEST);
+    };
+    let device = match state.db.get_device_by_id(device_id).await {
+        Ok(d) if d.user_id == claims.user_id => d,
+        Ok(_) | Err(sqlx::Error::RowNotFound) => {
+            return json_error("device not found", StatusCode::NOT_FOUND);
+        }
+        Err(e) => return super::middleware::ApiError::internal(e).into_response(),
+    };
+    let (key, sig) = match validated_encryption_key(
+        &device.public_key,
+        Some(&req.encryption_key),
+        Some(&req.encryption_key_sig),
+    ) {
+        Ok(Some(pair)) => pair,
+        Ok(None) => unreachable!("both fields are required by the request type"),
+        Err(message) => return json_error(message, StatusCode::BAD_REQUEST),
+    };
+    match state
+        .db
+        .set_device_encryption_key(device_id, claims.user_id, key, sig)
+        .await
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => json_error("device not found", StatusCode::NOT_FOUND),
+        Err(e) => super::middleware::ApiError::internal(e).into_response(),
+    }
 }
 
 // === Legacy group key endpoints (kept for backward compatibility during migration) ===
@@ -473,7 +568,7 @@ pub(crate) fn validate_memberships(
     for key in keys {
         if !recipients.insert(&key.device_id)
             || !expected.contains_key(&key.device_id)
-            || key.encrypted_key.len() != 60
+            || key.encrypted_key.len() != proto::WRAP_V3_LEN
             || membership.wrapped_key_hashes.get(&key.device_id)
                 != Some(&proto::wrapped_key_hash(&key.encrypted_key))
         {
@@ -487,12 +582,9 @@ pub(crate) fn validate_memberships(
         &membership.wrapped_key_hashes,
     )
     .map_err(|_| bad())?;
-    aws_lc_rs::signature::UnparsedPublicKey::new(
-        &aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1,
-        &sender.public_key,
-    )
-    .verify(&transcript, &membership.signature)
-    .map_err(|_| bad())?;
+    if !verify_device_signature(&sender.public_key, &transcript, &membership.signature) {
+        return Err(bad());
+    }
     Ok(())
 }
 

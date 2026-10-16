@@ -375,7 +375,7 @@ impl ApiClient {
     pub async fn register_device(
         &mut self,
         name: &str,
-        key_pair: &crate::crypto::keys::KeyPair,
+        keys: &crate::crypto::keys::DeviceKeys,
         fingerprint: Option<String>,
     ) -> Result<RegisterDeviceResponse, ApiError> {
         let response = self
@@ -385,6 +385,7 @@ impl ApiClient {
             return Err(read_error(response).await);
         }
         let challenge: DeviceChallengeResponse = response.json().await?;
+        let key_pair = &keys.identity;
         let proof = DeviceSessionProof {
             signature: key_pair.sign_message(&device_proof_transcript(&challenge.challenge)),
             challenge: challenge.challenge,
@@ -396,6 +397,8 @@ impl ApiClient {
                 name: name.to_string(),
                 public_key: key_pair.public_key_bytes(),
                 public_key_sig: Some(key_pair.sign_public_key()),
+                encryption_key: Some(keys.encryption.public_key_bytes()),
+                encryption_key_sig: Some(keys.certify_encryption_key()),
                 fingerprint,
                 proof: Some(proof),
             })
@@ -445,6 +448,27 @@ impl ApiClient {
         self.authed_get_json("/api/devices/keys").await
     }
 
+    /// Publishes (or replaces) this device's certified encryption key.
+    pub async fn publish_encryption_key(
+        &self,
+        keys: &crate::crypto::keys::DeviceKeys,
+    ) -> Result<(), ApiError> {
+        let resp = self
+            .send_authed(
+                self.request(Method::PUT, "/api/devices/me/encryption-key")
+                    .json(&PublishEncryptionKeyRequest {
+                        encryption_key: keys.encryption.public_key_bytes(),
+                        encryption_key_sig: keys.certify_encryption_key(),
+                    }),
+            )
+            .await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(read_error(resp).await)
+        }
+    }
+
     // === Device Approval ===
 
     pub async fn get_my_approval_status(&self) -> Result<ApprovalStatusResponse, ApiError> {
@@ -458,6 +482,7 @@ impl ApiClient {
     pub async fn begin_approval(
         &self,
         pending_device_id: &str,
+        commit: &[u8; 32],
     ) -> Result<ApprovalSessionResponse, ApiError> {
         let resp = self
             .send_authed(
@@ -465,11 +490,73 @@ impl ApiClient {
                     Method::POST,
                     &format!("/api/device-approvals/{pending_device_id}/begin"),
                 )
-                .header("X-Cpmesh-Pairing", "2"),
+                .header("X-Cpmesh-Pairing", PAIRING_VERSION.to_string())
+                .json(&BeginApprovalRequest {
+                    commit: commit.to_vec(),
+                }),
             )
             .await?;
         if resp.status() == StatusCode::OK {
             Ok(resp.json().await?)
+        } else {
+            Err(read_error(resp).await)
+        }
+    }
+
+    /// Approver: polls for the pending device's SAS nonce.
+    pub async fn approval_session(
+        &self,
+        pending_device_id: &str,
+    ) -> Result<ApprovalSessionState, ApiError> {
+        self.authed_get_json(&format!(
+            "/api/device-approvals/{pending_device_id}/session"
+        ))
+        .await
+    }
+
+    /// Approver: opens its commitment once the pending nonce has arrived.
+    pub async fn reveal_approval_nonce(
+        &self,
+        pending_device_id: &str,
+        session_id: &str,
+        nonce: &[u8; 32],
+    ) -> Result<(), ApiError> {
+        let resp = self
+            .send_authed(
+                self.request(
+                    Method::POST,
+                    &format!("/api/device-approvals/{pending_device_id}/reveal"),
+                )
+                .json(&SasNonceRequest {
+                    session_id: session_id.to_string(),
+                    nonce: nonce.to_vec(),
+                }),
+            )
+            .await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(read_error(resp).await)
+        }
+    }
+
+    /// Pending device: contributes its SAS nonce after seeing the commitment.
+    pub async fn submit_pending_nonce(
+        &self,
+        session_id: &str,
+        nonce: &[u8; 32],
+    ) -> Result<(), ApiError> {
+        let resp = self
+            .send_authed(
+                self.request(Method::POST, "/api/device-approvals/me/nonce")
+                    .json(&SasNonceRequest {
+                        session_id: session_id.to_string(),
+                        nonce: nonce.to_vec(),
+                    }),
+            )
+            .await?;
+        if resp.status().is_success() {
+            Ok(())
         } else {
             Err(read_error(resp).await)
         }

@@ -145,6 +145,8 @@ fn clipboard_push_payload_wire_format() {
         encrypted_data: vec![0xde, 0xad, 0xbe, 0xef],
         metadata: Some("bWV0YQ==".into()),
         key_version: 3,
+        sent_at: None,
+        sender_signature: None,
     };
     let json = serde_json::to_value(&payload).unwrap();
     assert_eq!(
@@ -167,6 +169,8 @@ fn clipboard_push_payload_wire_format() {
         encrypted_data: vec![],
         metadata: None,
         key_version: 1,
+        sent_at: None,
+        sender_signature: None,
     })
     .unwrap();
     assert!(json.get("metadata").is_none());
@@ -199,6 +203,9 @@ fn clipboard_entry_roundtrip_and_defaults() {
         metadata: "m".into(),
         created_at: created,
         key_version: 2,
+        request_id: None,
+        sent_at: None,
+        sender_signature: None,
     };
     let json = serde_json::to_string(&entry).unwrap();
     let back: ClipboardEntry = serde_json::from_str(&json).unwrap();
@@ -246,6 +253,7 @@ fn plain_entry_encodes_data_as_base64() {
         data: b"hello".to_vec(),
         metadata: Metadata::default(),
         created_at: Utc.timestamp_opt(0, 0).unwrap(),
+        authenticated: true,
     };
     let json = serde_json::to_value(&entry).unwrap();
     assert_eq!(json["data"], "aGVsbG8=");
@@ -297,6 +305,8 @@ fn register_device_request_binary_fields() {
         name: "Laptop".into(),
         public_key: vec![4, 1, 2],
         public_key_sig: Some(vec![0x30, 0x44]),
+        encryption_key: None,
+        encryption_key_sig: None,
         fingerprint: Some("fp".into()),
     };
     let json = serde_json::to_value(&req).unwrap();
@@ -417,6 +427,8 @@ fn approval_types_roundtrip() {
         pending_device_id: "p".into(),
         pending_public_key: vec![4],
         pending_public_key_sig: Some(vec![0x30]),
+        pending_encryption_key: None,
+        pending_encryption_key_sig: None,
         expires_at: expires,
     };
     let json = serde_json::to_value(&session).unwrap();
@@ -494,4 +506,158 @@ fn base64_serde_helpers_roundtrip_edge_cases() {
     let back: Wrapper = serde_json::from_str(r#"{"data":"AA=="}"#).unwrap();
     assert_eq!(back.data, vec![0]);
     assert!(back.opt.is_none());
+}
+
+#[test]
+fn protocol_v3_constants() {
+    assert_eq!(PROTOCOL_VERSION, "3");
+    assert_eq!(PAIRING_VERSION, 3);
+    assert_eq!(WRAP_V3_LEN, 125);
+    assert_eq!(WRAP_LEGACY_LEN, 60);
+}
+
+#[test]
+fn encryption_key_transcript_binds_both_keys() {
+    let transcript = encryption_key_transcript(&[4; 65], &[5; 65]);
+    let text = String::from_utf8(transcript).unwrap();
+    assert!(text.starts_with("cpmesh-encryption-key-v1\n"));
+    assert_eq!(text.lines().count(), 3);
+    assert_ne!(
+        encryption_key_transcript(&[4; 65], &[5; 65]),
+        encryption_key_transcript(&[5; 65], &[4; 65])
+    );
+}
+
+#[test]
+fn wrap_aad_separates_version_and_parties() {
+    let a = "00000000-0000-4000-8000-000000000001";
+    let b = "00000000-0000-4000-8000-000000000002";
+    assert_eq!(
+        String::from_utf8(wrap_aad(7, a, b)).unwrap(),
+        format!("cpmesh-wrap-v3\n7\n{a}\n{b}\n")
+    );
+    assert_ne!(wrap_aad(7, a, b), wrap_aad(7, b, a));
+    assert_ne!(wrap_aad(7, a, b), wrap_aad(8, a, b));
+}
+
+#[test]
+fn clipboard_aads_and_signature_transcript_are_context_bound() {
+    let sender = "00000000-0000-4000-8000-000000000001";
+    let request = "00000000-0000-4000-8000-000000000009";
+    let data = clipboard_data_aad(2, &ContentType::Text, sender, request, 1_700_000_000_123);
+    let metadata =
+        clipboard_metadata_aad(2, &ContentType::Text, sender, request, 1_700_000_000_123);
+    assert_eq!(
+        String::from_utf8(data.clone()).unwrap(),
+        format!("cpmesh-clipboard-v3\n2\ntext\n{sender}\n{request}\n1700000000123\ndata\n")
+    );
+    assert!(
+        String::from_utf8(metadata.clone())
+            .unwrap()
+            .ends_with("metadata\n")
+    );
+    assert_ne!(data, metadata);
+    // Relabelling the content type or key version changes the AAD.
+    assert_ne!(
+        data,
+        clipboard_data_aad(2, &ContentType::File, sender, request, 1_700_000_000_123)
+    );
+    assert_ne!(
+        data,
+        clipboard_data_aad(3, &ContentType::Text, sender, request, 1_700_000_000_123)
+    );
+
+    let transcript = clipboard_signature_transcript(
+        2,
+        &ContentType::Text,
+        sender,
+        request,
+        1_700_000_000_123,
+        b"ciphertext",
+        b"",
+    );
+    let text = String::from_utf8(transcript.clone()).unwrap();
+    let lines: Vec<_> = text.lines().collect();
+    assert_eq!(lines.len(), 8);
+    assert_eq!(lines[6].len(), 64);
+    // SHA-256 of empty metadata.
+    assert_eq!(
+        lines[7],
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    assert_ne!(
+        transcript,
+        clipboard_signature_transcript(
+            2,
+            &ContentType::Text,
+            sender,
+            request,
+            1_700_000_000_123,
+            b"ciphertext",
+            b"meta"
+        )
+    );
+}
+
+#[test]
+fn sas_code_is_symmetric_eight_digits_and_key_bound() {
+    let approver = [1u8; 32];
+    let pending = [2u8; 32];
+    let a = vec![4u8; 65];
+    let b = vec![5u8; 65];
+    let code = sas_code(&approver, &pending, &a, &b);
+    assert_eq!(code, sas_code(&approver, &pending, &b, &a));
+    assert_eq!(code.len(), 9);
+    assert!(code.chars().enumerate().all(|(i, c)| if i == 4 {
+        c == ' '
+    } else {
+        c.is_ascii_digit()
+    }));
+    assert_ne!(code, sas_code(&approver, &pending, &a, &[6u8; 65]));
+    assert_ne!(code, sas_code(&pending, &approver, &a, &b));
+    assert_ne!(sas_commitment(&approver), sas_commitment(&pending));
+
+    let full = pairing_fingerprint(&a, &b);
+    assert_eq!(full, pairing_fingerprint(&b, &a));
+    assert_eq!(full.len(), 64);
+    assert!(
+        full.chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase())
+    );
+    assert_ne!(full, pairing_fingerprint(&a, &[6u8; 65]));
+}
+
+#[test]
+fn v3_fields_are_optional_on_the_wire() {
+    let legacy: ClipboardEntry = serde_json::from_value(json!({
+        "id": "e", "user_id": "u", "device_id": "d", "content_type": "text",
+        "encrypted_data": "AQID", "created_at": "2026-01-01T00:00:00Z"
+    }))
+    .unwrap();
+    assert!(
+        legacy.request_id.is_none()
+            && legacy.sent_at.is_none()
+            && legacy.sender_signature.is_none()
+    );
+    let push: ClipboardPushPayload = serde_json::from_value(json!({
+        "request_id": "r", "content_type": "text", "encrypted_data": "AQID", "key_version": 2,
+        "sent_at": 1700000000123i64, "sender_signature": "AQID"
+    }))
+    .unwrap();
+    assert_eq!(push.sent_at, Some(1_700_000_000_123));
+    assert_eq!(push.sender_signature, Some(vec![1, 2, 3]));
+    let status: ApprovalStatusResponse = serde_json::from_value(json!({
+        "pairing_version": 3, "status": "pending", "approver_commit": "AQID"
+    }))
+    .unwrap();
+    assert_eq!(status.approver_commit, Some(vec![1, 2, 3]));
+    assert!(status.pending_nonce.is_none());
+    let begin: BeginApprovalRequest = serde_json::from_value(json!({"commit": "AQID"})).unwrap();
+    assert_eq!(begin.commit, vec![1, 2, 3]);
+    let plain: PlainEntry = serde_json::from_value(json!({
+        "id": "p", "device_id": "d", "device_name": "n", "content_type": "text",
+        "data": "aGVsbG8=", "metadata": {}, "created_at": "2026-01-01T00:00:00Z"
+    }))
+    .unwrap();
+    assert!(plain.authenticated);
 }

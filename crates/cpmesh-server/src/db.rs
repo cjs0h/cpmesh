@@ -492,7 +492,8 @@ impl Db {
                  SELECT id, ROW_NUMBER() OVER (ORDER BY created_at DESC, id DESC) AS n,
                      SUM(size) OVER (ORDER BY created_at DESC, id DESC) AS bytes FROM page
              )
-             SELECT e.id, e.user_id, e.device_id, d.name as device_name, e.content_type, e.encrypted_data, e.metadata, e.created_at, e.key_version
+             SELECT e.id, e.user_id, e.device_id, d.name as device_name, e.content_type, e.encrypted_data, e.metadata, e.created_at, e.key_version,
+                    e.request_id, e.sent_at, e.sender_signature
              FROM clipboard_entries e
              JOIN devices d ON d.id = e.device_id
              JOIN bounded b ON b.id = e.id
@@ -661,6 +662,7 @@ impl Db {
         pending_device_id: uuid::Uuid,
         approver_device_id: uuid::Uuid,
         ttl_secs: i64,
+        approver_commit: &[u8],
     ) -> Result<DeviceApprovalSession, sqlx::Error> {
         // Delete any existing session for this pending device first
         sqlx::query("DELETE FROM device_approval_sessions WHERE pending_device_id = $1")
@@ -669,15 +671,76 @@ impl Db {
             .await?;
 
         sqlx::query_as::<_, DeviceApprovalSession>(
-            "INSERT INTO device_approval_sessions (pending_device_id, approver_device_id, status, expires_at)
-             VALUES ($1, $2, 'pending', NOW() + make_interval(secs => $3))
+            "INSERT INTO device_approval_sessions (pending_device_id, approver_device_id, status, expires_at, approver_commit)
+             VALUES ($1, $2, 'pending', NOW() + make_interval(secs => $3), $4)
              RETURNING *"
         )
         .bind(pending_device_id)
         .bind(approver_device_id)
         .bind(ttl_secs as f64)
+        .bind(approver_commit)
         .fetch_one(&self.pool)
         .await
+    }
+
+    /// Pending device contributes its SAS nonce once; a different value later is a conflict.
+    pub async fn set_pending_nonce(
+        &self,
+        session_id: uuid::Uuid,
+        pending_device_id: uuid::Uuid,
+        nonce: &[u8],
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE device_approval_sessions SET pending_nonce = $3
+             WHERE id = $1 AND pending_device_id = $2 AND status = 'pending' AND expires_at > NOW()
+               AND (pending_nonce IS NULL OR pending_nonce = $3)",
+        )
+        .bind(session_id)
+        .bind(pending_device_id)
+        .bind(nonce)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Approver opens its commitment; only after the pending nonce exists.
+    pub async fn set_approver_nonce(
+        &self,
+        session_id: uuid::Uuid,
+        approver_device_id: uuid::Uuid,
+        nonce: &[u8],
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE device_approval_sessions SET approver_nonce = $3
+             WHERE id = $1 AND approver_device_id = $2 AND status = 'pending' AND expires_at > NOW()
+               AND pending_nonce IS NOT NULL AND (approver_nonce IS NULL OR approver_nonce = $3)",
+        )
+        .bind(session_id)
+        .bind(approver_device_id)
+        .bind(nonce)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Stores a device's identity-certified encryption key (verified by the caller).
+    pub async fn set_device_encryption_key(
+        &self,
+        device_id: uuid::Uuid,
+        user_id: uuid::Uuid,
+        encryption_key: &[u8],
+        encryption_key_sig: &[u8],
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE devices SET encryption_key = $3, encryption_key_sig = $4 WHERE id = $1 AND user_id = $2",
+        )
+        .bind(device_id)
+        .bind(user_id)
+        .bind(encryption_key)
+        .bind(encryption_key_sig)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn get_approval_session(
@@ -1389,6 +1452,12 @@ pub struct ClipboardEntryRow {
     pub metadata: Option<String>,
     pub created_at: DateTime<Utc>,
     pub key_version: i32,
+    #[sqlx(default)]
+    pub request_id: Option<uuid::Uuid>,
+    #[sqlx(default)]
+    pub sent_at: Option<i64>,
+    #[sqlx(default)]
+    pub sender_signature: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -1402,6 +1471,9 @@ pub struct ClipboardEntryWithDevice {
     pub metadata: Option<String>,
     pub created_at: DateTime<Utc>,
     pub key_version: i32,
+    pub request_id: Option<uuid::Uuid>,
+    pub sent_at: Option<i64>,
+    pub sender_signature: Option<Vec<u8>>,
 }
 
 // === PII helper functions ===
@@ -1857,6 +1929,16 @@ WITH ranked AS (
 UPDATE app_releases a SET is_current = FALSE FROM ranked r WHERE a.id = r.id AND r.n > 1;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_current_release
     ON app_releases(platform, arch) WHERE is_current;
+
+-- Protocol v3: a separate, identity-certified ECDH key per device; signed clipboard
+-- entries; committed short-authentication-string pairing.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS encryption_key BYTEA;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS encryption_key_sig BYTEA;
+ALTER TABLE clipboard_entries ADD COLUMN IF NOT EXISTS sent_at BIGINT;
+ALTER TABLE clipboard_entries ADD COLUMN IF NOT EXISTS sender_signature BYTEA;
+ALTER TABLE device_approval_sessions ADD COLUMN IF NOT EXISTS approver_commit BYTEA;
+ALTER TABLE device_approval_sessions ADD COLUMN IF NOT EXISTS pending_nonce BYTEA;
+ALTER TABLE device_approval_sessions ADD COLUMN IF NOT EXISTS approver_nonce BYTEA;
 "#;
 
 #[cfg(test)]
