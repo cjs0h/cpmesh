@@ -1,1 +1,1 @@
-pub mod models;
+pub use cpmesh_proto::models;

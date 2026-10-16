@@ -115,9 +115,9 @@ describe('desktop app store', () => {
 		await flush();
 
 		expect(again).toBe(cleanup);
-		expect(mocks.listen).toHaveBeenCalledTimes(4);
+		expect(mocks.listen).toHaveBeenCalledTimes(5);
 		expect([...mocks.handlers.keys()].sort()).toEqual(
-			['clipboard-new', 'connection-state-changed', 'device-status-changed', 'update-available'].sort(),
+			['clipboard-new', 'connection-state-changed', 'device-status-changed', 'update-available', 'sync-error'].sort(),
 		);
 		expect(mocks.invoke).toHaveBeenCalledWith('get_status');
 		expect(mocks.isPermissionGranted).toHaveBeenCalled();
@@ -201,7 +201,7 @@ describe('desktop app store', () => {
 	it('destroyEventListeners unsubscribes and allows re-initialisation', async () => {
 		const cleanup = store.initEventListeners();
 		await flush();
-		expect(mocks.unlisteners).toHaveLength(4);
+		expect(mocks.unlisteners).toHaveLength(5);
 
 		cleanup();
 		for (const unlisten of mocks.unlisteners) expect(unlisten).toHaveBeenCalledTimes(1);
@@ -209,6 +209,6 @@ describe('desktop app store', () => {
 		mocks.listen.mockClear();
 		store.initEventListeners();
 		await flush();
-		expect(mocks.listen).toHaveBeenCalledTimes(4);
+		expect(mocks.listen).toHaveBeenCalledTimes(5);
 	});
 });

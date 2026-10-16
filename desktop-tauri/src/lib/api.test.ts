@@ -40,9 +40,9 @@ describe('Tauri command wrappers', () => {
 		],
 		[
 			'confirmDeviceApproval',
-			() => api.confirmDeviceApproval('p1', 's1'),
+			() => api.confirmDeviceApproval('p1', 's1', 'A'.repeat(64)),
 			'confirm_device_approval',
-			{ pendingDeviceId: 'p1', sessionId: 's1' },
+			{ pendingDeviceId: 'p1', sessionId: 's1', fingerprint: 'A'.repeat(64) },
 		],
 		[
 			'rejectPendingDevice',

@@ -6,6 +6,9 @@ import { getStatus, type StatusInfo, type HistoryEntry, type UpdateInfo } from '
 let appState = $state<string>('not_configured');
 let status = $state<StatusInfo | null>(null);
 let recentEntry = $state<HistoryEntry | null>(null);
+let syncError = $state('');
+
+export function getSyncError() { return syncError; }
 
 // Update state
 let availableUpdate = $state<UpdateInfo | null>(null);
@@ -67,8 +70,12 @@ export function initEventListeners(): () => void {
 
 	listen<string>('connection-state-changed', (event) => {
 		appState = event.payload as string;
+		if (appState === 'connected' || appState === 'not_configured') syncError = '';
 		refreshStatus();
 	}).then((u) => unlistenFns.push(u));
+
+	listen<string>('sync-error', (event) => { syncError = event.payload; })
+		.then((u) => unlistenFns.push(u));
 
 	listen<HistoryEntry>('clipboard-new', (event) => {
 		recentEntry = event.payload;

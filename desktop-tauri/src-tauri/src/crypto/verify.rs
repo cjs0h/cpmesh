@@ -15,6 +15,10 @@ pub enum VerifyError {
     #[error("device has not been approved yet")]
     #[allow(dead_code)]
     NotPinned,
+    #[error("device was revoked; register a new identity instead of re-admitting the old one")]
+    Revoked,
+    #[error("invalid persisted membership state")]
+    InvalidState,
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
@@ -24,21 +28,28 @@ pub enum VerifyError {
 /// Implements explicit trust pinning for device public keys.
 ///
 /// Unlike TOFU (trust-on-first-use), keys are ONLY pinned after:
-/// 1. Successful device approval (8-digit code match confirmed)
-/// 2. Legacy migration of an already-approved device
+/// 1. Explicit full-fingerprint comparison on both devices
+/// 2. A membership transition signed by an already authenticated member
 ///
 /// Key changes after pinning are hard failures (possible MITM).
 pub struct KeyVerifier {
     pins: HashMap<String, String>, // device_id -> hex(SHA-256(public_key))
+    version: i32,
+    revoked: HashMap<String, i64>,
+    rotation_required: bool,
     file_path: PathBuf,
 }
 
 impl KeyVerifier {
     /// Creates a verifier that persists pinned keys to the given directory.
     pub fn new(config_dir: &Path) -> Result<Self, VerifyError> {
-        let file_path = config_dir.join("pinned_keys.json");
+        // Old TOFU pins are deliberately not imported as authenticated membership.
+        let file_path = config_dir.join("verified_keys.json");
         let mut kv = KeyVerifier {
             pins: HashMap::new(),
+            version: 0,
+            revoked: HashMap::new(),
+            rotation_required: false,
             file_path,
         };
         kv.load()?;
@@ -46,14 +57,20 @@ impl KeyVerifier {
     }
 
     /// Pin a device's public key after successful approval.
-    /// This is the ONLY way to add a new pin (no auto-trust on first use).
+    /// Never call this based only on relay-provided approval status.
     #[allow(dead_code)]
     pub fn pin_after_approval(
         &mut self,
         device_id: &str,
         public_key: &PublicKey,
     ) -> Result<(), VerifyError> {
+        if self.revoked.contains_key(device_id) {
+            return Err(VerifyError::Revoked);
+        }
         let hash = hash_public_key(public_key);
+        if self.pins.get(device_id).is_some_and(|old| *old != hash) {
+            return Err(VerifyError::KeyChanged);
+        }
         self.pins.insert(device_id.to_string(), hash);
         self.save()
     }
@@ -67,6 +84,29 @@ impl KeyVerifier {
         device_id: &str,
         public_key: &PublicKey,
     ) -> Result<(), VerifyError> {
+        if self.revoked.contains_key(device_id) {
+            return Err(VerifyError::Revoked);
+        }
+        self.verify_identity(device_id, public_key)
+    }
+
+    pub fn verify_sender_at(
+        &self,
+        device_id: &str,
+        key: &PublicKey,
+        version: i32,
+    ) -> Result<(), VerifyError> {
+        if self
+            .revoked
+            .get(device_id)
+            .is_some_and(|epoch| i64::from(version) >= *epoch)
+        {
+            return Err(VerifyError::Revoked);
+        }
+        self.verify_identity(device_id, key)
+    }
+
+    fn verify_identity(&self, device_id: &str, public_key: &PublicKey) -> Result<(), VerifyError> {
         let hash = hash_public_key(public_key);
         match self.pins.get(device_id) {
             None => Err(VerifyError::NotPinned),
@@ -75,42 +115,105 @@ impl KeyVerifier {
         }
     }
 
-    /// Migrate a legacy device that was already approved under the old TOFU model.
-    /// Pins the key if not already pinned. If already pinned, verifies the key matches.
-    pub fn migrate_legacy(
+    pub fn accept_membership(
         &mut self,
-        device_id: &str,
-        public_key: &PublicKey,
+        version: i32,
+        members: &[cpmesh_proto::models::DeviceIdentity],
     ) -> Result<(), VerifyError> {
-        let hash = hash_public_key(public_key);
-        match self.pins.get(device_id) {
-            None => {
-                self.pins.insert(device_id.to_string(), hash);
-                self.save()?;
-                Ok(())
-            }
-            Some(pinned) if *pinned == hash => Ok(()),
-            Some(_) => Err(VerifyError::KeyChanged),
+        if version < self.version {
+            return Ok(());
         }
+        let mut pins = HashMap::new();
+        for member in members {
+            if self
+                .revoked
+                .get(&member.id)
+                .is_some_and(|epoch| i64::from(version) >= *epoch)
+            {
+                return Err(VerifyError::Revoked);
+            }
+            let key = super::keys::KeyPair::parse_public_key(&member.public_key)
+                .map_err(|_| VerifyError::KeyChanged)?;
+            let hash = hash_public_key(&key);
+            if self.pins.get(&member.id).is_some_and(|old| *old != hash)
+                || pins.insert(member.id.clone(), hash).is_some()
+            {
+                return Err(VerifyError::KeyChanged);
+            }
+        }
+        if version == self.version {
+            let active: HashMap<_, _> = self
+                .pins
+                .iter()
+                .filter(|(id, _)| !self.revoked.contains_key(*id))
+                .map(|(id, hash)| (id.clone(), hash.clone()))
+                .collect();
+            if !self.rotation_required && pins != active {
+                return Err(VerifyError::KeyChanged);
+            }
+            return Ok(());
+        }
+        for id in self.pins.keys() {
+            if !pins.contains_key(id) {
+                self.revoked.entry(id.clone()).or_insert(i64::from(version));
+            }
+        }
+        self.pins.extend(pins);
+        self.version = version;
+        self.rotation_required = false;
+        self.save()
     }
 
     /// Check if a device is already pinned.
     #[allow(dead_code)]
     pub fn is_pinned(&self, device_id: &str) -> bool {
-        self.pins.contains_key(device_id)
+        self.pins.contains_key(device_id) && !self.revoked.contains_key(device_id)
     }
 
-    /// Remove a pin (e.g., when a device is deleted).
+    pub fn has_peer(&self, own_id: &str) -> bool {
+        self.pins
+            .keys()
+            .any(|id| id != own_id && !self.revoked.contains_key(id))
+    }
+
+    pub fn membership_version(&self) -> i32 {
+        self.version
+    }
+
+    pub fn rotation_required(&self) -> bool {
+        self.rotation_required
+    }
+
+    /// Keep the identity for historical verification, but never admit it again.
     #[allow(dead_code)]
     pub fn remove_pin(&mut self, device_id: &str) -> Result<(), VerifyError> {
-        self.pins.remove(device_id);
+        self.revoked
+            .entry(device_id.to_string())
+            .or_insert(i64::from(self.version) + 1);
+        self.rotation_required = true;
         self.save()
     }
 
     fn load(&mut self) -> Result<(), VerifyError> {
         match fs::read_to_string(&self.file_path) {
             Ok(data) => {
-                self.pins = serde_json::from_str(&data)?;
+                #[derive(serde::Deserialize)]
+                struct Saved {
+                    version: i32,
+                    pins: HashMap<String, String>,
+                    #[serde(default)]
+                    revoked: HashMap<String, i64>,
+                    #[serde(default)]
+                    rotation_required: bool,
+                }
+                let saved: Saved = serde_json::from_str(&data)?;
+                if saved.version < 0 || saved.revoked.values().any(|epoch| *epoch < 1) {
+                    return Err(VerifyError::InvalidState);
+                }
+                self.pins = saved.pins;
+                self.version = saved.version;
+                self.revoked = saved.revoked;
+                self.rotation_required = saved.rotation_required;
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -122,8 +225,11 @@ impl KeyVerifier {
         if let Some(dir) = self.file_path.parent() {
             fs::create_dir_all(dir)?;
         }
-        let data = serde_json::to_string_pretty(&self.pins)?;
-        fs::write(&self.file_path, data)?;
+        let data = serde_json::to_vec(&serde_json::json!({
+            "version": self.version, "pins": self.pins, "revoked": self.revoked,
+            "rotation_required": self.rotation_required,
+        }))?;
+        super::keys::write_private_file(&self.file_path, &data)?;
         Ok(())
     }
 }
@@ -152,7 +258,7 @@ mod tests {
         let kv = KeyVerifier::new(dir.path()).unwrap();
         assert!(!kv.is_pinned("dev-1"));
         // No file is created until something is pinned
-        assert!(!dir.path().join("pinned_keys.json").exists());
+        assert!(!dir.path().join("verified_keys.json").exists());
     }
 
     #[test]
@@ -162,6 +268,25 @@ mod tests {
         let kp = KeyPair::generate();
         assert!(matches!(
             kv.verify_pinned("dev-1", &kp.public),
+            Err(VerifyError::NotPinned)
+        ));
+    }
+
+    #[test]
+    fn legacy_tofu_pins_are_not_silently_promoted_to_membership() {
+        let dir = TempDir::new().unwrap();
+        let pair = KeyPair::generate();
+        fs::write(
+            dir.path().join("pinned_keys.json"),
+            serde_json::json!({
+                "invented-relay-id": hash_public_key(&pair.public),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let verifier = KeyVerifier::new(dir.path()).unwrap();
+        assert!(matches!(
+            verifier.verify_pinned("invented-relay-id", &pair.public),
             Err(VerifyError::NotPinned)
         ));
     }
@@ -192,7 +317,7 @@ mod tests {
             let mut kv = KeyVerifier::new(dir.path()).unwrap();
             kv.pin_after_approval("dev-1", &kp.public).unwrap();
         }
-        assert!(dir.path().join("pinned_keys.json").is_file());
+        assert!(dir.path().join("verified_keys.json").is_file());
 
         let kv = KeyVerifier::new(dir.path()).unwrap();
         assert!(kv.is_pinned("dev-1"));
@@ -206,8 +331,9 @@ mod tests {
         let mut kv = KeyVerifier::new(dir.path()).unwrap();
         kv.pin_after_approval("dev-1", &kp.public).unwrap();
 
-        let raw = fs::read_to_string(dir.path().join("pinned_keys.json")).unwrap();
-        let pins: HashMap<String, String> = serde_json::from_str(&raw).unwrap();
+        let raw = fs::read_to_string(dir.path().join("verified_keys.json")).unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let pins: HashMap<String, String> = serde_json::from_value(saved["pins"].clone()).unwrap();
         let stored = &pins["dev-1"];
         assert_eq!(stored.len(), 64);
         assert_eq!(stored, &hash_public_key(&kp.public));
@@ -215,22 +341,22 @@ mod tests {
     }
 
     #[test]
-    fn migrate_legacy_pins_when_absent_and_verifies_when_present() {
+    fn explicit_verification_never_overwrites_an_existing_identity() {
         let dir = TempDir::new().unwrap();
         let mut kv = KeyVerifier::new(dir.path()).unwrap();
         let kp = KeyPair::generate();
 
         // First sight of a legacy device pins it
-        kv.migrate_legacy("legacy", &kp.public).unwrap();
+        kv.pin_after_approval("legacy", &kp.public).unwrap();
         assert!(kv.is_pinned("legacy"));
 
         // Same key again is fine
-        kv.migrate_legacy("legacy", &kp.public).unwrap();
+        kv.pin_after_approval("legacy", &kp.public).unwrap();
 
         // A changed key is rejected and the original pin is kept
         let other = KeyPair::generate();
         assert!(matches!(
-            kv.migrate_legacy("legacy", &other.public),
+            kv.pin_after_approval("legacy", &other.public),
             Err(VerifyError::KeyChanged)
         ));
         kv.verify_pinned("legacy", &kp.public).unwrap();
@@ -255,7 +381,7 @@ mod tests {
     #[test]
     fn corrupt_pin_file_is_a_json_error() {
         let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("pinned_keys.json"), "not json").unwrap();
+        fs::write(dir.path().join("verified_keys.json"), "not json").unwrap();
         assert!(matches!(
             KeyVerifier::new(dir.path()),
             Err(VerifyError::Json(_))
@@ -269,6 +395,6 @@ mod tests {
         let mut kv = KeyVerifier::new(&nested).unwrap();
         kv.pin_after_approval("dev-1", &KeyPair::generate().public)
             .unwrap();
-        assert!(nested.join("pinned_keys.json").is_file());
+        assert!(nested.join("verified_keys.json").is_file());
     }
 }

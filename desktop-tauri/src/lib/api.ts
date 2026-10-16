@@ -69,7 +69,7 @@ export interface MfaPrompt {
 	message: string;
 }
 
-export type LoginStep = { status: 'signed_in' } | ({ status: 'mfa_required' } & MfaPrompt);
+export type LoginStep = { status: 'signed_in' | 'verification_sent' } | ({ status: 'mfa_required' } & MfaPrompt);
 
 export interface MfaLoginDone {
 	/** Set when a recovery code was used: how many unused ones are left */
@@ -151,6 +151,7 @@ export interface MyApprovalStatus {
 	status: 'pending' | 'approved' | 'rejected' | 'revoked';
 	approval_code?: string;
 	session_id?: string;
+	locally_verified: boolean;
 }
 
 export async function getPendingDevices(): Promise<PendingDevice[]> {
@@ -161,8 +162,20 @@ export async function beginDeviceApproval(pendingDeviceId: string): Promise<Appr
 	return invoke('begin_device_approval', { pendingDeviceId });
 }
 
-export async function confirmDeviceApproval(pendingDeviceId: string, sessionId: string): Promise<void> {
-	return invoke('confirm_device_approval', { pendingDeviceId, sessionId });
+export async function confirmDeviceApproval(pendingDeviceId: string, sessionId: string, fingerprint: string): Promise<void> {
+	return invoke('confirm_device_approval', { pendingDeviceId, sessionId, fingerprint });
+}
+
+export async function confirmPairing(sessionId: string, fingerprint: string): Promise<void> {
+	return invoke('confirm_pairing', { sessionId, fingerprint });
+}
+
+export async function getOwnIdentity(): Promise<{ device_id: string; fingerprint: string }> {
+	return invoke('get_own_identity');
+}
+
+export async function verifyDeviceIdentity(deviceId: string, fingerprint: string): Promise<void> {
+	return invoke('verify_device_identity', { deviceId, fingerprint });
 }
 
 export async function rejectPendingDevice(pendingDeviceId: string): Promise<void> {

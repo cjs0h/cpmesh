@@ -125,7 +125,10 @@ impl ApiClient {
     pub fn new(base_url: &str) -> Self {
         ApiClient {
             base_url: base_url.trim_end_matches('/').to_string(),
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("HTTP client"),
             session: Mutex::new(Session::default()),
             device_id: None,
             persistence: None,
@@ -163,6 +166,19 @@ impl ApiClient {
         self.session().refresh.is_some()
     }
 
+    pub fn is_device_bound(&self, device: &str) -> bool {
+        self.access_token()
+            .and_then(|token| {
+                let payload = token.split('.').nth(1)?;
+                let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(payload)
+                    .ok()?;
+                let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+                claims.get("device_id")?.as_str().map(|id| id == device)
+            })
+            .unwrap_or(false)
+    }
+
     fn session(&self) -> MutexGuard<'_, Session> {
         self.session.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -181,7 +197,9 @@ impl ApiClient {
             .post(format!("{}/api/auth/refresh", self.base_url))
             .json(&RefreshRequest {
                 refresh_token: &refresh,
-                device_id: self.device_id.as_deref(),
+                // The server preserves an existing binding. Legacy unbound sessions
+                // reconnect through a fresh device proof, never a refresh parameter.
+                device_id: None,
             })
             .send()
             .await?;
@@ -357,25 +375,49 @@ impl ApiClient {
     pub async fn register_device(
         &mut self,
         name: &str,
-        public_key: Vec<u8>,
-        public_key_sig: Option<Vec<u8>>,
+        key_pair: &crate::crypto::keys::KeyPair,
         fingerprint: Option<String>,
     ) -> Result<RegisterDeviceResponse, ApiError> {
-        let resp =
-            self.send_authed(self.request(Method::POST, "/api/devices").json(
-                &RegisterDeviceRequest {
-                    name: name.to_string(),
-                    public_key,
-                    public_key_sig,
-                    fingerprint,
-                },
-            ))
+        let response = self
+            .send_authed(self.request(Method::POST, "/api/devices/challenge"))
             .await?;
+        if !response.status().is_success() {
+            return Err(read_error(response).await);
+        }
+        let challenge: DeviceChallengeResponse = response.json().await?;
+        let proof = DeviceSessionProof {
+            signature: key_pair.sign_message(&device_proof_transcript(&challenge.challenge)),
+            challenge: challenge.challenge,
+        };
+        // Do not retry this one-use proof with a different bearer session.
+        let mut request = self
+            .request(Method::POST, "/api/devices")
+            .json(&RegisterDeviceRequest {
+                name: name.to_string(),
+                public_key: key_pair.public_key_bytes(),
+                public_key_sig: Some(key_pair.sign_public_key()),
+                fingerprint,
+                proof: Some(proof),
+            })
+            .build()?;
+        self.authorize(&mut request);
+        let resp = self.client.execute(request).await?;
 
         let status = resp.status();
         if status == StatusCode::CREATED || status == StatusCode::OK {
             let result: RegisterDeviceResponse = resp.json().await?;
-            self.session().access = non_empty(result.access_token.clone());
+            if result.access_token.is_empty() || result.refresh_token.is_empty() {
+                return Err(ApiError::Server {
+                    status: 502,
+                    code: Some("protocol_upgrade_required".into()),
+                    message: "Server did not return a device-bound session; update the server"
+                        .into(),
+                });
+            }
+            self.set_tokens(result.access_token.clone(), result.refresh_token.clone());
+            if let Some(persistence) = &self.persistence {
+                persistence.save(&result.access_token, &result.refresh_token);
+            }
             self.set_device_id(Some(result.device.id.clone()));
             Ok(result)
         } else {
@@ -403,31 +445,6 @@ impl ApiClient {
         self.authed_get_json("/api/devices/keys").await
     }
 
-    // === Group Key ===
-
-    pub async fn get_group_key(&self) -> Result<Option<GroupKeyResponse>, ApiError> {
-        let resp = self
-            .send_authed(self.request(Method::GET, "/api/group-key"))
-            .await?;
-        match resp.status() {
-            StatusCode::OK => Ok(Some(resp.json().await?)),
-            StatusCode::NOT_FOUND => Ok(None),
-            _ => Err(read_error(resp).await),
-        }
-    }
-
-    pub async fn store_group_keys(&self, keys: &[StoreGroupKeyEntry]) -> Result<(), ApiError> {
-        let resp = self
-            .send_authed(self.request(Method::POST, "/api/group-key").json(keys))
-            .await?;
-
-        if resp.status() == StatusCode::OK {
-            Ok(())
-        } else {
-            Err(read_error(resp).await)
-        }
-    }
-
     // === Device Approval ===
 
     pub async fn get_my_approval_status(&self) -> Result<ApprovalStatusResponse, ApiError> {
@@ -443,10 +460,13 @@ impl ApiClient {
         pending_device_id: &str,
     ) -> Result<ApprovalSessionResponse, ApiError> {
         let resp = self
-            .send_authed(self.request(
-                Method::POST,
-                &format!("/api/device-approvals/{pending_device_id}/begin"),
-            ))
+            .send_authed(
+                self.request(
+                    Method::POST,
+                    &format!("/api/device-approvals/{pending_device_id}/begin"),
+                )
+                .header("X-Cpmesh-Pairing", "2"),
+            )
             .await?;
         if resp.status() == StatusCode::OK {
             Ok(resp.json().await?)
@@ -953,9 +973,9 @@ pub(crate) mod tests {
         );
         let refresh_body: serde_json::Value = serde_json::from_str(&log[1].body).unwrap();
         assert_eq!(refresh_body["refresh_token"], "refresh-1");
-        assert_eq!(
-            refresh_body["device_id"], "device-1",
-            "refreshed tokens stay bound"
+        assert!(
+            refresh_body.get("device_id").is_none(),
+            "refresh cannot choose a device"
         );
         assert_eq!(log[2].authorization.as_deref(), Some("Bearer access-2"));
 

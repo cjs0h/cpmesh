@@ -7,6 +7,8 @@
 		beginDeviceApproval,
 		confirmDeviceApproval,
 		rejectPendingDevice,
+		getOwnIdentity,
+		verifyDeviceIdentity,
 		type DeviceInfo,
 		type PendingDevice,
 		type ApprovalSession
@@ -28,6 +30,21 @@
 	let confirming = $state(false);
 	let approvalError = $state('');
 	let successMessage = $state('');
+	let ownFingerprint = $state('');
+	let verifyingDevice = $state('');
+	let expectedFingerprint = $state('');
+	let verifying = $state(false);
+
+	async function verifyExistingDevice() {
+		verifying = true;
+		error = '';
+		try {
+			await verifyDeviceIdentity(verifyingDevice, expectedFingerprint);
+			successMessage = 'Device identity verified. Reconnect to synchronize authenticated keys.';
+			expectedFingerprint = '';
+		} catch (e) { error = String(e); }
+		finally { verifying = false; }
+	}
 
 	function friendlyError(raw: string): string {
 		const s = String(raw);
@@ -36,7 +53,7 @@
 		if (s.includes('no active approval session') || s.includes('Session expired')) return 'The approval session expired. Please start over.';
 		if (s.includes('session_id mismatch')) return 'The approval session has changed. Please start over.';
 		if (s.includes('not the approver')) return 'Only the device that started approval can confirm it.';
-		return 'Something went wrong. Please try again.';
+		return s;
 	}
 
 	async function loadDevices() {
@@ -45,10 +62,7 @@
 		try {
 			const [devs, pending] = await Promise.all([
 				getDevices(),
-				getPendingDevices().catch((e) => {
-					console.warn('Failed to load pending devices:', e);
-					return [] as PendingDevice[];
-				})
+				getPendingDevices()
 			]);
 			// Filter out pending/rejected/revoked from the main list — they show in their own section
 			const pendingIds = new Set(pending.map((d) => d.id));
@@ -94,7 +108,7 @@
 		approvalError = '';
 		confirming = true;
 		try {
-			await confirmDeviceApproval(approvingDeviceId, approvalSession.session_id);
+			await confirmDeviceApproval(approvingDeviceId, approvalSession.session_id, approvalSession.approval_code);
 			closeApprovalModal();
 			successMessage = 'Device approved successfully.';
 			setTimeout(() => { successMessage = ''; }, 3000);
@@ -147,6 +161,8 @@
 
 	onMount(() => {
 		loadDevices();
+		getOwnIdentity().then((identity) => { ownFingerprint = identity.fingerprint; })
+			.catch((e) => { error = String(e); });
 		let unlisten: UnlistenFn | undefined;
 		listen('device-status-changed', () => loadDevices()).then((u) => { unlisten = u; });
 		return () => { unlisten?.(); };
@@ -155,6 +171,23 @@
 
 <div class="devices-page">
 	<h1>Devices</h1>
+	<section class="card identity">
+		<h2>This device's full fingerprint</h2>
+		<code>{ownFingerprint || 'Loading identity...'}</code>
+		<p>For an existing mesh after updating, verify peers explicitly. Get the fingerprint directly from the other device, not from a relay-controlled device list.</p>
+		<label>Device to verify
+			<select bind:value={verifyingDevice}>
+				<option value="">Select a device</option>
+				{#each devices as device}<option value={device.id}>{device.name}</option>{/each}
+			</select>
+		</label>
+		<label>Full fingerprint from the other device
+			<input bind:value={expectedFingerprint} autocomplete="off" spellcheck="false" />
+		</label>
+		<button onclick={verifyExistingDevice} disabled={verifying || !verifyingDevice || !expectedFingerprint}>
+			{verifying ? 'Verifying...' : 'Verify identity'}
+		</button>
+	</section>
 
 	{#if successMessage}
 		<p class="success">{successMessage}</p>
@@ -233,7 +266,7 @@
 
 			{#if approvalSession}
 				<p class="modal-desc">
-					Verify this code matches on the new device, then confirm.
+					Compare all 64 characters directly on the new device, or through an independent trusted channel. Confirm on both devices.
 				</p>
 				<div class="approval-code">{approvalSession.approval_code}</div>
 				{#if approvalError}
@@ -242,7 +275,7 @@
 				<div class="modal-actions">
 					<button onclick={closeApprovalModal} disabled={confirming}>Cancel</button>
 					<button class="primary" onclick={handleConfirmApproval} disabled={confirming}>
-						{confirming ? 'Approving...' : 'Codes Match - Approve'}
+						{confirming ? 'Approving...' : 'All characters match - approve'}
 					</button>
 				</div>
 			{:else if approvalError}
@@ -258,6 +291,10 @@
 {/if}
 
 <style>
+	.identity { padding: 1rem; margin-bottom: 1rem; }
+	.identity code { display: block; overflow-wrap: anywhere; margin: 0.5rem 0; }
+	.identity label { display: block; margin: 0.75rem 0; }
+	.identity input, .identity select { display: block; width: 100%; margin-top: 0.25rem; }
 	.devices-page h1 {
 		font-size: 1.25rem;
 		margin-bottom: 1rem;
@@ -378,7 +415,8 @@
 
 	.approval-code {
 		font-family: monospace;
-		font-size: 2rem;
+		font-size: 0.9rem;
+		overflow-wrap: anywhere;
 		font-weight: 700;
 		text-align: center;
 		letter-spacing: 0.2em;

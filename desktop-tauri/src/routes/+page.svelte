@@ -46,6 +46,7 @@
 	let mobile = $state('');
 	let isRegister = $state(false);
 	let error = $state('');
+	let registrationNotice = $state('');
 	let loading = $state(false);
 
 	// Sign-in in the system browser: single sign-on, or the web dashboard
@@ -190,6 +191,13 @@
 			);
 			if (step.status === 'mfa_required') {
 				startMfa(step);
+				return;
+			}
+			if (step.status === 'verification_sent') {
+				registrationNotice = 'If your details are valid, you will receive a verification email. Check your inbox, then sign in.';
+				isRegister = false;
+				password = '';
+				passwordConfirm = '';
 				return;
 			}
 			wizardStep = 3;
@@ -454,6 +462,7 @@
 							<button class:active={!isRegister} onclick={() => (isRegister = false)}>Login</button>
 							<button class:active={isRegister} onclick={() => (isRegister = true)}>Register</button>
 						</div>
+						{#if registrationNotice}<p role="status">{registrationNotice}</p>{/if}
 						{#if isRegister}
 							<input type="text" placeholder="Full Name *" bind:value={fullName} />
 							<input type="email" placeholder="Email *" bind:value={email} />
@@ -471,7 +480,7 @@
 						<div class="button-row">
 							<button onclick={() => (wizardStep = 1)}>Back</button>
 							<button class="primary" onclick={handleSetup} disabled={loading || !username || !password || (isRegister && (!email || !fullName || !passwordConfirm))}>
-								{loading ? 'Setting up...' : isRegister ? 'Register & Connect' : 'Login & Connect'}
+								{loading ? 'Setting up...' : isRegister ? 'Register' : 'Login & Connect'}
 							</button>
 						</div>
 					{/if}
