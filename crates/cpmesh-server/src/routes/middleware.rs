@@ -17,8 +17,17 @@ use crate::oauth::policy::AgentAccess;
 use crate::rbac::{self, Permission, Role};
 
 pub type IpRateLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
+/// A rate limiter keyed by account.
+pub type UserRateLimiter =
+    RateLimiter<uuid::Uuid, DefaultKeyedStateStore<uuid::Uuid>, DefaultClock>;
 
 pub fn build_rate_limiter(per_minute: u32) -> Arc<IpRateLimiter> {
+    Arc::new(RateLimiter::keyed(Quota::per_minute(
+        NonZeroU32::new(per_minute).expect("rate limit must be non-zero"),
+    )))
+}
+
+pub fn build_user_rate_limiter(per_minute: u32) -> Arc<UserRateLimiter> {
     Arc::new(RateLimiter::keyed(Quota::per_minute(
         NonZeroU32::new(per_minute).expect("rate limit must be non-zero"),
     )))

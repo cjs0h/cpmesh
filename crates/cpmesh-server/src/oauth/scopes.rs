@@ -98,6 +98,11 @@ impl Scopes {
         self.0 & other.0 != 0
     }
 
+    /// Whether every scope of `other` is in this set.
+    pub const fn contains_all(self, other: Scopes) -> bool {
+        self.0 & other.0 == other.0
+    }
+
     pub const fn with(self, scope: Scope) -> Scopes {
         Scopes(self.0 | scope.bit())
     }
@@ -195,5 +200,16 @@ mod tests {
         assert!(Scopes::of(&[Scope::ClipboardWrite]).intersects(read_or_write));
         assert!(!Scopes::of(&[Scope::DevicesManage]).intersects(read_or_write));
         assert!(!Scopes::NONE.intersects(read_or_write));
+    }
+
+    #[test]
+    fn containment_needs_every_scope() {
+        let read_write = Scopes::of(&[Scope::ClipboardRead, Scope::ClipboardWrite]);
+        assert!(read_write.contains_all(Scopes::of(&[Scope::ClipboardWrite])));
+        assert!(read_write.contains_all(read_write));
+        assert!(read_write.contains_all(Scopes::NONE));
+        assert!(
+            !read_write.contains_all(Scopes::of(&[Scope::ClipboardRead, Scope::DevicesManage]))
+        );
     }
 }

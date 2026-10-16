@@ -11,7 +11,10 @@ mod relay;
 
 pub use console::{AuditFilter, RoleChange, UserListFilter};
 pub use mfa::{EmailCodeCheck, MfaSummary};
-pub use oauth::{GrantBinding, RemovedDevice, RevokedGrant};
+pub use oauth::{
+    DeviceDecision, DevicePoll, GrantBinding, NewAuthorizationCode, NewDeviceCode, RemovedDevice,
+    RevokedGrant,
+};
 pub use relay::{ClipboardWrite, KeyRotation, NewDevice};
 
 /// What removing a device did.
@@ -2024,6 +2027,39 @@ CREATE INDEX IF NOT EXISTS idx_oauth_grants_device ON oauth_grants(device_id);
 -- At most one grant in force per device
 CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_grants_active_device
     ON oauth_grants(device_id) WHERE device_id IS NOT NULL AND revoked_at IS NULL;
+-- When the user authorized the agent (epoch seconds), the start of every session of the
+-- grant: signing out everywhere after it ends them (see oauth::consent::grant_status)
+ALTER TABLE oauth_grants ADD COLUMN IF NOT EXISTS session_start BIGINT NOT NULL DEFAULT 0;
+
+-- Codes of agents signing in: authorization codes (approved, exchanged once) and device
+-- codes (RFC 8628) with their user codes. Only SHA-256 hashes of the codes are stored.
+CREATE TABLE IF NOT EXISTS oauth_codes (
+    code_hash      VARCHAR(64) PRIMARY KEY,
+    kind           VARCHAR(20) NOT NULL CHECK (kind IN ('authorization_code', 'device_code')),
+    user_code      VARCHAR(8),
+    client_id      TEXT NOT NULL,
+    redirect_uri   TEXT,
+    code_challenge TEXT,
+    -- Requested while a device code is pending, then what the user approved
+    scopes         JSONB NOT NULL DEFAULT '[]'::jsonb,
+    status         VARCHAR(20) NOT NULL CHECK (status IN ('pending', 'approved', 'denied')),
+    user_id        UUID REFERENCES users(id) ON DELETE CASCADE,
+    -- The approving session was confirmed with a second factor
+    mfa            BOOLEAN NOT NULL DEFAULT FALSE,
+    -- When the user approved (epoch seconds): the start of the agent's sessions
+    approved_at    BIGINT,
+    requester_ip   VARCHAR(45),
+    user_agent     TEXT,
+    agent_name     TEXT NOT NULL DEFAULT '',
+    interval_secs  INT NOT NULL DEFAULT 5,
+    last_polled_at TIMESTAMPTZ,
+    expires_at     TIMESTAMPTZ NOT NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+-- A user code names a single pending request
+CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_codes_pending_user_code
+    ON oauth_codes(user_code) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_oauth_codes_expires ON oauth_codes(expires_at);
 "#;
 
 #[cfg(test)]
@@ -2141,6 +2177,7 @@ mod tests {
             "app_settings",
             "user_daily_activity",
             "oauth_grants",
+            "oauth_codes",
         ] {
             assert!(
                 SCHEMA.contains(&format!("CREATE TABLE IF NOT EXISTS {table}")),

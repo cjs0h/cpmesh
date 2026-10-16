@@ -805,3 +805,611 @@ async fn websocket_tickets_never_carry_agent_sessions() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(body_json(resp).await["error"], "invalid or expired ticket");
 }
+
+// ---- OAuth authorization server ----------------------------------------------
+
+const LOOPBACK: &str = "http://127.0.0.1:53682/callback";
+const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+/// The parameters of a query string.
+fn query_map(query: &str) -> std::collections::HashMap<String, String> {
+    let uri: axum::http::Uri = format!("/?{query}").parse().unwrap();
+    axum::extract::Query::try_from_uri(&uri).unwrap().0
+}
+
+fn location(resp: &axum::http::Response<Body>) -> String {
+    resp.headers()[header::LOCATION]
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+/// The query of a redirect to `LOOPBACK`.
+fn loopback_query(resp: &axum::http::Response<Body>) -> std::collections::HashMap<String, String> {
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let target = location(resp);
+    let query = target
+        .strip_prefix(&format!("{LOOPBACK}?"))
+        .unwrap_or_else(|| panic!("not a redirect to the client: {target}"));
+    query_map(query)
+}
+
+fn authorize_uri(params: &[(&str, &str)]) -> String {
+    format!(
+        "/oauth/authorize?{}",
+        crate::oauth::request::query_string(params)
+    )
+}
+
+fn valid_authorize_params() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("response_type", "code"),
+        ("client_id", MCP_CLIENT_ID),
+        ("redirect_uri", LOOPBACK),
+        ("state", "opaque-state_123"),
+        ("code_challenge", CHALLENGE),
+        ("code_challenge_method", "S256"),
+        ("scope", "clipboard:write clipboard:read"),
+        ("agent_name", "Claude Code via cpmesh-mcp on höst"),
+    ]
+}
+
+fn with(
+    params: &[(&'static str, &'static str)],
+    name: &str,
+    value: Option<&'static str>,
+) -> Vec<(&'static str, &'static str)> {
+    let mut params: Vec<_> = params.iter().copied().filter(|(n, _)| *n != name).collect();
+    if let Some(value) = value {
+        params.push((Box::leak(name.to_string().into_boxed_str()), value));
+    }
+    params
+}
+
+fn assert_unframable(resp: &axum::http::Response<Body>, what: &str) {
+    let h = resp.headers();
+    assert_eq!(h["x-frame-options"], "DENY", "{what}");
+    let csp = h["content-security-policy"].to_str().unwrap();
+    assert!(csp.contains("frame-ancestors 'none'"), "{what}: {csp}");
+}
+
+fn form_request(uri: &str, params: &[(&str, &str)]) -> axum::http::Request<Body> {
+    request("POST", uri)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(crate::oauth::request::query_string(params)))
+        .unwrap()
+}
+
+/// An OAuth error response: status, `error`, and the no-store headers checked.
+async fn oauth_error(resp: axum::http::Response<Body>) -> (StatusCode, String) {
+    let status = resp.status();
+    assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(resp.headers()[header::PRAGMA], "no-cache");
+    let body = body_json(resp).await;
+    assert!(body["error_description"].is_string(), "{body}");
+    (status, body["error"].as_str().unwrap().to_string())
+}
+
+#[tokio::test]
+async fn oauth_metadata_describes_the_authorization_server() {
+    let mut config = test_config();
+    config.base_url = "https://cpmesh.test/".into();
+    let app = test_router(test_state(config).await);
+    let resp = send(
+        &app,
+        request("GET", "/.well-known/oauth-authorization-server")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let metadata = body_json(resp).await;
+    assert_eq!(
+        metadata,
+        serde_json::json!({
+            "issuer": "https://cpmesh.test",
+            "authorization_endpoint": "https://cpmesh.test/oauth/authorize",
+            "token_endpoint": "https://cpmesh.test/oauth/token",
+            "device_authorization_endpoint": "https://cpmesh.test/oauth/device_authorization",
+            "revocation_endpoint": "https://cpmesh.test/oauth/revoke",
+            "response_types_supported": ["code"],
+            "response_modes_supported": ["query"],
+            "grant_types_supported": [
+                "authorization_code",
+                "refresh_token",
+                "urn:ietf:params:oauth:grant-type:device_code"
+            ],
+            "code_challenge_methods_supported": ["S256"],
+            "token_endpoint_auth_methods_supported": ["none"],
+            "revocation_endpoint_auth_methods_supported": ["none"],
+            "scopes_supported": [
+                "clipboard:read",
+                "clipboard:write",
+                "clipboard:delete",
+                "devices:manage"
+            ],
+            "authorization_response_iss_parameter_supported": true,
+        })
+    );
+
+    // Without BASE_URL there is no issuer, so agents cannot sign in
+    let mut config = test_config();
+    config.base_url = String::new();
+    let app = test_router(test_state(config).await);
+    let resp = send(
+        &app,
+        request("GET", "/.well-known/oauth-authorization-server")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        oauth_error(resp).await,
+        (StatusCode::INTERNAL_SERVER_ERROR, "server_error".into())
+    );
+    let resp = send(
+        &app,
+        request("GET", &authorize_uri(&valid_authorize_params()))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(resp.headers().get(header::LOCATION).is_none());
+}
+
+#[tokio::test]
+async fn authorize_never_redirects_for_an_unregistered_client_or_redirect_uri() {
+    let app = test_router(test_state(test_config()).await);
+    let valid = valid_authorize_params();
+    for params in [
+        with(&valid, "client_id", None),
+        with(&valid, "client_id", Some("someone-else")),
+        with(&valid, "redirect_uri", None),
+        with(
+            &valid,
+            "redirect_uri",
+            Some("http://localhost:53682/callback"),
+        ),
+        with(
+            &valid,
+            "redirect_uri",
+            Some("https://127.0.0.1:53682/callback"),
+        ),
+        with(
+            &valid,
+            "redirect_uri",
+            Some("http://127.0.0.1:53682/elsewhere"),
+        ),
+        with(
+            &valid,
+            "redirect_uri",
+            Some("http://evil@127.0.0.1:53682/callback"),
+        ),
+        with(
+            &valid,
+            "redirect_uri",
+            Some("http://127.0.0.1:53682/callback#x"),
+        ),
+        with(
+            &valid,
+            "redirect_uri",
+            Some("https://evil.example/callback"),
+        ),
+        // Repeated: neither value is trusted
+        [
+            valid.clone(),
+            vec![("redirect_uri", "https://evil.example/callback")],
+        ]
+        .concat(),
+        [valid.clone(), vec![("client_id", MCP_CLIENT_ID)]].concat(),
+    ] {
+        let resp = send(
+            &app,
+            request("GET", &authorize_uri(&params))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{params:?}");
+        assert!(resp.headers().get(header::LOCATION).is_none(), "{params:?}");
+        assert!(
+            resp.headers()[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
+        assert_unframable(&resp, "error page");
+        let page = String::from_utf8(body_bytes(resp).await).unwrap();
+        assert!(page.contains("isn't valid"), "{page}");
+        assert!(!page.contains("evil"), "the page reflects no input");
+    }
+}
+
+#[tokio::test]
+async fn authorize_errors_go_back_to_the_client_with_state_and_issuer() {
+    let app = test_router(test_state(test_config()).await);
+    let valid = valid_authorize_params();
+    let long_name: &'static str = Box::leak("a".repeat(101).into_boxed_str());
+    for (params, error, state_echoed) in [
+        (with(&valid, "state", None), "invalid_request", false),
+        (
+            with(&valid, "state", Some("bad\tstate")),
+            "invalid_request",
+            false,
+        ),
+        (with(&valid, "response_type", None), "invalid_request", true),
+        (
+            with(&valid, "response_type", Some("token")),
+            "unsupported_response_type",
+            true,
+        ),
+        (
+            with(&valid, "code_challenge_method", None),
+            "invalid_request",
+            true,
+        ),
+        (
+            with(&valid, "code_challenge_method", Some("plain")),
+            "invalid_request",
+            true,
+        ),
+        (
+            with(&valid, "code_challenge", None),
+            "invalid_request",
+            true,
+        ),
+        (
+            with(&valid, "code_challenge", Some("short")),
+            "invalid_request",
+            true,
+        ),
+        (
+            with(&valid, "scope", Some("clipboard:read admin")),
+            "invalid_scope",
+            true,
+        ),
+        (
+            with(&valid, "agent_name", Some(long_name)),
+            "invalid_request",
+            true,
+        ),
+        (
+            with(&valid, "agent_name", Some("rtl\u{202E}name")),
+            "invalid_request",
+            true,
+        ),
+        (
+            [valid.clone(), vec![("scope", "clipboard:read")]].concat(),
+            "invalid_request",
+            true,
+        ),
+    ] {
+        let resp = send(
+            &app,
+            request("GET", &authorize_uri(&params))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        let query = loopback_query(&resp);
+        assert_eq!(query["error"], error, "{params:?}");
+        assert!(!query["error_description"].is_empty());
+        assert_eq!(query["iss"], "https://cpmesh.test");
+        assert_eq!(
+            query.get("state").map(String::as_str),
+            state_echoed.then_some("opaque-state_123"),
+            "{params:?}"
+        );
+        assert!(!query.contains_key("code"));
+    }
+}
+
+#[tokio::test]
+async fn valid_authorization_requests_go_to_the_consent_page() {
+    let app = test_router(test_state(test_config()).await);
+    let resp = send(
+        &app,
+        request("GET", &authorize_uri(&valid_authorize_params()))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    assert_unframable(&resp, "redirect");
+    let target = location(&resp);
+    let query = query_map(target.strip_prefix("/#/authorize?").unwrap());
+    let expected: std::collections::HashMap<String, String> = [
+        ("client_id", MCP_CLIENT_ID),
+        ("redirect_uri", LOOPBACK),
+        ("response_type", "code"),
+        ("state", "opaque-state_123"),
+        ("code_challenge", CHALLENGE),
+        ("code_challenge_method", "S256"),
+        // Canonical order
+        ("scope", "clipboard:read clipboard:write"),
+        ("agent_name", "Claude Code via cpmesh-mcp on höst"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    assert_eq!(query, expected);
+
+    // Without a scope the agent asks for every scope; IPv6 loopback works too
+    let params = with(
+        &with(&valid_authorize_params(), "scope", None),
+        "redirect_uri",
+        Some("http://[::1]:1/callback"),
+    );
+    let resp = send(
+        &app,
+        request("GET", &authorize_uri(&with(&params, "agent_name", None)))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let target = location(&resp);
+    let query = query_map(target.strip_prefix("/#/authorize?").unwrap());
+    assert_eq!(
+        query["scope"],
+        "clipboard:read clipboard:write clipboard:delete devices:manage"
+    );
+    assert_eq!(query["redirect_uri"], "http://[::1]:1/callback");
+    assert!(!query.contains_key("agent_name"));
+}
+
+#[tokio::test]
+async fn consent_pages_cannot_be_framed() {
+    let app = test_router(test_state(test_config()).await);
+    for path in [
+        "/",
+        "/index.html",
+        "/activate",
+        "/activate?user_code=BCDF-GHJK",
+    ] {
+        let resp = send(&app, request("GET", path).body(Body::empty()).unwrap()).await;
+        assert_unframable(&resp, path);
+    }
+}
+
+#[tokio::test]
+async fn activate_carries_only_well_formed_user_codes() {
+    let app = test_router(test_state(test_config()).await);
+    for (uri, target) in [
+        ("/activate", "/#/activate"),
+        (
+            "/activate?user_code=BCDF-GHJK",
+            "/#/activate?user_code=BCDF-GHJK",
+        ),
+        (
+            "/activate?user_code=bcdf%20ghjk",
+            "/#/activate?user_code=BCDF-GHJK",
+        ),
+        (
+            "/activate?user_code=bcdfghjk&x=1",
+            "/#/activate?user_code=BCDF-GHJK",
+        ),
+        ("/activate?user_code=ABCD-EFGH", "/#/activate"),
+        ("/activate?user_code=%3Cscript%3E", "/#/activate"),
+        ("/activate?user_code=", "/#/activate"),
+    ] {
+        let resp = send(&app, request("GET", uri).body(Body::empty()).unwrap()).await;
+        assert_eq!(resp.status(), StatusCode::FOUND, "{uri}");
+        assert_eq!(location(&resp), target, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn device_authorization_is_rate_limited_per_address() {
+    let state = test_state_with(
+        test_config(),
+        std::collections::HashMap::from([("oauth_device", 2)]),
+    )
+    .await;
+    let app = test_router(state);
+    let start = || {
+        form_request(
+            "/oauth/device_authorization",
+            &[("client_id", MCP_CLIENT_ID)],
+        )
+    };
+    for _ in 0..2 {
+        // Gets as far as storing the code (no database here)
+        let (status, error) = oauth_error(send(&app, start()).await).await;
+        assert_eq!(
+            (status, error.as_str()),
+            (StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable")
+        );
+    }
+    let resp = send(&app, start()).await;
+    assert!(resp.headers().contains_key(header::RETRY_AFTER));
+    assert_eq!(
+        oauth_error(resp).await,
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            "temporarily_unavailable".into()
+        )
+    );
+}
+
+#[tokio::test]
+async fn device_authorization_checks_the_client_scope_and_agent_name() {
+    let app = test_router(test_state(test_config()).await);
+    for (params, error) in [
+        (vec![], "invalid_request"),
+        (vec![("client_id", "someone-else")], "invalid_client"),
+        (
+            vec![("client_id", MCP_CLIENT_ID), ("scope", "everything")],
+            "invalid_scope",
+        ),
+        (
+            vec![("client_id", MCP_CLIENT_ID), ("agent_name", "bell\u{7}")],
+            "invalid_request",
+        ),
+    ] {
+        let resp = send(&app, form_request("/oauth/device_authorization", &params)).await;
+        assert_eq!(
+            oauth_error(resp).await,
+            (StatusCode::BAD_REQUEST, error.to_string()),
+            "{params:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_token_endpoint_answers_with_rfc_6749_errors() {
+    let state = test_state(test_config()).await;
+    let app = test_router(state.clone());
+    let first_party_refresh = state
+        .auth
+        .generate_refresh_token(uuid::Uuid::new_v4(), None)
+        .unwrap();
+    let mcp = ("client_id", MCP_CLIENT_ID);
+    for (params, error) in [
+        (vec![mcp], "invalid_request"),
+        (
+            vec![mcp, ("grant_type", "password")],
+            "unsupported_grant_type",
+        ),
+        (
+            vec![mcp, ("grant_type", "client_credentials")],
+            "unsupported_grant_type",
+        ),
+        (vec![("grant_type", "refresh_token")], "invalid_request"),
+        (
+            vec![("client_id", "nobody"), ("grant_type", "refresh_token")],
+            "invalid_client",
+        ),
+        (
+            vec![mcp, ("grant_type", "refresh_token")],
+            "invalid_request",
+        ),
+        (
+            vec![
+                mcp,
+                ("grant_type", "refresh_token"),
+                ("refresh_token", "garbage"),
+            ],
+            "invalid_grant",
+        ),
+        // A first-party session never refreshes here
+        (
+            vec![
+                mcp,
+                ("grant_type", "refresh_token"),
+                ("refresh_token", first_party_refresh.as_str()),
+            ],
+            "invalid_grant",
+        ),
+        (
+            vec![mcp, ("grant_type", "authorization_code"), ("code", "x")],
+            "invalid_request",
+        ),
+        (
+            vec![
+                mcp,
+                ("grant_type", "authorization_code"),
+                ("code", "x"),
+                ("redirect_uri", LOOPBACK),
+                ("code_verifier", "too-short"),
+            ],
+            "invalid_request",
+        ),
+        (
+            vec![
+                mcp,
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ],
+            "invalid_request",
+        ),
+        (
+            vec![
+                mcp,
+                ("grant_type", "refresh_token"),
+                ("grant_type", "refresh_token"),
+            ],
+            "invalid_request",
+        ),
+    ] {
+        let resp = send(&app, form_request("/oauth/token", &params)).await;
+        assert_eq!(
+            oauth_error(resp).await,
+            (StatusCode::BAD_REQUEST, error.to_string()),
+            "{params:?}"
+        );
+    }
+
+    // Only form bodies
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/oauth/token",
+            serde_json::json!({"grant_type": "refresh_token", "client_id": MCP_CLIENT_ID}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        oauth_error(resp).await,
+        (StatusCode::BAD_REQUEST, "invalid_request".into())
+    );
+}
+
+#[tokio::test]
+async fn revocation_accepts_any_token_but_only_acts_on_the_clients_own() {
+    let state = test_state(test_config()).await;
+    let app = test_router(state.clone());
+    let revoke = |params: Vec<(&str, &str)>| form_request("/oauth/revoke", &params);
+    let first_party = state
+        .auth
+        .generate_access_token(uuid::Uuid::new_v4(), None)
+        .unwrap();
+
+    assert_eq!(
+        oauth_error(send(&app, revoke(vec![("token", "x")])).await).await,
+        (StatusCode::BAD_REQUEST, "invalid_request".into())
+    );
+    assert_eq!(
+        oauth_error(send(&app, revoke(vec![("client_id", "nobody"), ("token", "x")])).await).await,
+        (StatusCode::BAD_REQUEST, "invalid_client".into())
+    );
+    assert_eq!(
+        oauth_error(send(&app, revoke(vec![("client_id", MCP_CLIENT_ID)])).await).await,
+        (StatusCode::BAD_REQUEST, "invalid_request".into())
+    );
+    // Unknown, invalid and first-party tokens change nothing (no database here)
+    for token in ["garbage", first_party.as_str()] {
+        let resp = send(
+            &app,
+            revoke(vec![
+                ("client_id", MCP_CLIENT_ID),
+                ("token", token),
+                ("token_type_hint", "refresh_token"),
+            ]),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(body_bytes(resp).await.is_empty());
+    }
+    // An agent's own token reaches its grant, which needs the database
+    let agent = state
+        .auth
+        .issue_refresh(&agent_session(&[Scope::ClipboardRead], false))
+        .unwrap();
+    let resp = send(
+        &app,
+        revoke(vec![
+            ("client_id", MCP_CLIENT_ID),
+            ("token", agent.as_str()),
+        ]),
+    )
+    .await;
+    assert_eq!(
+        oauth_error(resp).await,
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporarily_unavailable".into()
+        )
+    );
+}

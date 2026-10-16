@@ -185,6 +185,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_used_at: None,
             revoked_at: None,
+            session_start: 0,
         }
     }
 

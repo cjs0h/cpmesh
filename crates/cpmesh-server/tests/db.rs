@@ -1569,7 +1569,7 @@ mod router {
     use cpmesh_server::email::EmailService;
     use cpmesh_server::routes::auth::PkceCodeStore;
     use cpmesh_server::routes::auth_service::{AuthService, RefreshResult};
-    use cpmesh_server::routes::middleware::build_rate_limiter;
+    use cpmesh_server::routes::middleware::{build_rate_limiter, build_user_rate_limiter};
     use cpmesh_server::ws::Hub;
     use cpmesh_server::{AppState, RateLimiters};
     use http_body_util::BodyExt;
@@ -1595,6 +1595,9 @@ mod router {
                 register: build_rate_limiter(1000),
                 refresh: build_rate_limiter(1000),
                 mfa: build_rate_limiter(1000),
+                oauth_device: build_rate_limiter(1000),
+                user_code_ip: build_rate_limiter(1000),
+                user_code_user: build_user_rate_limiter(1000),
             },
             settings: cpmesh_server::settings::SettingsCache::new(),
         });
@@ -2202,7 +2205,13 @@ async fn oauth_grants_bind_to_one_device_and_end_with_it() {
         let other = make_user(&db, "agent-stranger", None).await;
         let scopes = Scopes::of(&[Scope::ClipboardRead, Scope::ClipboardWrite]);
         let grant = db
-            .create_oauth_grant(user.id, MCP_CLIENT_ID, scopes, "Claude Code via cpmesh-mcp")
+            .create_oauth_grant(
+                user.id,
+                MCP_CLIENT_ID,
+                scopes,
+                "Claude Code via cpmesh-mcp",
+                0,
+            )
             .await
             .unwrap();
         assert_eq!(grant.scopes(), scopes);
@@ -2273,7 +2282,7 @@ async fn oauth_grants_bind_to_one_device_and_end_with_it() {
         // Authorizing again moves the device to the new grant and supersedes the old
         // one; the device stays, still paired
         let renewed = db
-            .create_oauth_grant(user.id, MCP_CLIENT_ID, scopes, "renewed")
+            .create_oauth_grant(user.id, MCP_CLIENT_ID, scopes, "renewed", 0)
             .await
             .unwrap();
         assert_eq!(
@@ -2311,7 +2320,7 @@ async fn oauth_grants_bind_to_one_device_and_end_with_it() {
 
         // At most one grant in force per device
         let spare = db
-            .create_oauth_grant(user.id, MCP_CLIENT_ID, scopes, "spare")
+            .create_oauth_grant(user.id, MCP_CLIENT_ID, scopes, "spare", 0)
             .await
             .unwrap();
         let duplicate = sqlx::query("UPDATE oauth_grants SET device_id = $1 WHERE id = $2")
@@ -2380,7 +2389,7 @@ async fn oauth_grants_bind_to_one_device_and_end_with_it() {
         let spare = db.get_oauth_grant(spare.id).await.unwrap().unwrap();
         assert!(spare.revoked_at.is_some());
         let last = db
-            .create_oauth_grant(user.id, MCP_CLIENT_ID, scopes, "last")
+            .create_oauth_grant(user.id, MCP_CLIENT_ID, scopes, "last", 0)
             .await
             .unwrap();
         assert_eq!(
@@ -2403,6 +2412,178 @@ async fn oauth_grants_bind_to_one_device_and_end_with_it() {
         // Grants go with their user
         db.admin_delete_user(user.id).await.unwrap();
         assert!(db.get_oauth_grant(last.id).await.unwrap().is_none());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn oauth_codes_work_once_and_user_codes_are_unique_while_pending() {
+    with_db(|db| async move {
+        use cpmesh_server::db::{DeviceDecision, DevicePoll, NewAuthorizationCode, NewDeviceCode};
+        use cpmesh_server::oauth::{MCP_CLIENT_ID, Scope, Scopes};
+        use std::time::Duration;
+
+        let user = make_user(&db, "code-owner", None).await;
+        let scopes = Scopes::of(&[Scope::ClipboardRead]);
+        let code = |hash: &'static str, ttl: u64| NewAuthorizationCode {
+            code_hash: hash,
+            client_id: MCP_CLIENT_ID,
+            redirect_uri: "http://127.0.0.1:1/callback",
+            code_challenge: "challenge",
+            scopes,
+            agent_name: "agent",
+            user_id: user.id,
+            mfa: true,
+            approved_at: 1_700_000_000,
+            ttl: Duration::from_secs(ttl),
+        };
+        db.create_authorization_code(&code("a", 120)).await.unwrap();
+        let taken = db.take_authorization_code("a").await.unwrap().unwrap();
+        assert_eq!(
+            (taken.kind.as_str(), taken.status.as_str()),
+            ("authorization_code", "approved")
+        );
+        assert_eq!(taken.user_id, Some(user.id));
+        assert_eq!(taken.approved_at, Some(1_700_000_000));
+        assert!(taken.mfa);
+        assert_eq!(taken.scopes(), scopes);
+        assert_eq!(taken.redirect_uri.as_deref(), Some("http://127.0.0.1:1/callback"));
+        assert!(db.take_authorization_code("a").await.unwrap().is_none());
+        db.create_authorization_code(&code("expired", 0)).await.unwrap();
+        assert!(db.take_authorization_code("expired").await.unwrap().is_none());
+
+        // One pending request per user code
+        let device = |hash: &'static str, user_code: &'static str| NewDeviceCode {
+            code_hash: hash,
+            user_code,
+            client_id: MCP_CLIENT_ID,
+            scopes,
+            agent_name: "agent",
+            requester_ip: "198.51.100.4",
+            user_agent: Some("cpmesh-mcp"),
+            interval: Duration::from_secs(5),
+            ttl: Duration::from_secs(600),
+        };
+        db.create_device_code(&device("d1", "BCDFGHJK")).await.unwrap();
+        match db.create_device_code(&device("d2", "BCDFGHJK")).await {
+            Err(sqlx::Error::Database(e)) => assert!(e.is_unique_violation()),
+            other => panic!("duplicate pending user code: {other:?}"),
+        }
+        assert!(db.take_authorization_code("d1").await.unwrap().is_none(), "kinds stay apart");
+        let pending = db.find_pending_device_code("BCDFGHJK").await.unwrap().unwrap();
+        assert_eq!(pending.code_hash, "d1");
+        assert_eq!(pending.requester_ip.as_deref(), Some("198.51.100.4"));
+        assert_eq!(pending.interval_secs, 5);
+        assert!(db.find_pending_device_code("ZZZZZZZZ").await.unwrap().is_none());
+
+        // Decided once; the user code is free again
+        assert!(db.decide_device_code("d1", user.id, DeviceDecision::Deny).await.unwrap());
+        let approve = DeviceDecision::Approve {
+            scopes,
+            mfa: false,
+            approved_at: 1,
+        };
+        assert!(!db.decide_device_code("d1", user.id, approve).await.unwrap());
+        assert!(db.find_pending_device_code("BCDFGHJK").await.unwrap().is_none());
+        assert!(matches!(
+            db.poll_device_code("d1", MCP_CLIENT_ID).await.unwrap(),
+            DevicePoll::Denied
+        ));
+        db.create_device_code(&device("d2", "BCDFGHJK")).await.unwrap();
+        assert!(matches!(
+            db.poll_device_code("d2", "another-client").await.unwrap(),
+            DevicePoll::Unknown
+        ));
+        assert!(matches!(
+            db.poll_device_code("d2", MCP_CLIENT_ID).await.unwrap(),
+            DevicePoll::Pending
+        ));
+        assert!(matches!(
+            db.poll_device_code("d2", MCP_CLIENT_ID).await.unwrap(),
+            DevicePoll::SlowDown { interval_secs: 10 }
+        ));
+        assert!(db.decide_device_code("d2", user.id, approve).await.unwrap());
+        let DevicePoll::Approved(approved) = db.poll_device_code("d2", MCP_CLIENT_ID).await.unwrap()
+        else {
+            panic!("approved code not handed out");
+        };
+        assert_eq!((approved.user_id, approved.approved_at), (Some(user.id), Some(1)));
+        assert!(matches!(
+            db.poll_device_code("d2", MCP_CLIENT_ID).await.unwrap(),
+            DevicePoll::Unknown
+        ));
+
+        // Expired codes are kept for an hour, so polling agents learn they expired
+        db.create_device_code(&NewDeviceCode {
+            ttl: Duration::ZERO,
+            ..device("d3", "CDFGHJKL")
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            db.poll_device_code("d3", MCP_CLIENT_ID).await.unwrap(),
+            DevicePoll::Expired
+        ));
+        assert!(!db.decide_device_code("d3", user.id, DeviceDecision::Deny).await.unwrap());
+        assert_eq!(db.delete_expired_oauth_codes().await.unwrap(), 0);
+        sqlx::query("UPDATE oauth_codes SET expires_at = NOW() - INTERVAL '61 minutes' WHERE code_hash IN ('d3', 'expired')")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(db.delete_expired_oauth_codes().await.unwrap(), 2);
+        let left: Vec<String> = sqlx::query_scalar("SELECT code_hash FROM oauth_codes ORDER BY code_hash")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(left, ["d1"]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn oauth_grant_listing_shows_grants_in_force_with_their_devices() {
+    with_db(|db| async move {
+        use cpmesh_server::oauth::{MCP_CLIENT_ID, Scope, Scopes};
+
+        let user = make_user(&db, "listing-owner", None).await;
+        let other = make_user(&db, "listing-other", None).await;
+        let scopes = Scopes::of(&[Scope::ClipboardWrite]);
+        let older = db
+            .create_oauth_grant(user.id, MCP_CLIENT_ID, scopes, "older", 1_000)
+            .await
+            .unwrap();
+        let newer = db
+            .create_oauth_grant(user.id, MCP_CLIENT_ID, scopes, "newer", 2_000)
+            .await
+            .unwrap();
+        let revoked = db
+            .create_oauth_grant(user.id, MCP_CLIENT_ID, scopes, "revoked", 3_000)
+            .await
+            .unwrap();
+        db.create_oauth_grant(other.id, MCP_CLIENT_ID, scopes, "theirs", 0)
+            .await
+            .unwrap();
+        db.revoke_oauth_grant(revoked.id, user.id).await.unwrap();
+        let device = make_device(&db, &user, "Agent box", "pending").await;
+        sqlx::query("UPDATE oauth_grants SET device_id = $1 WHERE id = $2")
+            .bind(device.id)
+            .bind(older.id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        db.revoke_all_user_tokens(user.id, 1_500).await.unwrap();
+
+        let listed = db.list_oauth_grants(user.id).await.unwrap();
+        let ids: Vec<_> = listed.iter().map(|g| g.id).collect();
+        assert_eq!(ids, [newer.id, older.id]);
+        assert_eq!(listed[0].device_id, None);
+        assert_eq!(listed[0].session_start, 2_000);
+        assert_eq!(listed[0].agent_name, "newer");
+        assert_eq!(listed[1].device_id, Some(device.id));
+        assert_eq!(listed[1].device_name.as_deref(), Some("Agent box"));
+        assert_eq!(listed[1].device_status.as_deref(), Some("pending"));
+        assert!(listed.iter().all(|g| g.tokens_revoked_before == 1_500));
+        assert_eq!(db.list_oauth_grants(other.id).await.unwrap().len(), 1);
     })
     .await;
 }

@@ -19,6 +19,7 @@ use crate::AppState;
 use crate::audit::RequestMeta;
 use crate::mfa::SignInStep;
 use crate::models::*;
+use crate::oauth::codes::is_valid_code_challenge;
 
 const MAX_PASSWORD_LENGTH: usize = 128;
 
@@ -872,14 +873,6 @@ pub struct NativeCodeBody {
 
 /// How recent a web sign-in must be to hand it to the desktop app.
 const NATIVE_HANDOFF_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
-
-/// A PKCE S256 challenge: base64url of a SHA-256 digest (43 characters), with some slack.
-fn is_valid_code_challenge(challenge: &str) -> bool {
-    (43..=128).contains(&challenge.len())
-        && challenge
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-}
 
 /// Hands a fresh web sign-in to the desktop app ("Sign in with browser"). The app opened
 /// the dashboard with a PKCE challenge; the dashboard signs the user in (password,

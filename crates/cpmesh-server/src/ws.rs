@@ -277,6 +277,7 @@ impl Hub {
     }
 }
 
+/// Hourly housekeeping: idle send budgets, old request receipts and expired OAuth codes.
 pub fn start_hub_cleanup(state: Arc<AppState>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
@@ -295,6 +296,9 @@ pub fn start_hub_cleanup(state: Arc<AppState>) {
             .await
             {
                 warn!("Failed to expire clipboard request receipts: {error}");
+            }
+            if let Err(error) = state.db.delete_expired_oauth_codes().await {
+                warn!("Failed to delete expired OAuth codes: {error}");
             }
         }
     });
