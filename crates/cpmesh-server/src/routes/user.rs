@@ -1,7 +1,7 @@
 use axum::{
     extract::{ConnectInfo, Extension, State},
     http::StatusCode,
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use serde_json::json;
 use std::net::SocketAddr;
@@ -22,7 +22,10 @@ pub async fn handle_get_me(
 
     let (email, full_name, country, mobile) = decrypt_user_pii(&user, state.pii.as_ref());
     let role = user.role();
-    let mfa = state.db.mfa_summary(user.id).await.unwrap_or_default();
+    let mfa = match state.db.mfa_summary(user.id).await {
+        Ok(mfa) => mfa,
+        Err(e) => return super::middleware::ApiError::internal(e).into_response(),
+    };
 
     let mut resp = json!({
         "id": user.id.to_string(),
@@ -94,14 +97,19 @@ pub async fn handle_change_password(
         Err(_) => return json_error("user not found", StatusCode::NOT_FOUND),
     };
 
-    if !state
+    let password_ok = match state
         .auth
-        .check_password(&user.password, &req.current_password)
+        .check_password_async(&user.password, &req.current_password)
+        .await
     {
+        Ok(ok) => ok,
+        Err(e) => return super::middleware::ApiError::internal(e).into_response(),
+    };
+    if !password_ok {
         return json_error("current password is incorrect", StatusCode::UNAUTHORIZED);
     }
 
-    let hash = match state.auth.hash_password(&req.new_password) {
+    let hash = match state.auth.hash_password_async(&req.new_password).await {
         Ok(h) => h,
         Err(_) => return json_error("internal error", StatusCode::INTERNAL_SERVER_ERROR),
     };
@@ -118,6 +126,8 @@ pub async fn handle_change_password(
         );
     }
 
+    state.hub.disconnect_user(&claims.user_id.to_string()).await;
+
     // Audit log
     let ip = extract_client_ip(&headers, &addr, state.config.trust_proxy_headers);
     let ua = headers
@@ -127,8 +137,7 @@ pub async fn handle_change_password(
     let pool = state.db.pool.clone();
     let uid = claims.user_id;
     let ip_str = ip.to_string();
-    tokio::spawn(async move {
-        let _ = sqlx::query(
+    if let Err(error) = sqlx::query(
             "INSERT INTO audit_logs (user_id, action, ip_address, user_agent, details) VALUES ($1, $2, $3, $4, $5)"
         )
         .bind(Some(uid))
@@ -137,10 +146,12 @@ pub async fn handle_change_password(
         .bind(ua.as_deref())
         .bind(json!({}))
         .execute(&pool)
-        .await;
-    });
+        .await { tracing::warn!("Failed to persist audit entry: {error}"); }
 
-    json_response(StatusCode::OK, json!({"message": "password changed"}))
+    json_response(
+        StatusCode::OK,
+        json!({"message": "password changed; sign in again", "reauth_required": true}),
+    )
 }
 
 pub async fn handle_get_my_subscription(

@@ -36,6 +36,298 @@ use crate::{AppState, RateLimiters};
 
 const PASSWORD: &str = "Correct-Horse-9!";
 
+fn device_key() -> aws_lc_rs::signature::EcdsaKeyPair {
+    aws_lc_rs::signature::EcdsaKeyPair::generate(
+        &aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+    )
+    .unwrap()
+}
+
+fn device_registration(
+    key: &aws_lc_rs::signature::EcdsaKeyPair,
+    challenge: &str,
+    fingerprint: &str,
+) -> Value {
+    use aws_lc_rs::signature::KeyPair;
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    json!({
+        "name": "Proof device", "fingerprint": fingerprint,
+        "public_key": b64.encode(key.public_key().as_ref()),
+        "proof": {
+            "challenge": challenge,
+            "signature": b64.encode(key.sign(&aws_lc_rs::rand::SystemRandom::new(), &cpmesh_proto::models::device_proof_transcript(challenge)).unwrap().as_ref()),
+        },
+    })
+}
+
+#[tokio::test]
+async fn device_registration_requires_fresh_session_bound_possession_and_issues_bound_refresh() {
+    with_app(Options::default(), |app| async move {
+        let user = app.member("proof").await;
+        let token = app.mfa_session(&user);
+        let other_session = app.mfa_session(&user);
+        let key = device_key();
+        let (_, challenge) = app
+            .call("POST", "/api/devices/challenge", Some(&token), None)
+            .await;
+        let body = device_registration(&key, challenge["challenge"].as_str().unwrap(), "fp");
+        let mut legacy = body.clone();
+        legacy.as_object_mut().unwrap().remove("proof");
+        assert_eq!(
+            app.call("POST", "/api/devices", Some(&token), Some(legacy))
+                .await
+                .0,
+            StatusCode::UPGRADE_REQUIRED
+        );
+        assert_eq!(
+            app.call(
+                "POST",
+                "/api/devices",
+                Some(&other_session),
+                Some(body.clone())
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let (status, registration) = app
+            .call("POST", "/api/devices", Some(&token), Some(body.clone()))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{registration}");
+        let id = registration["device"]["id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let access = app
+            .state
+            .auth
+            .validate_access_token(registration["access_token"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(access.device_id, Some(id));
+        assert!(access.mfa);
+        let crate::routes::auth_service::RefreshResult::Ok(refresh, _, _) = app
+            .state
+            .auth
+            .validate_refresh_token(registration["refresh_token"].as_str().unwrap())
+        else {
+            panic!("invalid refresh");
+        };
+        assert_eq!(refresh.device_id, Some(id));
+        assert_eq!(
+            app.call("POST", "/api/devices", Some(&token), Some(body))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // Knowing the fingerprint or a captured public-key signature never authorizes replacement.
+        let (_, challenge) = app
+            .call("POST", "/api/devices/challenge", Some(&other_session), None)
+            .await;
+        let replacement = device_registration(
+            &device_key(),
+            challenge["challenge"].as_str().unwrap(),
+            "fp",
+        );
+        assert_eq!(
+            app.call(
+                "POST",
+                "/api/devices",
+                Some(&other_session),
+                Some(replacement)
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        let (_, challenge) = app
+            .call("POST", "/api/devices/challenge", Some(&other_session), None)
+            .await;
+        let reconnect = device_registration(&key, challenge["challenge"].as_str().unwrap(), "fp");
+        assert_eq!(
+            app.call(
+                "POST",
+                "/api/devices",
+                Some(&other_session),
+                Some(reconnect)
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn simultaneous_first_registrations_only_auto_approve_one_device() {
+    with_app(Options::default(), |app| async move {
+        let user = app.member("registration-race").await;
+        let token = app.mfa_session(&user);
+        let (_, a) = app
+            .call("POST", "/api/devices/challenge", Some(&token), None)
+            .await;
+        let (_, b) = app
+            .call("POST", "/api/devices/challenge", Some(&token), None)
+            .await;
+        let a = device_registration(&device_key(), a["challenge"].as_str().unwrap(), "a");
+        let b = device_registration(&device_key(), b["challenge"].as_str().unwrap(), "b");
+        let (a, b) = tokio::join!(
+            app.call("POST", "/api/devices", Some(&token), Some(a)),
+            app.call("POST", "/api/devices", Some(&token), Some(b)),
+        );
+        assert_eq!(a.0, StatusCode::CREATED, "{:?}", a.1);
+        assert_eq!(b.0, StatusCode::CREATED, "{:?}", b.1);
+        let devices = app.state.db.get_devices_by_user(user.id).await.unwrap();
+        assert_eq!(devices.iter().filter(|d| d.status == "approved").count(), 1);
+        assert_eq!(devices.iter().filter(|d| d.status == "pending").count(), 1);
+    })
+    .await;
+}
+
+type TestSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn open_socket(address: std::net::SocketAddr, token: &str) -> TestSocket {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = format!("ws://{address}/ws").into_client_request().unwrap();
+    req.headers_mut()
+        .insert("x-cpmesh-protocol", "2".parse().unwrap());
+    req.headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    tokio_tungstenite::connect_async(req).await.unwrap().0
+}
+
+async fn socket_message(socket: &mut TestSocket, kind: &str) -> Value {
+    use futures_util::StreamExt;
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let message = socket.next().await.expect("socket closed").unwrap();
+            if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                let value: Value = serde_json::from_str(&text).unwrap();
+                if value["type"] == kind {
+                    return value["payload"].clone();
+                }
+            }
+        }
+    })
+    .await
+    .expect("message deadline")
+}
+
+async fn socket_closed(socket: &mut TestSocket) {
+    use futures_util::StreamExt;
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while let Some(message) = socket.next().await {
+            if matches!(
+                message,
+                Ok(tokio_tungstenite::tungstenite::Message::Close(_)) | Err(_)
+            ) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("revoked socket remained open");
+}
+
+#[tokio::test]
+async fn live_sockets_acknowledge_commit_reconcile_ids_and_stop_after_revocation() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    with_app(Options::default(), |app| async move {
+        let user = app.member("live-relay").await;
+        let a = app.state.db.create_device(user.id, "A", &[4; 65], None, "approved", None).await.unwrap();
+        let b = app.state.db.create_device(user.id, "B", &[4; 65], None, "approved", None).await.unwrap();
+        app.state.db.rotate_group_key(user.id, a.id, 0, 1, &[(a.id, vec![1; 60]), (b.id, vec![2; 60])], 24).await.unwrap();
+        let grant = SessionGrant::signed_in(user.id, true);
+        let (a_access, stolen_refresh) = app.state.auth.issue_session(&grant.with_device(Some(a.id))).unwrap();
+        let b_access = app.state.auth.issue_access(&grant.with_device(Some(b.id))).unwrap();
+        let web_access = app.state.auth.issue_access(&grant).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = app.router.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
+        });
+        let mut a_socket = open_socket(address, &a_access).await;
+        let mut b_socket = open_socket(address, &b_access).await;
+        let mut browser = open_socket(address, &web_access).await;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let payload = json!({
+            "request_id": request_id, "content_type": "text",
+            "encrypted_data": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [7; 48]),
+            "key_version": 1,
+        });
+        let push = json!({"type": "clipboard_push", "payload": payload});
+        a_socket.send(Message::Text(push.to_string().into())).await.unwrap();
+        let ack = socket_message(&mut a_socket, "clipboard_ack").await;
+        assert_eq!(ack["status"], "accepted");
+        assert_eq!(ack["request_id"], request_id);
+        let received = socket_message(&mut b_socket, "clipboard_new").await;
+        assert_eq!(received["entry"]["id"], ack["entry_id"]);
+        let metadata = socket_message(&mut browser, "clipboard_new").await;
+        assert_eq!(metadata["entry"]["encrypted_size"], 48);
+        assert!(metadata["entry"].get("encrypted_data").is_none());
+        a_socket.send(Message::Text(push.to_string().into())).await.unwrap();
+        let retry = socket_message(&mut a_socket, "clipboard_ack").await;
+        assert_eq!(retry["entry_id"], ack["entry_id"]);
+        assert_eq!(app.state.db.count_user_clipboard_entries(user.id).await.unwrap(), 1);
+        let (status, history) = app.call("GET", "/api/clipboard?metadata_only=true", Some(&web_access), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(history["entries"][0].get("encrypted_data").is_none());
+        let mut invalid = push.clone();
+        let invalid_id = uuid::Uuid::new_v4().to_string();
+        invalid["payload"]["request_id"] = json!(invalid_id);
+        invalid["payload"]["encrypted_data"] = json!("not base64");
+        a_socket.send(Message::Text(invalid.to_string().into())).await.unwrap();
+        let rejection = socket_message(&mut a_socket, "clipboard_ack").await;
+        assert_eq!(rejection["request_id"], invalid_id);
+        assert_eq!(rejection["code"], "invalid_payload");
+        sqlx::query("ALTER TABLE clipboard_entries ADD CONSTRAINT fail_clipboard_test CHECK (key_version <> 1) NOT VALID")
+            .execute(&app.state.db.pool).await.unwrap();
+        let mut failed = push.clone();
+        failed["payload"]["request_id"] = json!(uuid::Uuid::new_v4());
+        a_socket.send(Message::Text(failed.to_string().into())).await.unwrap();
+        assert_eq!(socket_message(&mut a_socket, "clipboard_ack").await["code"], "temporarily_unavailable");
+        sqlx::query("ALTER TABLE clipboard_entries DROP CONSTRAINT fail_clipboard_test")
+            .execute(&app.state.db.pool).await.unwrap();
+        app.state.db.clear_clipboard_history(user.id).await.unwrap();
+        a_socket.send(Message::Text(push.to_string().into())).await.unwrap();
+        assert_eq!(socket_message(&mut a_socket, "clipboard_ack").await["entry_id"], ack["entry_id"]);
+        assert_eq!(app.state.db.count_user_clipboard_entries(user.id).await.unwrap(), 0, "retries must not resurrect deleted history");
+
+        let (status, _) = app.call("DELETE", &format!("/api/devices/{}", b.id), Some(&web_access), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        socket_closed(&mut b_socket).await;
+        assert!(!app.state.hub.is_device_online(&user.id.to_string(), &b.id.to_string()).await);
+        let mut stale = push.clone();
+        stale["payload"]["request_id"] = json!(uuid::Uuid::new_v4());
+        a_socket.send(Message::Text(stale.to_string().into())).await.unwrap();
+        assert_eq!(socket_message(&mut a_socket, "clipboard_ack").await["code"], "rotation_required");
+        app.state.db.rotate_group_key(user.id, a.id, 1, 2, &[(a.id, vec![3; 60])], 24).await.unwrap();
+        stale["payload"]["key_version"] = json!(2);
+        a_socket.send(Message::Text(stale.to_string().into())).await.unwrap();
+        assert_eq!(socket_message(&mut a_socket, "clipboard_ack").await["status"], "accepted");
+
+        let (status, changed) = app.call("PUT", "/api/me/password", Some(&web_access),
+            Some(json!({"current_password": PASSWORD, "new_password": "Changed-Horse-7!"}))).await;
+        assert_eq!(status, StatusCode::OK, "{changed}");
+        assert_eq!(changed["reauth_required"], true);
+        socket_closed(&mut a_socket).await;
+        socket_closed(&mut browser).await;
+        assert_eq!(app.call("POST", "/api/auth/refresh", None, Some(json!({"refresh_token": stolen_refresh}))).await.0, StatusCode::UNAUTHORIZED);
+        // A refresh that was already in flight cannot mint its way past the cutoff.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let late_refresh = app.state.auth.issue_refresh(&grant).unwrap();
+        assert_eq!(app.call("POST", "/api/auth/refresh", None, Some(json!({"refresh_token": late_refresh}))).await.0, StatusCode::UNAUTHORIZED);
+        server.abort();
+        let _ = server.await;
+    }).await;
+}
+
 struct TestApp {
     router: Router,
     state: Arc<AppState>,

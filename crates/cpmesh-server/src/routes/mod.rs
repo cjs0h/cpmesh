@@ -166,6 +166,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // Protected routes accessible to ALL authenticated devices (including pending)
     let protected_any_device = Router::new()
         .route(
+            "/api/devices/challenge",
+            axum::routing::post(devices::handle_device_challenge),
+        )
+        .route(
             "/api/device-approvals/me",
             axum::routing::get(approval::handle_my_approval_status),
         )

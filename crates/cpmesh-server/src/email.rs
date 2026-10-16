@@ -46,7 +46,7 @@ impl EmailService {
     }
 
     /// Test SMTP connectivity by sending a test email to the given address.
-    pub fn test_connection(&self, to_email: &str) -> Result<(), String> {
+    pub async fn test_connection(&self, to_email: &str) -> Result<(), String> {
         if !self.is_configured() {
             return Err("SMTP not configured (host or from address missing)".to_string());
         }
@@ -56,10 +56,10 @@ impl EmailService {
 <h2 style="color: #6366f1;">cpmesh SMTP Test</h2>
 <p>If you receive this email, your SMTP configuration is working correctly.</p>
 </body></html>"#;
-        self.send_html(to_email, subject, body)
+        self.send_html(to_email, subject, body).await
     }
 
-    pub fn send_verification_email(
+    pub async fn send_verification_email(
         &self,
         to_email: &str,
         full_name: &str,
@@ -93,13 +93,15 @@ impl EmailService {
   <p style="color: #999; font-size: 12px;">If you didn't create an account, you can safely ignore this email.</p>
 </body>
 </html>"#,
-            full_name, verify_url, verify_url
+            escape_html(full_name),
+            verify_url,
+            verify_url
         );
 
-        self.send_html(to_email, subject, &body)
+        self.send_html(to_email, subject, &body).await
     }
 
-    pub fn send_duplicate_registration_notice(
+    pub async fn send_duplicate_registration_notice(
         &self,
         to_email: &str,
         name: &str,
@@ -125,14 +127,14 @@ impl EmailService {
   <p style="color: #999; font-size: 12px;">If you're concerned about unauthorized access, consider changing your password.</p>
 </body>
 </html>"#,
-            name
+            escape_html(name)
         );
-        self.send_html(to_email, subject, &body)
+        self.send_html(to_email, subject, &body).await
     }
 
     /// Sends the code that confirms an account before it sets up two-factor
     /// authentication. Unlike notices, this fails when SMTP is not configured.
-    pub fn send_mfa_email_code(
+    pub async fn send_mfa_email_code(
         &self,
         to_email: &str,
         name: &str,
@@ -159,10 +161,11 @@ impl EmailService {
             code = escape_html(code),
         );
         self.send_html(to_email, "Your cpmesh confirmation code", &body)
+            .await
     }
 
     /// Tells a user about a change to their account's security (2FA, sessions, status).
-    pub fn send_security_notice(
+    pub async fn send_security_notice(
         &self,
         to_email: &str,
         name: &str,
@@ -188,9 +191,10 @@ impl EmailService {
             message = escape_html(message),
         );
         self.send_html(to_email, &format!("{subject} - cpmesh"), &body)
+            .await
     }
 
-    fn send_html(&self, to: &str, subject: &str, html_body: &str) -> Result<(), String> {
+    async fn send_html(&self, to: &str, subject: &str, html_body: &str) -> Result<(), String> {
         use lettre::message::header::ContentType;
         use lettre::transport::smtp::authentication::Credentials;
         use lettre::{Message, SmtpTransport, Transport};
@@ -214,22 +218,29 @@ impl EmailService {
                 .map_err(|e| format!("SMTP relay: {e}"))?
                 .port(self.port)
                 .credentials(creds)
+                .timeout(Some(std::time::Duration::from_secs(20)))
                 .build()
         } else if self.use_tls {
             SmtpTransport::starttls_relay(&self.host)
                 .map_err(|e| format!("SMTP STARTTLS: {e}"))?
                 .port(self.port)
                 .credentials(creds)
+                .timeout(Some(std::time::Duration::from_secs(20)))
                 .build()
         } else {
             SmtpTransport::builder_dangerous(&self.host)
                 .port(self.port)
                 .credentials(creds)
+                .timeout(Some(std::time::Duration::from_secs(20)))
                 .build()
         };
 
-        mailer.send(&email).map_err(|e| format!("SMTP send: {e}"))?;
-        info!("Email \"{subject}\" sent to {to}");
+        crate::blocking::run(crate::blocking::Work::Mail, move || {
+            mailer.send(&email).map_err(|e| format!("SMTP send: {e}"))?;
+            Ok(())
+        })
+        .await?;
+        info!("Email \"{subject}\" sent");
         Ok(())
     }
 }
@@ -306,31 +317,36 @@ mod tests {
         assert_eq!(service_from(&[("SMTP_PORT", "not-a-port")]).port, 587);
     }
 
-    #[test]
-    fn sending_without_configuration_is_a_silent_noop() {
+    #[tokio::test]
+    async fn sending_without_configuration_is_a_noop() {
         let svc = EmailService::disabled();
         svc.send_verification_email("a@example.com", "Alice", "tok")
+            .await
             .unwrap();
         svc.send_duplicate_registration_notice("a@example.com", "Alice")
+            .await
             .unwrap();
     }
 
-    #[test]
-    fn test_connection_without_configuration_is_an_error() {
+    #[tokio::test]
+    async fn test_connection_without_configuration_is_an_error() {
         let err = EmailService::disabled()
             .test_connection("a@example.com")
+            .await
             .unwrap_err();
         assert!(err.contains("not configured"), "{err}");
     }
 
-    #[test]
-    fn security_emails_without_configuration() {
+    #[tokio::test]
+    async fn security_emails_without_configuration() {
         let svc = EmailService::disabled();
         // Notices are best effort; the confirmation code must not silently vanish
         svc.send_security_notice("a@example.com", "Alice", "Subject", "Body")
+            .await
             .unwrap();
         assert!(
             svc.send_mfa_email_code("a@example.com", "Alice", "123456")
+                .await
                 .unwrap_err()
                 .contains("not configured")
         );
@@ -345,14 +361,15 @@ mod tests {
         assert_eq!(escape_html("plain"), "plain");
     }
 
-    #[test]
-    fn invalid_addresses_fail_before_any_network_io() {
+    #[tokio::test]
+    async fn invalid_addresses_fail_before_any_network_io() {
         let svc = service_from(&[
             ("SMTP_HOST", "smtp.invalid"),
             ("SMTP_FROM", "definitely not an address"),
         ]);
         let err = svc
             .send_verification_email("a@example.com", "Alice", "tok")
+            .await
             .unwrap_err();
         assert!(err.starts_with("invalid from"), "{err}");
 
@@ -362,6 +379,7 @@ mod tests {
         ]);
         let err = svc
             .send_duplicate_registration_notice("<<not valid>>", "Alice")
+            .await
             .unwrap_err();
         assert!(err.starts_with("invalid to"), "{err}");
     }

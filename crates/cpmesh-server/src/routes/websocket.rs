@@ -23,7 +23,7 @@ use super::middleware::{
     require_approved_device,
 };
 use crate::AppState;
-use crate::ws::Client;
+use crate::ws::{Client, QUEUE_CAPACITY, QueuedMessage};
 use cpmesh_proto::models::*;
 
 /// How long a WebSocket ticket can be redeemed after it is issued.
@@ -31,6 +31,9 @@ const TICKET_TTL: Duration = Duration::from_secs(10);
 
 /// Most WebSocket connections (devices and browser tabs) one user may hold.
 const MAX_CONNECTIONS_PER_USER: usize = 10;
+const MAX_WIRE_BYTES: usize =
+    (MAX_FILE_BYTES + ENCRYPTION_OVERHEAD).div_ceil(3) * 4 + MAX_METADATA_BYTES * 2 + 4096;
+const SEND_DEADLINE: Duration = Duration::from_secs(5);
 
 // WS ticket store (short-lived, single-use)
 static TICKETS: LazyLock<Mutex<HashMap<String, WsTicket>>> =
@@ -146,8 +149,29 @@ pub async fn handle_ws_upgrade(
     ws: WebSocketUpgrade,
 ) -> Response {
     let user_id = claims.user_id;
+    if claims.device_id.is_some()
+        && headers
+            .get("x-cpmesh-protocol")
+            .and_then(|value| value.to_str().ok())
+            != Some(PROTOCOL_VERSION)
+    {
+        return json_error(
+            "update your client: WebSocket protocol 2 is required",
+            StatusCode::UPGRADE_REQUIRED,
+        );
+    }
 
-    if state.hub.user_connection_count(&user_id.to_string()).await >= MAX_CONNECTIONS_PER_USER {
+    let replacing = if let Some(id) = claims.device_id {
+        state
+            .hub
+            .is_device_online(&user_id.to_string(), &id.to_string())
+            .await
+    } else {
+        false
+    };
+    if !replacing
+        && state.hub.user_connection_count(&user_id.to_string()).await >= MAX_CONNECTIONS_PER_USER
+    {
         return json_error(
             "too many concurrent connections",
             StatusCode::TOO_MANY_REQUESTS,
@@ -181,17 +205,26 @@ pub async fn handle_ws_upgrade(
         None => Peer::Browser,
     };
 
-    ws.on_upgrade(move |socket| handle_ws_connection(socket, state, user_id, peer))
+    let mut response = ws
+        .max_message_size(MAX_WIRE_BYTES)
+        .max_frame_size(MAX_WIRE_BYTES)
+        .on_upgrade(move |socket| handle_ws_connection(socket, state, claims, peer));
+    response.headers_mut().insert(
+        "x-cpmesh-protocol",
+        axum::http::HeaderValue::from_static(PROTOCOL_VERSION),
+    );
+    response
 }
 
 async fn handle_ws_connection(
     socket: WebSocket,
     state: Arc<AppState>,
-    user_id: uuid::Uuid,
+    claims: AuthClaims,
     peer: Peer,
 ) {
+    let user_id = claims.user_id;
     let (mut ws_tx, mut ws_rx) = socket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let (tx, mut rx) = mpsc::channel::<Arc<QueuedMessage>>(QUEUE_CAPACITY);
 
     let uid = user_id.to_string();
     let conn_id = uuid::Uuid::new_v4();
@@ -201,8 +234,8 @@ async fn handle_ws_connection(
         Peer::Browser => (format!("web-{conn_id}"), String::new(), None),
     };
 
-    let kick = Arc::new(tokio::sync::Notify::new());
-    state
+    let kick = tokio_util::sync::CancellationToken::new();
+    let registered = state
         .hub
         .register(Client {
             user_id: uid.clone(),
@@ -214,7 +247,17 @@ async fn handle_ws_connection(
             kick: kick.clone(),
         })
         .await;
-    crate::audit::record_activity(&state, user_id);
+    if !registered {
+        return;
+    }
+    // Close the authentication/upgrade race with deletion, suspension and revocation.
+    if check_session(&state, &claims).await.is_err()
+        || require_approved_device(&state, &claims).await.is_err()
+    {
+        state.hub.disconnect_device(&uid, &hub_id).await;
+        return;
+    }
+    crate::audit::record_activity(&state, user_id).await;
 
     // Prompt a device to rotate the group key when rotation is due
     if device_id.is_some()
@@ -225,18 +268,41 @@ async fn handle_ws_connection(
             payload: json!({"reason": "rotation_due"}),
         })
         .unwrap_or_default();
-        let _ = tx.send(rotation_msg);
+        let _ = tx.try_send(QueuedMessage::control(rotation_msg));
     }
 
     // Write pump: forward messages from hub to WebSocket, then close the socket once
     // every sender is gone (the hub dropped this client and the read pump finished)
+    let writer_kick = kick.clone();
     let mut write_handle = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if ws_tx.send(Message::Text(msg.into())).await.is_err() {
-                return;
+        let mut in_flight = None;
+        loop {
+            tokio::select! {
+                biased;
+                _ = writer_kick.cancelled() => break,
+                msg = rx.recv() => {
+                    let Some(msg) = msg else { break; };
+                    in_flight = Some(msg.clone());
+                    tokio::select! {
+                        biased;
+                        _ = writer_kick.cancelled() => break,
+                        result = tokio::time::timeout(SEND_DEADLINE, ws_tx.send(Message::Text(msg.text.clone()))) => {
+                            if !matches!(result, Ok(Ok(()))) {
+                                writer_kick.cancel();
+                                break;
+                            }
+                            in_flight = None;
+                        }
+                    }
+                }
             }
         }
-        let _ = ws_tx.send(Message::Close(None)).await;
+        let _ =
+            tokio::time::timeout(Duration::from_secs(1), ws_tx.send(Message::Close(None))).await;
+        // A partial frame can retain its bytes while closing; account for them
+        // until the sink, not merely its send future, has been dropped.
+        drop(ws_tx);
+        drop(in_flight);
     });
 
     // Read pump: handle messages from WebSocket until the client leaves or is kicked
@@ -247,7 +313,7 @@ async fn handle_ws_connection(
                 Some(Ok(msg)) => msg,
                 _ => break,
             },
-            _ = kick.notified() => {
+            _ = kick.cancelled() => {
                 kicked = true;
                 break;
             }
@@ -260,11 +326,37 @@ async fn handle_ws_connection(
                 match ws_msg.msg_type.as_str() {
                     // Only devices push clipboard entries; browser sessions hold no keys
                     MSG_CLIPBOARD_PUSH => {
-                        if let Some(device_id) = device_id
-                            && let Ok(payload) =
-                                serde_json::from_value::<ClipboardPushPayload>(ws_msg.payload)
+                        let request_id = ws_msg
+                            .payload
+                            .get("request_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .chars()
+                            .take(64)
+                            .collect::<String>();
+                        let ack = if let Err(code) = validate_push_wire(&ws_msg.payload) {
+                            rejected(&request_id, code)
+                        } else if let Some(device_id) = device_id {
+                            match serde_json::from_value::<ClipboardPushPayload>(ws_msg.payload) {
+                                Ok(payload) => {
+                                    handle_clipboard_push(&state, &claims, device_id, payload).await
+                                }
+                                Err(_) => rejected(&request_id, "invalid_payload"),
+                            }
+                        } else {
+                            rejected(&request_id, "device_required")
+                        };
+                        let response = WsMessage {
+                            msg_type: MSG_CLIPBOARD_ACK.into(),
+                            payload: json!(ack),
+                        };
+                        if tx
+                            .try_send(QueuedMessage::control(
+                                serde_json::to_string(&response).expect("serializable ack"),
+                            ))
+                            .is_err()
                         {
-                            handle_clipboard_push(&state, user_id, device_id, payload).await;
+                            kick.cancel();
                         }
                     }
                     MSG_PING => {
@@ -273,7 +365,9 @@ async fn handle_ws_connection(
                             payload: json!({}),
                         })
                         .unwrap_or_default();
-                        let _ = tx.send(pong);
+                        if tx.try_send(QueuedMessage::control(pong)).is_err() {
+                            kick.cancel();
+                        }
                     }
                     _ => {}
                 }
@@ -284,6 +378,7 @@ async fn handle_ws_connection(
     }
 
     // Cleanup
+    state.hub.remove(&uid, &hub_id, conn_id).await;
     if kicked {
         // Let the write pump flush and send a close frame before the socket drops
         drop(tx);
@@ -294,57 +389,67 @@ async fn handle_ws_connection(
             write_handle.abort();
         }
     } else {
-        state.hub.remove(&uid, &hub_id, conn_id).await;
         write_handle.abort();
     }
 }
 
 async fn handle_clipboard_push(
     state: &Arc<AppState>,
-    user_id: uuid::Uuid,
+    claims: &AuthClaims,
     device_id: uuid::Uuid,
     payload: ClipboardPushPayload,
-) {
-    // Enforce subscription limits
-    if let Ok(sub) = state.db.get_user_subscription(user_id).await {
-        // Check allowed file types
-        if !sub.allowed_file_types.is_empty() {
-            let ct = payload.content_type.to_string();
-            if !sub.allowed_file_types.contains(&ct) {
-                warn!("File type {} not allowed for user {}", ct, user_id);
-                return;
-            }
-        }
-        // Check clipboard history limit
-        if let Some(max_history) = sub.max_clipboard_history
-            && max_history > 0
-            && let Ok(count) = state.db.count_user_clipboard_entries(user_id).await
-            && count >= max_history as i64
-        {
-            let _ = state
-                .db
-                .delete_oldest_clipboard_entries(user_id, count - max_history as i64 + 1)
-                .await;
-        }
+) -> ClipboardAck {
+    let user_id = claims.user_id;
+    let request_id = match payload.request_id.as_deref() {
+        Some(id) => match uuid::Uuid::parse_str(id) {
+            Ok(id) => id,
+            Err(_) => return rejected(id, "invalid_request_id"),
+        },
+        None => return rejected("", "request_id_required"),
+    };
+    let id = request_id.to_string();
+    if payload.encrypted_data.len()
+        > content_size_limit(&payload.content_type) + ENCRYPTION_OVERHEAD
+        || payload.encrypted_data.len() < ENCRYPTION_OVERHEAD
+    {
+        return rejected(&id, "payload_size");
     }
-
-    let content_type = payload.content_type.to_string();
-    let metadata = payload.metadata.unwrap_or_default();
-    let key_version = payload.key_version;
+    let sub = match state.db.get_user_subscription(user_id).await {
+        Ok(sub) => sub,
+        Err(e) => {
+            warn!(%user_id, "Failed to read clipboard limits: {e}");
+            return rejected(&id, "temporarily_unavailable");
+        }
+    };
+    if !sub.allowed_file_types.is_empty()
+        && !sub
+            .allowed_file_types
+            .contains(&payload.content_type.to_string())
+    {
+        return rejected(&id, "content_type_not_allowed");
+    }
 
     match state
         .db
-        .create_clipboard_entry(
+        .persist_clipboard_push(
             user_id,
             device_id,
-            &content_type,
-            &payload.encrypted_data,
-            &metadata,
-            key_version,
+            request_id,
+            &payload,
+            sub.max_clipboard_history,
+            claims.session_started_at(),
         )
         .await
     {
-        Ok(entry) => {
+        Ok(crate::db::ClipboardWrite::Accepted { entry, inserted }) => {
+            let ack = ClipboardAck::Accepted {
+                request_id: id,
+                entry_id: entry.id.to_string(),
+                created_at: entry.created_at,
+            };
+            if !inserted {
+                return ack;
+            }
             let broadcast = WsMessage {
                 msg_type: MSG_CLIPBOARD_NEW.to_string(),
                 payload: json!({
@@ -354,6 +459,7 @@ async fn handle_clipboard_push(
                         "device_id": entry.device_id.to_string(),
                         "device_name": "",
                         "content_type": entry.content_type,
+                        "encrypted_size": entry.encrypted_data.len(),
                         "encrypted_data": base64::engine::general_purpose::STANDARD.encode(&entry.encrypted_data),
                         "metadata": entry.metadata.unwrap_or_default(),
                         "created_at": entry.created_at.to_rfc3339(),
@@ -365,9 +471,81 @@ async fn handle_clipboard_push(
                 .hub
                 .broadcast_to_user(&user_id.to_string(), &device_id.to_string(), &broadcast)
                 .await;
+            ack
         }
+        Ok(crate::db::ClipboardWrite::Replay {
+            entry_id,
+            created_at,
+        }) => ClipboardAck::Accepted {
+            request_id: id,
+            entry_id: entry_id.to_string(),
+            created_at,
+        },
+        Ok(crate::db::ClipboardWrite::Rejected(code)) => rejected(&id, code),
         Err(e) => {
             warn!("Failed to save clipboard entry: {e}");
+            rejected(&id, "temporarily_unavailable")
         }
+    }
+}
+
+fn rejected(request_id: &str, code: &str) -> ClipboardAck {
+    ClipboardAck::Rejected {
+        request_id: request_id.to_string(),
+        code: code.to_string(),
+        message: if code == "temporarily_unavailable" {
+            "Persistence could not be confirmed; retry the same request_id".into()
+        } else {
+            format!("Clipboard was not accepted: {code}")
+        },
+    }
+}
+
+fn validate_push_wire(value: &serde_json::Value) -> Result<(), &'static str> {
+    let Some(request_id) = value.get("request_id").and_then(|value| value.as_str()) else {
+        return Err("request_id_required");
+    };
+    if uuid::Uuid::parse_str(request_id).is_err() {
+        return Err("invalid_request_id");
+    }
+    let content_type = match value.get("content_type").and_then(|v| v.as_str()) {
+        Some("text") => ContentType::Text,
+        Some("image") => ContentType::Image,
+        Some("file") => ContentType::File,
+        _ => return Err("invalid_content_type"),
+    };
+    let limit = (content_size_limit(&content_type) + ENCRYPTION_OVERHEAD).div_ceil(3) * 4;
+    if value
+        .get("encrypted_data")
+        .and_then(|v| v.as_str())
+        .is_none_or(|s| s.len() > limit)
+        || value
+            .get("metadata")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.len() > MAX_METADATA_BYTES)
+    {
+        return Err("payload_size");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod payload_tests {
+    use super::*;
+
+    #[test]
+    fn enforces_content_and_metadata_limits_before_base64_decoding() {
+        let limit = (content_size_limit(&ContentType::Text) + ENCRYPTION_OVERHEAD).div_ceil(3) * 4;
+        let mut payload = json!({"request_id": uuid::Uuid::new_v4(), "content_type": "text", "encrypted_data": "A".repeat(limit)});
+        assert!(validate_push_wire(&payload).is_ok());
+        payload["encrypted_data"] = json!("A".repeat(limit + 1));
+        assert_eq!(validate_push_wire(&payload), Err("payload_size"));
+        payload["encrypted_data"] = json!("AA==");
+        payload["metadata"] = json!("A".repeat(MAX_METADATA_BYTES + 1));
+        assert_eq!(validate_push_wire(&payload), Err("payload_size"));
+        payload["request_id"] = json!("x".repeat(1000));
+        assert_eq!(validate_push_wire(&payload), Err("invalid_request_id"));
+        assert_eq!(content_size_limit(&ContentType::Image), 10 * 1024 * 1024);
+        assert_eq!(content_size_limit(&ContentType::File), 25 * 1024 * 1024);
     }
 }

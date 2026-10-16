@@ -208,21 +208,16 @@ pub async fn handle_send_email_code(
         return internal(e);
     }
     let name = mfa::user_display_name(&state, &user);
-    let mailer = state.clone();
-    let to = email.clone();
-    let sent =
-        tokio::task::spawn_blocking(move || mailer.email.send_mfa_email_code(&to, &name, &code))
-            .await;
+    let sent = state.email.send_mfa_email_code(&email, &name, &code).await;
     match sent {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
+        Ok(()) => {}
+        Err(e) => {
             tracing::warn!("Failed to email confirmation code: {e}");
             return json_error(
                 "could not send the email; try again later",
                 StatusCode::BAD_GATEWAY,
             );
         }
-        Err(e) => return internal(e),
     }
 
     audit::record(
@@ -232,7 +227,8 @@ pub async fn handle_send_email_code(
         AUDIT_MFA_EMAIL_CODE_SENT,
         &meta,
         json!({}),
-    );
+    )
+    .await;
     json_response(
         StatusCode::OK,
         json!({ "sent": true, "email_hint": codes::mask_email(&email) }),
@@ -400,13 +396,15 @@ pub async fn handle_totp_enable(
         AUDIT_MFA_TOTP_ENABLE,
         &meta,
         json!({}),
-    );
+    )
+    .await;
     mfa::notify(
         &state,
         &user,
         "Two-factor authentication changed",
         "An authenticator app was set up for two-factor authentication on your account.".into(),
-    );
+    )
+    .await;
     finish_enrollment(&state, &principal, &user, "totp", &meta, json!({})).await
 }
 
@@ -558,7 +556,8 @@ pub async fn handle_passkey_register(
         AUDIT_MFA_PASSKEY_ADD,
         &meta,
         json!({ "passkey_id": stored.id, "name": stored.name }),
-    );
+    )
+    .await;
     mfa::notify(
         &state,
         &user,
@@ -567,7 +566,8 @@ pub async fn handle_passkey_register(
             "A passkey named \"{}\" was added to your account.",
             stored.name
         ),
-    );
+    )
+    .await;
     finish_enrollment(
         &state,
         &principal,
@@ -651,8 +651,9 @@ async fn finish_enrollment(
                 AUDIT_LOGIN_OK,
                 meta,
                 json!({ "mfa": method, "enrolled": true }),
-            );
-            audit::record_activity(state, user.id);
+            )
+            .await;
+            audit::record_activity(state, user.id).await;
             SessionGrant::signed_in(user.id, true)
         }
         MfaPrincipal::Session(claims) => SessionGrant {
@@ -789,7 +790,8 @@ pub async fn handle_verify(
                 AUDIT_MFA_FAIL,
                 &meta,
                 json!({ "method": factor.method() }),
-            );
+            )
+            .await;
             return invalid_code(&reason);
         }
         Err(VerifyError::Locked) => {
@@ -800,7 +802,8 @@ pub async fn handle_verify(
                 AUDIT_MFA_LOCKED,
                 &meta,
                 json!({ "method": factor.method() }),
-            );
+            )
+            .await;
             return json_error_code(
                 "mfa_locked",
                 "Too many failed attempts. Try again in 15 minutes.",
@@ -827,7 +830,8 @@ pub async fn handle_verify(
             AUDIT_MFA_RECOVERY_USED,
             &meta,
             json!({ "remaining": remaining }),
-        );
+        )
+        .await;
         mfa::notify(
             &state,
             &user,
@@ -835,7 +839,7 @@ pub async fn handle_verify(
             format!(
                 "A recovery code was used to sign in to your account. {remaining} unused codes remain."
             ),
-        );
+        ).await;
     }
 
     let grant = match &principal {
@@ -861,8 +865,9 @@ pub async fn handle_verify(
                 AUDIT_LOGIN_OK,
                 &meta,
                 json!({ "mfa": factor.method() }),
-            );
-            audit::record_activity(&state, user.id);
+            )
+            .await;
+            audit::record_activity(&state, user.id).await;
             SessionGrant::signed_in(user.id, true)
         }
         MfaPrincipal::Session(claims) => {
@@ -873,7 +878,8 @@ pub async fn handle_verify(
                 AUDIT_MFA_STEP_UP,
                 &meta,
                 json!({ "method": factor.method() }),
-            );
+            )
+            .await;
             SessionGrant {
                 mfa: true,
                 auth_time: crate::routes::auth_service::now_epoch(),
@@ -914,7 +920,19 @@ async fn password_step_up(
         Err(e) => return internal(e),
     }
     let password = password.unwrap_or_default();
-    if user.password.is_empty() || !state.auth.check_password(&user.password, password) {
+    let password_ok = if user.password.is_empty() {
+        false
+    } else {
+        match state
+            .auth
+            .check_password_async(&user.password, password)
+            .await
+        {
+            Ok(ok) => ok,
+            Err(e) => return internal(e),
+        }
+    };
+    if !password_ok {
         audit::record(
             state,
             Some(user.id),
@@ -922,7 +940,8 @@ async fn password_step_up(
             AUDIT_LOGIN_FAIL,
             meta,
             json!({ "step_up": true }),
-        );
+        )
+        .await;
         return json_error_code(
             "invalid_password",
             "incorrect password",
@@ -1008,13 +1027,15 @@ pub async fn handle_totp_disable(
         AUDIT_MFA_TOTP_DISABLE,
         &meta,
         json!({}),
-    );
+    )
+    .await;
     mfa::notify(
         &state,
         &user,
         "Two-factor authentication changed",
         "The authenticator app was removed from your account's two-factor authentication.".into(),
-    );
+    )
+    .await;
     json_response(
         StatusCode::OK,
         json!({ "message": "authenticator app removed" }),
@@ -1050,13 +1071,15 @@ pub async fn handle_passkey_delete(
         AUDIT_MFA_PASSKEY_REMOVE,
         &meta,
         json!({ "passkey_id": id }),
-    );
+    )
+    .await;
     mfa::notify(
         &state,
         &user,
         "Two-factor authentication changed",
         "A passkey was removed from your account.".into(),
-    );
+    )
+    .await;
     json_response(StatusCode::OK, json!({ "message": "passkey removed" }))
 }
 
@@ -1088,7 +1111,8 @@ pub async fn handle_regenerate_recovery_codes(
                 AUDIT_MFA_RECOVERY_REGENERATE,
                 &meta,
                 json!({}),
-            );
+            )
+            .await;
             json_response(StatusCode::OK, json!({ "recovery_codes": codes }))
         }
         Err(e) => internal(e),

@@ -9,6 +9,34 @@ use cpmesh_proto::models::*;
 use serde_json::json;
 
 #[test]
+fn membership_transcripts_reject_ambiguous_hashes_and_identity_aliases() {
+    let id = "00000000-0000-4000-8000-000000000001";
+    let peer = "00000000-0000-4000-8000-000000000002";
+    let members = vec![
+        DeviceIdentity {
+            id: id.into(),
+            public_key: vec![4; 65],
+        },
+        DeviceIdentity {
+            id: peer.into(),
+            public_key: vec![4; 65],
+        },
+    ];
+    let mut hashes = std::collections::BTreeMap::from([
+        (id.to_string(), "0".repeat(64)),
+        (peer.to_string(), "1".repeat(64)),
+    ]);
+    assert!(membership_transcript(1, id, &members, &hashes).is_ok());
+    hashes.insert(
+        peer.to_string(),
+        format!("{}\nforged:member", "1".repeat(64)),
+    );
+    assert!(membership_transcript(1, id, &members, &hashes).is_err());
+    assert!(!canonical_device_id(&format!("urn:uuid:{id}")));
+    assert!(!canonical_device_id("AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"));
+}
+
+#[test]
 fn message_type_constants_are_stable() {
     assert_eq!(MSG_CLIPBOARD_PUSH, "clipboard_push");
     assert_eq!(MSG_CLIPBOARD_NEW, "clipboard_new");
@@ -112,6 +140,7 @@ fn ws_message_envelope_uses_type_key_and_default_payload() {
 #[test]
 fn clipboard_push_payload_wire_format() {
     let payload = ClipboardPushPayload {
+        request_id: None,
         content_type: ContentType::Text,
         encrypted_data: vec![0xde, 0xad, 0xbe, 0xef],
         metadata: Some("bWV0YQ==".into()),
@@ -133,6 +162,7 @@ fn clipboard_push_payload_wire_format() {
 
     // metadata: None is omitted entirely
     let json = serde_json::to_value(ClipboardPushPayload {
+        request_id: None,
         content_type: ContentType::File,
         encrypted_data: vec![],
         metadata: None,
@@ -263,6 +293,7 @@ fn auth_response_user_id_optional() {
 #[test]
 fn register_device_request_binary_fields() {
     let req = RegisterDeviceRequest {
+        proof: None,
         name: "Laptop".into(),
         public_key: vec![4, 1, 2],
         public_key_sig: Some(vec![0x30, 0x44]),
@@ -345,8 +376,10 @@ fn group_key_response_defaults() {
 fn group_keys_response_and_rotate_request() {
     let due = Utc.with_ymd_and_hms(2026, 2, 3, 4, 5, 6).unwrap();
     let resp = GroupKeysResponse {
+        rotation_required: false,
         current_version: 2,
         keys: vec![VersionedGroupKey {
+            membership: None,
             version: 2,
             encrypted_key: vec![9],
             from_device_id: "d".into(),
@@ -379,6 +412,7 @@ fn group_keys_response_and_rotate_request() {
 fn approval_types_roundtrip() {
     let expires = Utc.with_ymd_and_hms(2026, 1, 1, 0, 10, 0).unwrap();
     let session = ApprovalSessionResponse {
+        pairing_version: 2,
         session_id: "s".into(),
         pending_device_id: "p".into(),
         pending_public_key: vec![4],
@@ -397,7 +431,7 @@ fn approval_types_roundtrip() {
     assert!(status.approver_public_key.is_none());
     assert!(status.session_id.is_none());
     let json = serde_json::to_value(&status).unwrap();
-    assert_eq!(json, json!({"status":"pending"}));
+    assert_eq!(json, json!({"status":"pending","pairing_version":0}));
 
     let approve: ApproveDeviceRequest = serde_json::from_value(json!({
         "session_id":"s","expected_current_version":1,"new_version":2,"wrapped_keys":[]

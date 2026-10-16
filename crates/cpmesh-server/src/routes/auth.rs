@@ -21,8 +21,7 @@ use crate::models::*;
 
 const MAX_PASSWORD_LENGTH: usize = 128;
 
-/// Fire-and-forget audit log write (non-blocking).
-fn audit_log_fire(
+async fn audit_log_fire(
     pool: &PgPool,
     user_id: Option<uuid::Uuid>,
     action: &'static str,
@@ -34,8 +33,7 @@ fn audit_log_fire(
     let ip = ip.to_string();
     let ua = user_agent.map(String::from);
     let details = details.clone();
-    tokio::spawn(async move {
-        let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
             "INSERT INTO audit_logs (user_id, action, ip_address, user_agent, details) VALUES ($1, $2, $3, $4, $5)"
         )
         .bind(user_id)
@@ -44,8 +42,9 @@ fn audit_log_fire(
         .bind(ua.as_deref())
         .bind(&details)
         .execute(&pool)
-        .await;
-    });
+        .await {
+            warn!(action, "Failed to persist audit entry: {e}");
+        }
 }
 
 // =============================================================================
@@ -322,7 +321,7 @@ pub async fn handle_register(
     }
 
     // Always hash the password first for timing normalization (Argon2 dominates response time)
-    let hash = match state.auth.hash_password(&req.password) {
+    let hash = match state.auth.hash_password_async(&req.password).await {
         Ok(h) => h,
         Err(_) => return json_error("internal error", StatusCode::INTERNAL_SERVER_ERROR),
     };
@@ -344,9 +343,13 @@ pub async fn handle_register(
         .is_ok()
     {
         // Email already registered — send a notice but don't reveal this to the caller
-        let _ = state
+        if let Err(e) = state
             .email
-            .send_duplicate_registration_notice(&email, &full_name);
+            .send_duplicate_registration_notice(&email, &full_name)
+            .await
+        {
+            warn!("Failed to send duplicate registration notice: {e}");
+        }
         return generic_ok();
     }
 
@@ -390,6 +393,7 @@ pub async fn handle_register(
         && let Err(e) = state
             .email
             .send_verification_email(&email, &full_name, &token)
+            .await
     {
         warn!("Failed to send verification email: {e}");
     }
@@ -405,7 +409,8 @@ pub async fn handle_register(
         &ip.to_string(),
         ua,
         &json!({"username": username}),
-    );
+    )
+    .await;
 
     generic_ok()
 }
@@ -450,12 +455,25 @@ pub async fn handle_login(
                 &ip_str,
                 ua.as_deref(),
                 &json!({"identifier": identifier}),
-            );
+            )
+            .await;
             return json_error("invalid credentials", StatusCode::UNAUTHORIZED);
         }
     };
 
-    if !state.auth.check_password(&user.password, &req.password) {
+    let password_ok = if user.password.is_empty() {
+        false
+    } else {
+        match state
+            .auth
+            .check_password_async(&user.password, &req.password)
+            .await
+        {
+            Ok(ok) => ok,
+            Err(e) => return super::middleware::ApiError::internal(e).into_response(),
+        }
+    };
+    if !password_ok {
         audit_log_fire(
             &state.db.pool,
             Some(user.id),
@@ -463,7 +481,8 @@ pub async fn handle_login(
             &ip_str,
             ua.as_deref(),
             &json!({}),
-        );
+        )
+        .await;
         return json_error("invalid credentials", StatusCode::UNAUTHORIZED);
     }
 
@@ -487,7 +506,8 @@ pub async fn handle_login(
             &ip_str,
             ua.as_deref(),
             &json!({"reason": "suspended"}),
-        );
+        )
+        .await;
         return json_error_code(
             "account_suspended",
             "This account is suspended. Contact your administrator.",
@@ -507,7 +527,8 @@ pub async fn handle_login(
                 &ip_str,
                 ua.as_deref(),
                 &json!({"stage": body["stage"]}),
-            );
+            )
+            .await;
             return json_response(StatusCode::FORBIDDEN, body);
         }
         Err(e) => {
@@ -531,8 +552,9 @@ pub async fn handle_login(
         &ip_str,
         ua.as_deref(),
         &json!({}),
-    );
-    crate::audit::record_activity(&state, user.id);
+    )
+    .await;
+    crate::audit::record_activity(&state, user.id).await;
 
     json_response(
         StatusCode::OK,
@@ -547,8 +569,7 @@ pub async fn handle_login(
 #[derive(Deserialize)]
 pub struct RefreshBody {
     pub refresh_token: String,
-    /// Binds a user-level session to one of the user's devices. Binding is one-way:
-    /// tokens refreshed from a device-bound token stay bound to that device.
+    /// Optional assertion of the existing binding, never a way to select a device.
     #[serde(default)]
     pub device_id: Option<uuid::Uuid>,
 }
@@ -572,7 +593,7 @@ pub async fn handle_refresh(
         Ok(user) => {
             if let Some(revoked_before) = user.tokens_revoked_before
                 && revoked_before > 0
-                && (claims.iat as i64) < revoked_before
+                && (claims.session_started_at() as i64) < revoked_before
             {
                 return json_error(
                     "session has been revoked, please log in again",
@@ -602,7 +623,13 @@ pub async fn handle_refresh(
             );
         }
         (Some(bound), _) => Some(bound),
-        (None, requested) => requested,
+        (None, Some(_)) => {
+            return json_error(
+                "device proof required; reconnect using device registration",
+                StatusCode::UNAUTHORIZED,
+            );
+        }
+        (None, None) => None,
     };
 
     // A device-bound session ends when its device is removed, rejected or revoked.
@@ -650,6 +677,7 @@ pub async fn handle_refresh(
                 .db
                 .revoke_all_user_tokens(claims.user_id, crate::routes::auth_service::now_epoch())
                 .await;
+            state.hub.disconnect_user(&claims.user_id.to_string()).await;
             audit_log_fire(
                 &state.db.pool,
                 Some(claims.user_id),
@@ -657,7 +685,8 @@ pub async fn handle_refresh(
                 "unknown",
                 None,
                 &json!({"reason": "refresh_token_reuse"}),
-            );
+            )
+            .await;
             return json_error(
                 "session compromised, all sessions revoked — please log in again",
                 StatusCode::UNAUTHORIZED,
@@ -678,7 +707,7 @@ pub async fn handle_refresh(
         Ok(tokens) => tokens,
         Err(_) => return json_error("internal error", StatusCode::INTERNAL_SERVER_ERROR),
     };
-    crate::audit::record_activity(&state, claims.user_id);
+    crate::audit::record_activity(&state, claims.user_id).await;
 
     json_response(
         StatusCode::OK,
@@ -815,9 +844,13 @@ pub async fn handle_resend_verification(
         } else {
             user.full_name
         };
-        let _ = state
+        if let Err(e) = state
             .email
-            .send_verification_email(&decrypted_email, &decrypted_name, &token);
+            .send_verification_email(&decrypted_email, &decrypted_name, &token)
+            .await
+        {
+            warn!("Failed to resend verification email: {e}");
+        }
     }
 
     json_response(StatusCode::OK, generic)
@@ -1007,6 +1040,12 @@ pub async fn handle_social_callback(
 
     // Decode state parameter — may be plain CSRF token (web) or base64 JSON (native)
     let cookie_state = extract_cookie(&headers, "cpmesh_oidc_state");
+    if cookie_state.as_deref().is_none_or(str::is_empty)
+        || query.state.as_deref().is_none_or(str::is_empty)
+    {
+        let redirect = format!("{}?social_error=invalid+state+parameter", frontend_login);
+        return Redirect::to(&redirect).into_response();
+    }
     let mut client_redirect: Option<String> = None;
     let mut code_challenge: Option<String> = None;
 
@@ -1390,7 +1429,7 @@ pub async fn handle_social_callback(
                 .into_response();
         }
     };
-    crate::audit::record_activity(&state, user.id);
+    crate::audit::record_activity(&state, user.id).await;
 
     // Redirect: native client (PKCE) or web client
     if let (Some(cr), Some(cc)) = (client_redirect, code_challenge) {
@@ -1580,12 +1619,10 @@ fn generate_random_string(len: usize) -> String {
 }
 
 pub async fn handle_list_active_plans(State(state): State<Arc<AppState>>) -> Response {
-    let plans = state
-        .db
-        .list_active_subscription_plans()
-        .await
-        .unwrap_or_default();
-    json_response(StatusCode::OK, plans)
+    match state.db.list_active_subscription_plans().await {
+        Ok(plans) => json_response(StatusCode::OK, plans),
+        Err(e) => super::middleware::ApiError::internal(e).into_response(),
+    }
 }
 
 #[cfg(test)]

@@ -217,6 +217,27 @@ pub struct DeviceGroupKey {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, FromRow)]
+pub struct DeviceGroupKeyWithSender {
+    pub version: i32,
+    pub encrypted_key: Vec<u8>,
+    pub from_device_id: uuid::Uuid,
+    pub from_public_key: Vec<u8>,
+    pub from_public_key_sig: Option<Vec<u8>>,
+    pub membership: Option<sqlx::types::Json<cpmesh_proto::models::KeyMembership>>,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+pub struct ClipboardMetadata {
+    pub id: uuid::Uuid,
+    pub device_id: uuid::Uuid,
+    pub device_name: String,
+    pub content_type: String,
+    pub encrypted_size: i32,
+    pub created_at: DateTime<Utc>,
+    pub key_version: i32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct AuditLog {
     pub id: uuid::Uuid,

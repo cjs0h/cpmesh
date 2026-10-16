@@ -16,6 +16,22 @@ use cpmesh_proto::models as proto;
 
 const MAX_DEVICES_PER_USER: usize = 10;
 
+pub async fn handle_device_challenge(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<AuthClaims>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let Some(token) = super::middleware::bearer_token(&headers) else {
+        return json_error("missing session", StatusCode::UNAUTHORIZED);
+    };
+    match state.auth.issue_device_challenge(claims.user_id, &token) {
+        Ok(challenge) => {
+            json_response(StatusCode::OK, proto::DeviceChallengeResponse { challenge })
+        }
+        Err(e) => super::middleware::ApiError::internal(e).into_response(),
+    }
+}
+
 pub async fn handle_register_device(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<AuthClaims>,
@@ -23,16 +39,46 @@ pub async fn handle_register_device(
     headers: axum::http::HeaderMap,
     axum::Json(req): axum::Json<proto::RegisterDeviceRequest>,
 ) -> Response {
-    if req.name.is_empty() || req.public_key.is_empty() {
-        return json_error("name and public_key required", StatusCode::BAD_REQUEST);
-    }
-
-    // Verify public_key_sig if provided
-    if req.public_key_sig.is_none() {
+    if req.name.is_empty() || req.name.len() > 255 || req.public_key.len() != 65 {
         return json_error(
-            "public_key_sig is required for device registration",
+            "valid name and P-256 public_key required",
             StatusCode::BAD_REQUEST,
         );
+    }
+
+    let Some(proof) = &req.proof else {
+        return json_error(
+            "update your client: session-bound device proof is required",
+            StatusCode::UPGRADE_REQUIRED,
+        );
+    };
+    let Some(token) = super::middleware::bearer_token(&headers) else {
+        return json_error("missing session", StatusCode::UNAUTHORIZED);
+    };
+    let (jti, exp) =
+        match state
+            .auth
+            .validate_device_challenge(&proof.challenge, claims.user_id, &token)
+        {
+            Ok(proof) => proof,
+            Err(_) => return json_error("invalid device challenge", StatusCode::UNAUTHORIZED),
+        };
+    if aws_lc_rs::signature::UnparsedPublicKey::new(
+        &aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1,
+        &req.public_key,
+    )
+    .verify(
+        &proto::device_proof_transcript(&proof.challenge),
+        &proof.signature,
+    )
+    .is_err()
+    {
+        return json_error("invalid device proof", StatusCode::UNAUTHORIZED);
+    }
+    match state.auth.consume_once(&jti, claims.user_id, exp).await {
+        Ok(true) => {}
+        Ok(false) => return json_error("device challenge already used", StatusCode::UNAUTHORIZED),
+        Err(e) => return super::middleware::ApiError::internal(e).into_response(),
     }
 
     let existing = match state.db.get_devices_by_user(claims.user_id).await {
@@ -45,106 +91,40 @@ pub async fn handle_register_device(
         }
     };
 
-    // Check if this device already exists by fingerprint
-    if let Some(ref fp) = req.fingerprint
-        && let Ok(Some(existing_device)) =
-            state.db.get_device_by_fingerprint(claims.user_id, fp).await
-    {
-        let is_same_keys = existing_device.public_key == req.public_key;
-
-        if is_same_keys {
-            // Same device, same keys — simple reconnect: return existing device + new token
-            let access_token = match state.auth.issue_access(
-                &SessionGrant::from_claims(&claims).with_device(Some(existing_device.id)),
-            ) {
-                Ok(t) => t,
-                Err(_) => {
-                    return json_error("internal error", StatusCode::INTERNAL_SERVER_ERROR);
-                }
-            };
-            return json_response(
-                StatusCode::OK,
-                json!({
-                    "device": {
-                        "id": existing_device.id.to_string(),
-                        "status": existing_device.status,
-                        "is_reregistration": false,
-                    },
-                    "access_token": access_token,
-                }),
+    // A fingerprint is only a lookup hint, never an authorization credential.
+    if let Some(device) = existing.iter().find(|d| {
+        d.public_key == req.public_key
+            || req
+                .fingerprint
+                .as_ref()
+                .is_some_and(|fp| d.fingerprint.as_ref() == Some(fp))
+    }) {
+        if device.public_key != req.public_key {
+            return json_error(
+                "device keys changed; remove the old device and pair the replacement",
+                StatusCode::CONFLICT,
             );
         }
-
-        // Same device, different keys (reinstall) — re-register
-        // If this is the user's only device, auto-approve to prevent deadlock
-        let status = if existing.len() <= 1 {
-            "approved"
-        } else {
-            "pending"
-        };
-
-        let device = match state
-            .db
-            .reregister_device(
-                existing_device.id,
-                &req.name,
-                &req.public_key,
-                req.public_key_sig.as_deref(),
-                status,
-            )
-            .await
-        {
-            Ok(d) => d,
-            Err(_) => {
-                return json_error(
-                    "failed to re-register device",
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                );
-            }
-        };
-
-        let access_token = match state
+        if device.status == "revoked" || device.status == "rejected" {
+            return json_error("device is revoked or rejected", StatusCode::FORBIDDEN);
+        }
+        let (access_token, refresh_token) = match state
             .auth
-            .issue_access(&SessionGrant::from_claims(&claims).with_device(Some(device.id)))
+            .issue_session(&SessionGrant::from_claims(&claims).with_device(Some(device.id)))
         {
-            Ok(t) => t,
-            Err(_) => return json_error("internal error", StatusCode::INTERNAL_SERVER_ERROR),
+            Ok(tokens) => tokens,
+            Err(e) => return super::middleware::ApiError::internal(e).into_response(),
         };
-
-        // Audit log for re-registration
-        let ip = extract_client_ip(&headers, &addr, state.config.trust_proxy_headers);
-        let ua = headers
-            .get(axum::http::header::USER_AGENT)
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-        let pool = state.db.pool.clone();
-        let uid = claims.user_id;
-        let dev_id = device.id;
-        let dev_name = device.name.clone();
-        let dev_status = device.status.clone();
-        let ip_str = ip.to_string();
-        tokio::spawn(async move {
-            let _ = sqlx::query(
-                    "INSERT INTO audit_logs (user_id, action, ip_address, user_agent, details) VALUES ($1, $2, $3, $4, $5)"
-                )
-                .bind(Some(uid))
-                .bind(AUDIT_DEVICE_REGISTER)
-                .bind(&ip_str)
-                .bind(ua.as_deref())
-                .bind(json!({"device_id": dev_id.to_string(), "device_name": dev_name, "status": dev_status, "is_reregistration": true}))
-                .execute(&pool)
-                .await;
-        });
-
         return json_response(
             StatusCode::OK,
             json!({
                 "device": {
                     "id": device.id.to_string(),
                     "status": device.status,
-                    "is_reregistration": true,
+                    "is_reregistration": false,
                 },
                 "access_token": access_token,
+                "refresh_token": refresh_token,
             }),
         );
     }
@@ -152,7 +132,7 @@ pub async fn handle_register_device(
     // New device registration (no fingerprint match)
     let max_devices = match state.db.get_user_subscription(claims.user_id).await {
         Ok(sub) => sub.max_devices.unwrap_or(MAX_DEVICES_PER_USER as i32) as usize,
-        Err(_) => MAX_DEVICES_PER_USER,
+        Err(e) => return super::middleware::ApiError::internal(e).into_response(),
     };
 
     if existing.len() >= max_devices {
@@ -162,26 +142,19 @@ pub async fn handle_register_device(
         );
     }
 
-    // First device auto-approves; subsequent devices are pending
-    let status = if existing.is_empty() {
-        "approved"
-    } else {
-        "pending"
-    };
-
     let device = match state
         .db
-        .create_device(
-            claims.user_id,
-            &req.name,
-            &req.public_key,
-            req.public_key_sig.as_deref(),
-            status,
-            req.fingerprint.as_deref(),
-        )
+        .register_device(claims.user_id, &req, max_devices as i64)
         .await
     {
-        Ok(d) => d,
+        Ok(Some(d)) => d,
+        Ok(None) => return json_error("maximum number of devices reached", StatusCode::CONFLICT),
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+            return json_error(
+                "device registration changed; retry with a fresh proof",
+                StatusCode::CONFLICT,
+            );
+        }
         Err(_) => {
             return json_error(
                 "failed to register device",
@@ -190,9 +163,9 @@ pub async fn handle_register_device(
         }
     };
 
-    let access_token = match state
+    let (access_token, refresh_token) = match state
         .auth
-        .issue_access(&SessionGrant::from_claims(&claims).with_device(Some(device.id)))
+        .issue_session(&SessionGrant::from_claims(&claims).with_device(Some(device.id)))
     {
         Ok(t) => t,
         Err(_) => return json_error("internal error", StatusCode::INTERNAL_SERVER_ERROR),
@@ -210,8 +183,7 @@ pub async fn handle_register_device(
     let dev_name = device.name.clone();
     let dev_status = device.status.clone();
     let ip_str = ip.to_string();
-    tokio::spawn(async move {
-        let _ = sqlx::query(
+    if let Err(error) = sqlx::query(
             "INSERT INTO audit_logs (user_id, action, ip_address, user_agent, details) VALUES ($1, $2, $3, $4, $5)"
         )
         .bind(Some(uid))
@@ -220,8 +192,7 @@ pub async fn handle_register_device(
         .bind(ua.as_deref())
         .bind(json!({"device_id": dev_id.to_string(), "device_name": dev_name, "status": dev_status}))
         .execute(&pool)
-        .await;
-    });
+        .await { tracing::warn!("Failed to persist audit entry: {error}"); }
 
     json_response(
         StatusCode::CREATED,
@@ -232,6 +203,7 @@ pub async fn handle_register_device(
                 "is_reregistration": false,
             },
             "access_token": access_token,
+            "refresh_token": refresh_token,
         }),
     )
 }
@@ -270,12 +242,13 @@ pub async fn handle_delete_device(
     Path(device_id): Path<uuid::Uuid>,
 ) -> Response {
     // Check if this was an approved device (for rotation trigger)
-    let was_approved = state
-        .db
-        .get_device_by_id(device_id)
-        .await
-        .map(|d| d.status == "approved")
-        .unwrap_or(false);
+    let was_approved = match state.db.get_device_by_id(device_id).await {
+        Ok(d) if d.user_id == claims.user_id => d.status == "approved",
+        Ok(_) | Err(sqlx::Error::RowNotFound) => {
+            return json_error("device not found", StatusCode::NOT_FOUND);
+        }
+        Err(e) => return super::middleware::ApiError::internal(e).into_response(),
+    };
 
     if state
         .db
@@ -285,6 +258,11 @@ pub async fn handle_delete_device(
     {
         return json_error("device not found", StatusCode::NOT_FOUND);
     }
+
+    state
+        .hub
+        .disconnect_device(&claims.user_id.to_string(), &device_id.to_string())
+        .await;
 
     // If the deleted device was approved, trigger immediate key rotation
     if was_approved {
@@ -307,8 +285,7 @@ pub async fn handle_delete_device(
     let pool = state.db.pool.clone();
     let uid = claims.user_id;
     let ip_str = ip.to_string();
-    tokio::spawn(async move {
-        let _ = sqlx::query(
+    if let Err(error) = sqlx::query(
             "INSERT INTO audit_logs (user_id, action, ip_address, user_agent, details) VALUES ($1, $2, $3, $4, $5)"
         )
         .bind(Some(uid))
@@ -317,8 +294,7 @@ pub async fn handle_delete_device(
         .bind(ua.as_deref())
         .bind(json!({"device_id": device_id.to_string(), "was_approved": was_approved}))
         .execute(&pool)
-        .await;
-    });
+        .await { tracing::warn!("Failed to persist audit entry: {error}"); }
 
     StatusCode::NO_CONTENT.into_response()
 }
@@ -370,26 +346,24 @@ pub async fn handle_get_group_key(
     };
 
     // Try versioned keys first
-    let current_version = state
-        .db
-        .get_current_group_key_version(claims.user_id)
-        .await
-        .ok()
-        .flatten();
+    let current_version = match state.db.get_current_group_key_version(claims.user_id).await {
+        Ok(version) => version,
+        Err(e) => return super::middleware::ApiError::internal(e).into_response(),
+    };
 
     if let Some(ref ver) = current_version {
         // Use versioned key system
-        let device_key = match state.db.get_device_group_key(device_id, ver.version).await {
-            Ok(k) => k,
-            Err(_) => {
+        let device_key = match state
+            .db
+            .get_device_group_keys_since(device_id, ver.version - 1)
+            .await
+        {
+            Ok(mut keys) if !keys.is_empty() => keys.remove(0),
+            Ok(_) => {
                 return json_error("no group key found for this version", StatusCode::NOT_FOUND);
             }
-        };
-
-        let from_device = match state.db.get_device_by_id(device_key.from_device_id).await {
-            Ok(d) => d,
             Err(_) => {
-                return json_error("sender device not found", StatusCode::INTERNAL_SERVER_ERROR);
+                return json_error("no group key found for this version", StatusCode::NOT_FOUND);
             }
         };
 
@@ -398,8 +372,9 @@ pub async fn handle_get_group_key(
             proto::GroupKeyResponse {
                 encrypted_key: device_key.encrypted_key,
                 from_device_id: device_key.from_device_id.to_string(),
-                from_public_key: from_device.public_key,
-                from_public_key_sig: from_device.public_key_sig,
+                from_public_key: device_key.from_public_key,
+                from_public_key_sig: device_key.from_public_key_sig,
+                membership: device_key.membership.map(|m| m.0),
                 version: ver.version,
                 rotation_due_at: ver.rotation_due_at,
             },
@@ -424,6 +399,7 @@ pub async fn handle_get_group_key(
             from_device_id: row.from_device_id.to_string(),
             from_public_key: from_device.public_key,
             from_public_key_sig: from_device.public_key_sig,
+            membership: None,
             version: 1,
             rotation_due_at: None,
         },
@@ -431,7 +407,7 @@ pub async fn handle_get_group_key(
 }
 
 pub async fn handle_store_group_keys(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Extension(claims): Extension<AuthClaims>,
     axum::Json(req): axum::Json<Vec<proto::StoreGroupKeyEntry>>,
 ) -> Response {
@@ -440,75 +416,84 @@ pub async fn handle_store_group_keys(
         None => return json_error("device context required", StatusCode::BAD_REQUEST),
     };
 
-    // Verify all devices belong to this user
-    let devices = match state.db.get_devices_by_user(claims.user_id).await {
-        Ok(d) => d,
-        Err(_) => {
-            return json_error(
-                "failed to verify devices",
-                StatusCode::INTERNAL_SERVER_ERROR,
-            );
+    // Legacy distribution could overwrite arbitrary wraps without a membership transition.
+    // Only the new, authenticated rotation endpoint may change mesh keys.
+    let _ = req;
+    let _ = device_id;
+    json_error(
+        "update your client: use authenticated group-key rotation",
+        StatusCode::UPGRADE_REQUIRED,
+    )
+}
+
+pub(crate) fn validate_memberships(
+    devices: &[crate::models::Device],
+    sender_id: uuid::Uuid,
+    version: i32,
+    keys: &[proto::StoreGroupKeyEntry],
+) -> Result<(), super::middleware::ApiError> {
+    use super::middleware::ApiError;
+    let bad = || ApiError::new(StatusCode::BAD_REQUEST, "invalid key membership");
+    let sender = devices.iter().find(|d| d.id == sender_id).ok_or_else(bad)?;
+    if version < 1 || keys.len() != devices.len() {
+        return Err(bad());
+    }
+    let proofs: Vec<_> = keys
+        .iter()
+        .filter_map(|key| key.membership.as_ref())
+        .collect();
+    let membership = match proofs.as_slice() {
+        [membership] => *membership,
+        [] => {
+            return Err(ApiError::new(
+                StatusCode::UPGRADE_REQUIRED,
+                "update your client: authenticated membership is required",
+            ));
         }
+        _ => return Err(bad()),
     };
-
-    let allowed: std::collections::HashSet<String> =
-        devices.iter().map(|d| d.id.to_string()).collect();
-
-    let mut keys = Vec::new();
-    for entry in &req {
-        if !allowed.contains(&entry.device_id) {
-            return json_error(
-                &format!("device {} does not belong to this account", entry.device_id),
-                StatusCode::FORBIDDEN,
-            );
+    if membership.members.len() != devices.len()
+        || membership.wrapped_key_hashes.len() != devices.len()
+    {
+        return Err(bad());
+    }
+    let expected: std::collections::HashMap<_, _> = devices
+        .iter()
+        .map(|device| (device.id.to_string(), device.public_key.as_slice()))
+        .collect();
+    let mut member_ids = std::collections::HashSet::new();
+    for member in &membership.members {
+        if !member_ids.insert(&member.id)
+            || expected.get(&member.id).copied() != Some(member.public_key.as_slice())
+        {
+            return Err(bad());
         }
-        let did = match uuid::Uuid::parse_str(&entry.device_id) {
-            Ok(d) => d,
-            Err(_) => return json_error("invalid device_id", StatusCode::BAD_REQUEST),
-        };
-        keys.push((did, entry.encrypted_key.clone()));
     }
-
-    // Store in both legacy and versioned tables for migration
-    if state.db.store_group_keys(device_id, &keys).await.is_err() {
-        return json_error(
-            "failed to store group keys",
-            StatusCode::INTERNAL_SERVER_ERROR,
-        );
+    let mut recipients = std::collections::HashSet::new();
+    for key in keys {
+        if !recipients.insert(&key.device_id)
+            || !expected.contains_key(&key.device_id)
+            || key.encrypted_key.len() != 60
+            || membership.wrapped_key_hashes.get(&key.device_id)
+                != Some(&proto::wrapped_key_hash(&key.encrypted_key))
+        {
+            return Err(bad());
+        }
     }
-
-    // Also create version 1 if no versioned keys exist yet
-    let current = state
-        .db
-        .get_current_group_key_version(claims.user_id)
-        .await
-        .ok()
-        .flatten();
-    if current.is_none() {
-        let _ = state
-            .db
-            .rotate_group_key(
-                claims.user_id,
-                device_id,
-                0,
-                1,
-                &keys,
-                state.config.group_key_rotation_interval_hours,
-            )
-            .await;
-    }
-
-    // Notify other devices
-    let msg = cpmesh_proto::models::WsMessage {
-        msg_type: cpmesh_proto::models::MSG_GROUP_KEY_UPDATED.to_string(),
-        payload: json!({"from_device_id": device_id.to_string()}),
-    };
-    state
-        .hub
-        .broadcast_to_user(&claims.user_id.to_string(), &device_id.to_string(), &msg)
-        .await;
-
-    json_response(StatusCode::OK, json!({"message": "group keys stored"}))
+    let transcript = proto::membership_transcript(
+        version,
+        &sender_id.to_string(),
+        &membership.members,
+        &membership.wrapped_key_hashes,
+    )
+    .map_err(|_| bad())?;
+    aws_lc_rs::signature::UnparsedPublicKey::new(
+        &aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1,
+        &sender.public_key,
+    )
+    .verify(&transcript, &membership.signature)
+    .map_err(|_| bad())?;
+    Ok(())
 }
 
 // === Versioned group key endpoints ===
@@ -551,26 +536,28 @@ pub async fn handle_get_current_group_keys(
         }
     };
 
-    let mut versioned_keys = Vec::new();
-    for dk in device_keys {
-        let from_device = state.db.get_device_by_id(dk.from_device_id).await.ok();
-        versioned_keys.push(proto::VersionedGroupKey {
+    let versioned_keys = device_keys
+        .into_iter()
+        .map(|dk| proto::VersionedGroupKey {
             version: dk.version,
             encrypted_key: dk.encrypted_key,
             from_device_id: dk.from_device_id.to_string(),
-            from_public_key: from_device
-                .as_ref()
-                .map(|d| d.public_key.clone())
-                .unwrap_or_default(),
-            from_public_key_sig: from_device.and_then(|d| d.public_key_sig),
-        });
-    }
+            from_public_key: dk.from_public_key,
+            from_public_key_sig: dk.from_public_key_sig,
+            membership: dk.membership.map(|m| m.0),
+        })
+        .collect();
+    let rotation_required = match state.db.rotation_required(claims.user_id).await {
+        Ok(required) => required,
+        Err(e) => return super::middleware::ApiError::internal(e).into_response(),
+    };
 
     json_response(
         StatusCode::OK,
         proto::GroupKeysResponse {
             current_version: current_version.version,
             keys: versioned_keys,
+            rotation_required,
             rotation_due_at: current_version.rotation_due_at,
         },
     )
@@ -611,25 +598,23 @@ pub async fn handle_rotate_group_key(
         }
     }
 
-    let mut keys = Vec::new();
-    for entry in &req.wrapped_keys {
-        let did = match uuid::Uuid::parse_str(&entry.device_id) {
-            Ok(d) => d,
-            Err(_) => return json_error("invalid device_id", StatusCode::BAD_REQUEST),
-        };
-        keys.push((did, entry.encrypted_key.clone()));
+    if let Err(error) =
+        validate_memberships(&approved, device_id, req.new_version, &req.wrapped_keys)
+    {
+        return error.into_response();
     }
 
     let success = match state
         .db
-        .rotate_group_key(
-            claims.user_id,
-            device_id,
-            req.expected_current_version,
-            req.new_version,
-            &keys,
-            state.config.group_key_rotation_interval_hours,
-        )
+        .commit_key_rotation(crate::db::KeyRotation {
+            user_id: claims.user_id,
+            from_device_id: device_id,
+            expected_current_version: req.expected_current_version,
+            new_version: req.new_version,
+            wrapped_keys: &req.wrapped_keys,
+            rotation_interval_hours: state.config.group_key_rotation_interval_hours,
+            approval: None,
+        })
         .await
     {
         Ok(s) => s,
@@ -667,8 +652,7 @@ pub async fn handle_rotate_group_key(
     let pool = state.db.pool.clone();
     let uid = claims.user_id;
     let ip_str = ip.to_string();
-    tokio::spawn(async move {
-        let _ = sqlx::query(
+    if let Err(error) = sqlx::query(
             "INSERT INTO audit_logs (user_id, action, ip_address, user_agent, details) VALUES ($1, $2, $3, $4, $5)"
         )
         .bind(Some(uid))
@@ -677,8 +661,7 @@ pub async fn handle_rotate_group_key(
         .bind(ua.as_deref())
         .bind(json!({"new_version": req.new_version, "device_id": device_id.to_string()}))
         .execute(&pool)
-        .await;
-    });
+        .await { tracing::warn!("Failed to persist audit entry: {error}"); }
 
     json_response(
         StatusCode::OK,

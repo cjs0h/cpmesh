@@ -33,6 +33,134 @@ fn pii() -> PiiService {
     PiiService::new(PII_MASTER_KEY, PII_HMAC_KEY).unwrap()
 }
 
+#[tokio::test]
+async fn failed_and_concurrent_release_switches_preserve_one_current_release() {
+    with_db(|db| async move {
+        let original = AppReleaseParams {
+            version: "1.0.0",
+            platform: "linux",
+            arch: "amd64",
+            download_url: "https://example.test/app",
+            release_notes: "",
+            is_current: true,
+        };
+        let published = db.create_app_release(&original).await.unwrap();
+        let too_long = "x".repeat(51);
+        let invalid = AppReleaseParams {
+            version: &too_long,
+            ..original
+        };
+        assert!(db.create_app_release(&invalid).await.is_err());
+        assert!(db.update_app_release(published.id, &invalid).await.is_err());
+        assert!(
+            db.update_app_release(uuid::Uuid::new_v4(), &original)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            db.get_current_release("linux", "amd64")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            published.id
+        );
+        let next = AppReleaseParams {
+            version: "2.0.0",
+            ..original
+        };
+        let competing = AppReleaseParams {
+            version: "3.0.0",
+            ..original
+        };
+        let (a, b) = tokio::join!(
+            db.create_app_release(&next),
+            db.create_app_release(&competing)
+        );
+        a.unwrap();
+        b.unwrap();
+        let releases = db.list_app_releases().await.unwrap();
+        assert_eq!(releases.iter().filter(|r| r.is_current).count(), 1);
+        assert_eq!(releases.len(), 3);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn approval_rotation_rolls_back_all_state_and_serializes_competing_versions() {
+    use cpmesh_proto::models::StoreGroupKeyEntry;
+    use cpmesh_server::db::KeyRotation;
+    with_db(|db| async move {
+        let user = make_user(&db, "atomic-approval", None).await;
+        let a = make_device(&db, &user, "A", "approved").await;
+        let b = make_device(&db, &user, "B", "pending").await;
+        db.rotate_group_key(user.id, a.id, 0, 1, &[(a.id, vec![1; 60])], 24)
+            .await
+            .unwrap();
+        let session = db.create_approval_session(b.id, a.id, 600).await.unwrap();
+        let wraps = vec![
+            StoreGroupKeyEntry {
+                device_id: a.id.to_string(),
+                encrypted_key: vec![2; 60],
+                membership: None,
+            },
+            StoreGroupKeyEntry {
+                device_id: b.id.to_string(),
+                encrypted_key: vec![3; 60],
+                membership: None,
+            },
+        ];
+        sqlx::query(
+            "ALTER TABLE device_group_keys ADD CONSTRAINT reject_test_version CHECK (version <> 2)",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let rotation = || KeyRotation {
+            user_id: user.id,
+            from_device_id: a.id,
+            expected_current_version: 1,
+            new_version: 2,
+            wrapped_keys: &wraps,
+            rotation_interval_hours: 24,
+            approval: Some((b.id, session.id)),
+        };
+        assert!(db.commit_key_rotation(rotation()).await.is_err());
+        assert_eq!(db.get_device_status(b.id).await.unwrap(), "pending");
+        assert!(db.get_approval_session(b.id).await.unwrap().is_some());
+        assert_eq!(
+            db.get_current_group_key_version(user.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            1
+        );
+        sqlx::query("ALTER TABLE device_group_keys DROP CONSTRAINT reject_test_version")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(db.commit_key_rotation(rotation()).await.unwrap());
+        assert_eq!(db.get_device_status(b.id).await.unwrap(), "approved");
+        assert!(db.get_approval_session(b.id).await.unwrap().is_none());
+        let keys = [(a.id, vec![4; 60]), (b.id, vec![5; 60])];
+        let (first, second) = tokio::join!(
+            db.rotate_group_key(user.id, a.id, 2, 3, &keys, 24),
+            db.rotate_group_key(user.id, b.id, 2, 3, &keys, 24),
+        );
+        assert_ne!(first.unwrap(), second.unwrap());
+        let current: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM group_key_versions WHERE user_id = $1 AND is_current",
+        )
+        .bind(user.id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(current, 1);
+    })
+    .await;
+}
+
 /// Runs `body` against a freshly migrated schema, then drops the schema even if the
 /// body panicked (the panic is re-raised afterwards so the test still fails).
 async fn with_db<F, Fut>(body: F)
@@ -742,8 +870,7 @@ async fn versioned_group_key_rotation_uses_compare_and_swap() {
                 .is_empty()
         );
 
-        // Removing a device cascades its own wrapped keys AND the keys it wrapped for
-        // other devices (they cannot be unwrapped without the sender's public key).
+        // Removing a device keeps historical sender identities with other devices' wraps.
         db.delete_device(a.id, user.id).await.unwrap();
         assert!(
             db.get_device_group_keys_since(a.id, 0)
@@ -752,9 +879,11 @@ async fn versioned_group_key_rotation_uses_compare_and_swap() {
                 .is_empty()
         );
         let b_keys = db.get_device_group_keys_since(b.id, 0).await.unwrap();
-        assert_eq!(b_keys.len(), 1, "v1 was wrapped by the deleted device");
-        assert_eq!(b_keys[0].version, 2);
-        assert_eq!(b_keys[0].from_device_id, b.id);
+        assert_eq!(b_keys.len(), 2);
+        assert_eq!(b_keys[0].version, 1);
+        assert_eq!(b_keys[0].from_public_key, a.public_key);
+        assert_eq!(b_keys[1].from_device_id, b.id);
+        assert!(db.rotation_required(user.id).await.unwrap());
     })
     .await;
 }
@@ -1583,7 +1712,7 @@ mod router {
     }
 
     #[tokio::test]
-    async fn refresh_binds_a_session_to_one_of_the_users_devices() {
+    async fn refresh_never_selects_a_device_without_possession_proof() {
         with_db(|db| async move {
             let (app, state) = app(&db);
             let user = make_user(&db, "yvonne", None).await;
@@ -1602,14 +1731,17 @@ mod router {
                     .unwrap()
             };
 
-            // Someone else's device, or a revoked one, is refused
-            for device_id in [foreign.id, revoked.id] {
+            // Even an approved device of this account cannot be selected by an unbound token.
+            for device_id in [device.id, foreign.id, revoked.id] {
                 let token = state.auth.generate_refresh_token(user.id, None).unwrap();
                 let (status, body) = call(&app, refresh_with(token, device_id)).await;
                 assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
             }
 
-            let token = state.auth.generate_refresh_token(user.id, None).unwrap();
+            let token = state
+                .auth
+                .generate_refresh_token(user.id, Some(device.id))
+                .unwrap();
             let (status, body) = call(&app, refresh_with(token, device.id)).await;
             assert_eq!(status, StatusCode::OK, "{body}");
             let access = state

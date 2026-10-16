@@ -69,7 +69,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 regex = "1"
 rust_decimal = "1"
 futures-util = "0.3"
-tokio-util = { version = "0.7", features = ["io"] }
+tokio-util = { version = "0.7", features = ["io", "rt"] }
 
 # Static file embedding
 rust-embed = "8"
@@ -79,3 +79,4 @@ mime_guess = "2"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
+tokio-tungstenite = "0.30"

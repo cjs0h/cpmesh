@@ -41,8 +41,9 @@ impl FromRequestParts<Arc<AppState>> for RequestMeta {
     }
 }
 
-/// Writes an audit entry in the background; failures never affect the request.
-pub fn record(
+/// Waits for audit persistence. A failed insert is observable without misreporting
+/// an already committed account change as having failed.
+pub async fn record(
     state: &AppState,
     actor: Option<uuid::Uuid>,
     target: Option<uuid::Uuid>,
@@ -50,30 +51,25 @@ pub fn record(
     meta: &RequestMeta,
     details: serde_json::Value,
 ) {
-    let pool = state.db.pool.clone();
-    let meta = meta.clone();
-    tokio::spawn(async move {
-        let db = crate::db::Db { pool };
-        if let Err(e) = db
-            .write_audit_entry(
-                actor,
-                target,
-                action,
-                Some(&meta.ip),
-                meta.user_agent.as_deref(),
-                &details,
-            )
-            .await
-        {
-            tracing::warn!("Failed to write audit entry {action}: {e}");
-        }
-    });
+    if let Err(e) = state
+        .db
+        .write_audit_entry(
+            actor,
+            target,
+            action,
+            Some(&meta.ip),
+            meta.user_agent.as_deref(),
+            &details,
+        )
+        .await
+    {
+        tracing::warn!("Failed to write audit entry {action}: {e}");
+    }
 }
 
 /// Notes in the background that `user_id` was active today.
-pub fn record_activity(state: &AppState, user_id: uuid::Uuid) {
-    let pool = state.db.pool.clone();
-    tokio::spawn(async move {
-        let _ = crate::db::Db { pool }.record_activity(user_id).await;
-    });
+pub async fn record_activity(state: &AppState, user_id: uuid::Uuid) {
+    if let Err(e) = state.db.record_activity(user_id).await {
+        tracing::warn!(%user_id, "Failed to record activity: {e}");
+    }
 }

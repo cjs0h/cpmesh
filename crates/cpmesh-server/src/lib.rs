@@ -4,6 +4,7 @@
 //! together; everything else lives here so it can be exercised by tests.
 
 pub mod audit;
+pub mod blocking;
 pub mod config;
 pub mod db;
 pub mod email;

@@ -208,7 +208,8 @@ pub async fn handle_admin_delete_user(
         AUDIT_ADMIN_DELETE_USER,
         &meta,
         json!({"deleted_user_id": user_id, "username": target.username, "role": target.role}),
-    );
+    )
+    .await;
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -254,7 +255,8 @@ pub async fn handle_admin_assign_subscription(
         AUDIT_ADMIN_ASSIGN_SUB,
         &meta,
         json!({"plan_id": plan_id, "plan_name": plan.name}),
-    );
+    )
+    .await;
     json_response(StatusCode::OK, json!({"message": "subscription assigned"}))
 }
 
@@ -283,7 +285,8 @@ pub async fn handle_admin_remove_subscription(
         AUDIT_ADMIN_REMOVE_SUB,
         &meta,
         json!({}),
-    );
+    )
+    .await;
     json_response(StatusCode::OK, json!({"message": "subscription removed"}))
 }
 
@@ -308,7 +311,8 @@ pub async fn handle_admin_verify_email(
         AUDIT_ADMIN_VERIFY_EMAIL,
         &meta,
         json!({}),
-    );
+    )
+    .await;
     json_response(StatusCode::OK, json!({"message": "email verified"}))
 }
 
@@ -341,20 +345,18 @@ pub async fn handle_admin_resend_verification(
         Err(e) => return internal(e),
     };
     let name = crate::mfa::user_display_name(&state, &target);
-    let mailer = state.clone();
-    let sent = tokio::task::spawn_blocking(move || {
-        mailer.email.send_verification_email(&email, &name, &token)
-    })
-    .await;
+    let sent = state
+        .email
+        .send_verification_email(&email, &name, &token)
+        .await;
     match sent {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
+        Ok(()) => {}
+        Err(e) => {
             return json_error(
                 &format!("could not send email: {e}"),
                 StatusCode::BAD_GATEWAY,
             );
         }
-        Err(e) => return internal(e),
     }
     audit::record(
         &state,
@@ -363,7 +365,8 @@ pub async fn handle_admin_resend_verification(
         AUDIT_ADMIN_RESEND_VERIFICATION,
         &meta,
         json!({}),
-    );
+    )
+    .await;
     json_response(
         StatusCode::OK,
         json!({"message": "verification email sent"}),
@@ -401,7 +404,8 @@ pub async fn handle_admin_suspend_user(
         AUDIT_ADMIN_SUSPEND,
         &meta,
         json!({"reason": reason}),
-    );
+    )
+    .await;
     json_response(StatusCode::OK, json!({"message": "user suspended"}))
 }
 
@@ -426,7 +430,8 @@ pub async fn handle_admin_unsuspend_user(
         AUDIT_ADMIN_UNSUSPEND,
         &meta,
         json!({}),
-    );
+    )
+    .await;
     json_response(StatusCode::OK, json!({"message": "user reinstated"}))
 }
 
@@ -449,7 +454,8 @@ pub async fn handle_admin_revoke_sessions(
         AUDIT_ADMIN_REVOKE_SESSIONS,
         &meta,
         json!({}),
-    );
+    )
+    .await;
     json_response(StatusCode::OK, json!({"message": "signed out everywhere"}))
 }
 
@@ -493,7 +499,8 @@ pub async fn handle_admin_set_role(
         AUDIT_ADMIN_SET_ROLE,
         &meta,
         json!({"from": target.role, "to": role.as_str()}),
-    );
+    )
+    .await;
     json_response(
         StatusCode::OK,
         json!({"message": "role updated", "role": role}),
@@ -528,13 +535,14 @@ pub async fn handle_admin_reset_mfa(
         AUDIT_ADMIN_RESET_MFA,
         &meta,
         json!({}),
-    );
+    )
+    .await;
     crate::mfa::notify(
         &state,
         &target,
         "Two-factor authentication was reset",
         "An administrator removed the two-factor authentication methods from your account and signed you out. You will set up a new method the next time you sign in.".into(),
-    );
+    ).await;
     json_response(
         StatusCode::OK,
         json!({"message": "two-factor authentication reset"}),
@@ -744,7 +752,8 @@ pub async fn handle_admin_create_plan(
                 AUDIT_ADMIN_PLAN_CREATE,
                 &meta,
                 json!({"plan_id": plan.id, "name": plan.name}),
-            );
+            )
+            .await;
             json_response(StatusCode::CREATED, plan)
         }
         Err(e) => internal(e),
@@ -776,7 +785,8 @@ pub async fn handle_admin_update_plan(
                 AUDIT_ADMIN_PLAN_UPDATE,
                 &meta,
                 json!({"plan_id": plan.id, "name": plan.name}),
-            );
+            )
+            .await;
             json_response(StatusCode::OK, plan)
         }
         Err(sqlx::Error::RowNotFound) => json_error("plan not found", StatusCode::NOT_FOUND),
@@ -800,7 +810,8 @@ pub async fn handle_admin_delete_plan(
                 AUDIT_ADMIN_PLAN_DELETE,
                 &meta,
                 json!({"plan_id": plan_id}),
-            );
+            )
+            .await;
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) if e == "plan not found" => json_error(&e, StatusCode::NOT_FOUND),
@@ -917,7 +928,8 @@ pub async fn handle_admin_create_download(
                     &ctx,
                     json!({"download_id": link.id, "name": link.name, "url": link.url}),
                 ),
-            );
+            )
+            .await;
             json_response(StatusCode::CREATED, link)
         }
         Err(e) => internal(e),
@@ -952,7 +964,8 @@ pub async fn handle_admin_update_download(
                     &ctx,
                     json!({"download_id": link.id, "name": link.name, "url": link.url}),
                 ),
-            );
+            )
+            .await;
             json_response(StatusCode::OK, link)
         }
         Err(sqlx::Error::RowNotFound) => {
@@ -978,7 +991,8 @@ pub async fn handle_admin_delete_download(
                 AUDIT_ADMIN_DOWNLOAD_DELETE,
                 &meta,
                 actor_details(&ctx, json!({"download_id": link_id})),
-            );
+            )
+            .await;
             StatusCode::NO_CONTENT.into_response()
         }
         Err(sqlx::Error::RowNotFound) => {
@@ -1321,7 +1335,8 @@ pub async fn handle_admin_upload_binary(
         AUDIT_ADMIN_UPLOAD,
         &meta,
         json!({"files": uploaded, "replace": replace}),
-    );
+    )
+    .await;
     json_response(StatusCode::OK, json!({ "uploaded": uploaded }))
 }
 
@@ -1354,10 +1369,15 @@ pub struct ReleaseBody {
 
 impl ReleaseBody {
     fn validate(&self, state: &AppState) -> Result<(), ApiError> {
-        if self.version.trim().is_empty() || self.download_url.trim().is_empty() {
+        if self.version.trim().is_empty()
+            || self.download_url.trim().is_empty()
+            || self.version.len() > 50
+            || self.platform.len() > 20
+            || self.arch.len() > 20
+        {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
-                "version and download_url are required",
+                "version and download_url are required; version/platform/arch limits are 50/20/20 bytes",
             ));
         }
         if !state.config.download_url_allowed(self.download_url.trim()) {
@@ -1398,7 +1418,7 @@ pub async fn handle_admin_create_release(
                     &ctx,
                     json!({"release_id": rel.id, "version": rel.version, "platform": rel.platform, "arch": rel.arch, "is_current": rel.is_current}),
                 ),
-            );
+            ).await;
             json_response(StatusCode::CREATED, rel)
         }
         Err(e) => internal(e),
@@ -1426,7 +1446,7 @@ pub async fn handle_admin_update_release(
                     &ctx,
                     json!({"release_id": rel.id, "version": rel.version, "platform": rel.platform, "arch": rel.arch, "is_current": rel.is_current}),
                 ),
-            );
+            ).await;
             json_response(StatusCode::OK, rel)
         }
         Err(sqlx::Error::RowNotFound) => json_error("release not found", StatusCode::NOT_FOUND),
@@ -1450,7 +1470,8 @@ pub async fn handle_admin_delete_release(
                 AUDIT_ADMIN_RELEASE_DELETE,
                 &meta,
                 actor_details(&ctx, json!({"release_id": release_id})),
-            );
+            )
+            .await;
             StatusCode::NO_CONTENT.into_response()
         }
         Err(sqlx::Error::RowNotFound) => json_error("release not found", StatusCode::NOT_FOUND),
@@ -1565,7 +1586,8 @@ pub async fn handle_admin_update_settings(
             AUDIT_ADMIN_SETTINGS_UPDATE,
             &meta,
             serde_json::Value::Object(changed),
-        );
+        )
+        .await;
     }
     handle_admin_get_settings(State(state), Extension(ctx)).await
 }
@@ -1588,14 +1610,15 @@ pub async fn handle_admin_test_smtp(
     if to.is_empty() {
         return json_error("to_email is required", StatusCode::BAD_REQUEST);
     }
-    let mailer = state.clone();
-    let recipient = to.clone();
-    let result =
-        tokio::task::spawn_blocking(move || mailer.email.test_connection(&recipient)).await;
+    let result = state.email.test_connection(&to).await;
+    let status = if result.is_ok() {
+        StatusCode::OK
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
     let outcome = match result {
-        Ok(Ok(())) => json!({"message": "Test email sent successfully."}),
-        Ok(Err(e)) => json!({"error": e}),
-        Err(e) => return internal(e),
+        Ok(()) => json!({"message": "Test email sent successfully."}),
+        Err(e) => json!({"error": e}),
     };
     audit::record(
         &state,
@@ -1604,8 +1627,9 @@ pub async fn handle_admin_test_smtp(
         AUDIT_ADMIN_TEST_SMTP,
         &meta,
         json!({"to": to, "ok": outcome.get("error").is_none()}),
-    );
-    json_response(StatusCode::OK, outcome)
+    )
+    .await;
+    json_response(status, outcome)
 }
 
 pub async fn handle_admin_test_oidc(
@@ -1622,7 +1646,8 @@ pub async fn handle_admin_test_oidc(
         AUDIT_ADMIN_TEST_OIDC,
         &meta,
         json!({"ok": outcome.get("error").is_none()}),
-    );
+    )
+    .await;
     json_response(StatusCode::OK, outcome)
 }
 
@@ -1751,7 +1776,8 @@ pub async fn handle_admin_create_api_token(
                 AUDIT_ADMIN_API_TOKEN_CREATE,
                 &meta,
                 json!({"token_id": record.id, "name": record.name, "scopes": scopes}),
-            );
+            )
+            .await;
             json_response(
                 StatusCode::CREATED,
                 json!({"token": token, "api_token": record}),
@@ -1777,7 +1803,8 @@ pub async fn handle_admin_revoke_api_token(
                 AUDIT_ADMIN_API_TOKEN_REVOKE,
                 &meta,
                 json!({"token_id": token_id}),
-            );
+            )
+            .await;
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(false) => json_error("API token not found", StatusCode::NOT_FOUND),

@@ -15,6 +15,8 @@ use crate::AppState;
 pub struct PaginationQuery {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    #[serde(default)]
+    pub metadata_only: bool,
 }
 
 pub async fn handle_get_clipboard_history(
@@ -25,9 +27,11 @@ pub async fn handle_get_clipboard_history(
     let mut limit = query.limit.unwrap_or(50).clamp(1, 100);
     let offset = query.offset.unwrap_or(0).max(0);
 
-    // Enforce subscription clipboard history limit
-    if let Ok(sub) = state.db.get_user_subscription(claims.user_id).await
-        && let Some(max_history) = sub.max_clipboard_history
+    let sub = match state.db.get_user_subscription(claims.user_id).await {
+        Ok(sub) => sub,
+        Err(e) => return super::middleware::ApiError::internal(e).into_response(),
+    };
+    if let Some(max_history) = sub.max_clipboard_history
         && max_history > 0
     {
         if offset >= max_history as i64 {
@@ -44,6 +48,27 @@ pub async fn handle_get_clipboard_history(
         }
     }
 
+    if query.metadata_only {
+        return match state
+            .db
+            .clipboard_metadata(claims.user_id, limit + 1, offset)
+            .await
+        {
+            Ok(mut entries) => {
+                let has_more = entries.len() as i64 > limit
+                    && sub
+                        .max_clipboard_history
+                        .filter(|n| *n > 0)
+                        .is_none_or(|max| offset + limit < i64::from(max));
+                entries.truncate(limit as usize);
+                json_response(
+                    StatusCode::OK,
+                    json!({"entries": entries, "has_more": has_more}),
+                )
+            }
+            Err(e) => super::middleware::ApiError::internal(e).into_response(),
+        };
+    }
     let entries = match state
         .db
         .get_clipboard_history(claims.user_id, limit + 1, offset)
@@ -53,7 +78,16 @@ pub async fn handle_get_clipboard_history(
         Err(_) => return json_error("failed to get history", StatusCode::INTERNAL_SERVER_ERROR),
     };
 
-    let has_more = entries.len() as i64 > limit;
+    let total = match state.db.count_user_clipboard_entries(claims.user_id).await {
+        Ok(total) => total.min(
+            sub.max_clipboard_history
+                .filter(|n| *n > 0)
+                .map(i64::from)
+                .unwrap_or(i64::MAX),
+        ),
+        Err(e) => return super::middleware::ApiError::internal(e).into_response(),
+    };
+    let has_more = total > offset + (entries.len() as i64).min(limit);
     let entries: Vec<_> = entries.into_iter().take(limit as usize).map(|e| {
         json!({
             "id": e.id.to_string(),

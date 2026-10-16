@@ -17,6 +17,10 @@ struct Claims {
     device_id: Option<String>,
     exp: u64,
     iat: u64,
+    /// Original session issuance, preserved by refresh and step-up. Unlike `iat`,
+    /// it cannot move past a password-change revocation while refresh is in flight.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    session_start: u64,
     jti: String,
     /// Token type: "access", "refresh", "mfa" (sign-in ticket) or "passkey" (ceremony).
     #[serde(default = "default_token_type")]
@@ -64,16 +68,19 @@ pub struct SessionGrant {
     pub device_id: Option<uuid::Uuid>,
     pub mfa: bool,
     pub auth_time: u64,
+    pub session_start: u64,
 }
 
 impl SessionGrant {
     /// A session for a sign-in completed now.
     pub fn signed_in(user_id: uuid::Uuid, mfa: bool) -> Self {
+        let now = now_secs();
         SessionGrant {
             user_id,
             device_id: None,
             mfa,
-            auth_time: now_secs(),
+            auth_time: now,
+            session_start: now,
         }
     }
 
@@ -84,6 +91,7 @@ impl SessionGrant {
             device_id: claims.device_id,
             mfa: claims.mfa,
             auth_time: claims.auth_time,
+            session_start: claims.session_started_at(),
         }
     }
 
@@ -255,6 +263,29 @@ impl AuthService {
             .is_ok()
     }
 
+    pub async fn hash_password_async(&self, password: &str) -> Result<String, String> {
+        let password = password.to_owned();
+        crate::blocking::run(crate::blocking::Work::Password, move || {
+            Argon2::default()
+                .hash_password(password.as_bytes())
+                .map(|hash| hash.to_string())
+                .map_err(|e| format!("hash password: {e}"))
+        })
+        .await
+    }
+
+    pub async fn check_password_async(&self, hash: &str, password: &str) -> Result<bool, String> {
+        let (hash, password) = (hash.to_owned(), password.to_owned());
+        crate::blocking::run(crate::blocking::Work::Password, move || {
+            let parsed = PasswordHash::new(&hash)
+                .map_err(|e| format!("invalid stored password hash: {e}"))?;
+            Ok(Argon2::default()
+                .verify_password(password.as_bytes(), &parsed)
+                .is_ok())
+        })
+        .await
+    }
+
     /// Issues an access token for a session that did not use a second factor.
     pub fn generate_access_token(
         &self,
@@ -287,11 +318,43 @@ impl AuthService {
         Ok((self.issue_access(grant)?, self.issue_refresh(grant)?))
     }
 
+    pub fn issue_device_challenge(
+        &self,
+        user_id: uuid::Uuid,
+        access_token: &str,
+    ) -> Result<String, String> {
+        use sha2::{Digest, Sha256};
+        self.sign(&Claims {
+            chal: Some(crate::mfa::webauthn::b64url(&Sha256::digest(
+                access_token.as_bytes(),
+            ))),
+            ..base_claims(user_id, "device-proof", Duration::from_secs(120))
+        })
+    }
+
+    pub fn validate_device_challenge(
+        &self,
+        challenge: &str,
+        user_id: uuid::Uuid,
+        access_token: &str,
+    ) -> Result<(String, u64), String> {
+        use sha2::{Digest, Sha256};
+        let claims = self.decode_typed(challenge, "device-proof")?;
+        let session_hash = crate::mfa::webauthn::b64url(&Sha256::digest(access_token.as_bytes()));
+        if claims.user_id != user_id.to_string()
+            || claims.chal.as_deref() != Some(session_hash.as_str())
+        {
+            return Err("device challenge belongs to another session".into());
+        }
+        Ok((claims.jti, claims.exp))
+    }
+
     fn session_claims(&self, grant: &SessionGrant, tt: &str, ttl: Duration) -> Claims {
         Claims {
             device_id: grant.device_id.map(|d| d.to_string()),
             mfa: grant.mfa,
             auth_time: grant.auth_time,
+            session_start: grant.session_start,
             ..base_claims(grant.user_id, tt, ttl)
         }
     }
@@ -467,6 +530,7 @@ impl AuthService {
                 .device_id
                 .and_then(|d| uuid::Uuid::parse_str(&d).ok()),
             iat: claims.iat,
+            session_start: claims.session_start,
             mfa: claims.mfa,
             auth_time: claims.auth_time,
         })
@@ -499,6 +563,7 @@ impl AuthService {
                 user_id,
                 device_id,
                 iat: claims.iat,
+                session_start: claims.session_start,
                 mfa: claims.mfa,
                 auth_time: claims.auth_time,
             },
@@ -850,6 +915,7 @@ mod tests {
             device_id: Some(uid()),
             mfa: true,
             auth_time: 1_700_000_000,
+            session_start: 1_700_000_000,
         };
         let (access, refresh) = svc.issue_session(&grant).unwrap();
         let claims = svc.validate_access_token(&access).unwrap();

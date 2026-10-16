@@ -27,6 +27,7 @@ pub struct AuthClaims {
     pub user_id: uuid::Uuid,
     pub device_id: Option<uuid::Uuid>,
     pub iat: u64,
+    pub session_start: u64,
     /// The session was established with a second factor.
     pub mfa: bool,
     /// When the user last signed in or confirmed a second factor (0 when unknown).
@@ -34,6 +35,14 @@ pub struct AuthClaims {
 }
 
 impl AuthClaims {
+    pub fn session_started_at(&self) -> u64 {
+        if self.session_start == 0 {
+            self.iat
+        } else {
+            self.session_start.min(self.iat)
+        }
+    }
+
     /// Whether the user signed in or confirmed their second factor within `window`.
     pub fn authenticated_within(&self, window: std::time::Duration) -> bool {
         self.auth_time > 0
@@ -150,7 +159,7 @@ pub(crate) async fn check_session(state: &AppState, claims: &AuthClaims) -> Resu
             // Check if token was issued before bulk revocation
             if let Some(revoked_before) = user.tokens_revoked_before
                 && revoked_before > 0
-                && (claims.iat as i64) < revoked_before
+                && (claims.session_started_at() as i64) < revoked_before
             {
                 return Err(Rejection::new(
                     StatusCode::UNAUTHORIZED,
@@ -523,7 +532,7 @@ pub async fn security_headers(req: Request, next: Next) -> Response {
 /// Reads the bearer token from the Authorization header. Tokens are never accepted
 /// from the query string, where they would end up in proxy and access logs; browser
 /// WebSockets use a single-use ticket instead (see `websocket::ws_auth_middleware`).
-fn bearer_token(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<String> {
     let auth = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     auth.strip_prefix("Bearer ").map(str::to_string)
 }

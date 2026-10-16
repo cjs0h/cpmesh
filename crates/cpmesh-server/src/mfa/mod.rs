@@ -410,8 +410,8 @@ pub async fn issue_recovery_codes(
     Ok(recovery)
 }
 
-/// Emails the account a security notice in the background (best effort).
-pub fn notify(state: &Arc<AppState>, user: &User, subject: &'static str, message: String) {
+/// Awaits bounded delivery of a best-effort security notice.
+pub async fn notify(state: &Arc<AppState>, user: &User, subject: &'static str, message: String) {
     if !state.email.is_configured() {
         return;
     }
@@ -420,15 +420,13 @@ pub fn notify(state: &Arc<AppState>, user: &User, subject: &'static str, message
         return;
     }
     let name = user_display_name(state, user);
-    let state = state.clone();
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = state
-            .email
-            .send_security_notice(&email, &name, subject, &message)
-        {
-            tracing::warn!("Failed to send security notice: {e}");
-        }
-    });
+    if let Err(e) = state
+        .email
+        .send_security_notice(&email, &name, subject, &message)
+        .await
+    {
+        tracing::warn!("Failed to send security notice: {e}");
+    }
 }
 
 fn now_secs() -> u64 {
