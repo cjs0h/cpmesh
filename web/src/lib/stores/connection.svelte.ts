@@ -1,4 +1,5 @@
 import { onWSStatus, type WSStatus } from '../ws';
+import { onSessionEnd } from '../auth';
 
 /** Reactive mirror of the WebSocket connection status for the UI. */
 export const connectionState: { status: WSStatus; lastEventAt: number | null } = $state({
@@ -14,3 +15,5 @@ onWSStatus((status) => {
 export function markActivity() {
   connectionState.lastEventAt = Date.now();
 }
+
+onSessionEnd(() => { connectionState.status = 'offline'; connectionState.lastEventAt = null; });

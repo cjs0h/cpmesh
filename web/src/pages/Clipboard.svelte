@@ -4,7 +4,7 @@
   import { connectionState } from '../lib/stores/connection.svelte';
   import { toast } from '../lib/stores/toast.svelte';
   import { createClock } from '../lib/clock.svelte';
-  import { absoluteTime, base64Size, contentTypeMeta, formatBytes, relativeTime, truncateMiddle } from '../lib/format';
+  import { absoluteTime, contentTypeMeta, formatBytes, relativeTime, truncateMiddle } from '../lib/format';
   import Icon from '../components/Icon.svelte';
   import Badge from '../components/ui/Badge.svelte';
   import Button from '../components/ui/Button.svelte';
@@ -14,6 +14,7 @@
   import IconTile from '../components/ui/IconTile.svelte';
   import Skeleton from '../components/ui/Skeleton.svelte';
   import CopyButton from '../components/ui/CopyButton.svelte';
+  import Alert from '../components/ui/Alert.svelte';
 
   const clock = createClock();
   let filter = $state<string>('all');
@@ -44,7 +45,7 @@
   );
 
   const page = $derived(Math.floor(clipboardState.offset / 20) + 1);
-  const totalBytes = $derived(clipboardState.entries.reduce((sum, e) => sum + base64Size(e.encrypted_data), 0));
+  const totalBytes = $derived(clipboardState.entries.reduce((sum, e) => sum + e.encrypted_size, 0));
 
   async function handleDelete(id: string) {
     try {
@@ -66,6 +67,7 @@
 </script>
 
 <!-- Toolbar -->
+{#if clipboardState.error}<Alert tone="danger">{clipboardState.error} The last loaded page is unchanged.</Alert>{/if}
 <div class="mb-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
   <div class="flex flex-wrap items-center gap-2">
     <button
@@ -150,7 +152,7 @@
                 </div>
               </td>
               <td class="text-muted">{entry.device_name || 'Unknown device'}</td>
-              <td class="font-mono text-[12.5px] text-muted">{formatBytes(base64Size(entry.encrypted_data))}</td>
+              <td class="font-mono text-[12.5px] text-muted">{formatBytes(entry.encrypted_size)}</td>
               <td>
                 <span class="inline-flex items-center gap-1">
                   <span class="mono-chip">{truncateMiddle(entry.id, 5)}</span>

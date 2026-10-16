@@ -21,7 +21,7 @@ use sqlx::{AssertSqlSafe, PgPool};
 
 use cpmesh_server::db::{
     AppReleaseParams, CreateOidcUserParams, CreateUserParams, Db, DownloadLinkParams,
-    SubscriptionPlanParams,
+    SubscriptionPlanParams, UserListFilter,
 };
 use cpmesh_server::models::*;
 use cpmesh_server::pii::PiiService;
@@ -31,6 +31,134 @@ const PII_HMAC_KEY: &str = "/aowWex7ni3uUnazmQk+rn6GPvb9lQFaSNIPlpiRAM0=";
 
 fn pii() -> PiiService {
     PiiService::new(PII_MASTER_KEY, PII_HMAC_KEY).unwrap()
+}
+
+#[tokio::test]
+async fn failed_and_concurrent_release_switches_preserve_one_current_release() {
+    with_db(|db| async move {
+        let original = AppReleaseParams {
+            version: "1.0.0",
+            platform: "linux",
+            arch: "amd64",
+            download_url: "https://example.test/app",
+            release_notes: "",
+            is_current: true,
+        };
+        let published = db.create_app_release(&original).await.unwrap();
+        let too_long = "x".repeat(51);
+        let invalid = AppReleaseParams {
+            version: &too_long,
+            ..original
+        };
+        assert!(db.create_app_release(&invalid).await.is_err());
+        assert!(db.update_app_release(published.id, &invalid).await.is_err());
+        assert!(
+            db.update_app_release(uuid::Uuid::new_v4(), &original)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            db.get_current_release("linux", "amd64")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            published.id
+        );
+        let next = AppReleaseParams {
+            version: "2.0.0",
+            ..original
+        };
+        let competing = AppReleaseParams {
+            version: "3.0.0",
+            ..original
+        };
+        let (a, b) = tokio::join!(
+            db.create_app_release(&next),
+            db.create_app_release(&competing)
+        );
+        a.unwrap();
+        b.unwrap();
+        let releases = db.list_app_releases().await.unwrap();
+        assert_eq!(releases.iter().filter(|r| r.is_current).count(), 1);
+        assert_eq!(releases.len(), 3);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn approval_rotation_rolls_back_all_state_and_serializes_competing_versions() {
+    use cpmesh_proto::models::StoreGroupKeyEntry;
+    use cpmesh_server::db::KeyRotation;
+    with_db(|db| async move {
+        let user = make_user(&db, "atomic-approval", None).await;
+        let a = make_device(&db, &user, "A", "approved").await;
+        let b = make_device(&db, &user, "B", "pending").await;
+        db.rotate_group_key(user.id, a.id, 0, 1, &[(a.id, vec![1; 60])], 24)
+            .await
+            .unwrap();
+        let session = db.create_approval_session(b.id, a.id, 600).await.unwrap();
+        let wraps = vec![
+            StoreGroupKeyEntry {
+                device_id: a.id.to_string(),
+                encrypted_key: vec![2; 60],
+                membership: None,
+            },
+            StoreGroupKeyEntry {
+                device_id: b.id.to_string(),
+                encrypted_key: vec![3; 60],
+                membership: None,
+            },
+        ];
+        sqlx::query(
+            "ALTER TABLE device_group_keys ADD CONSTRAINT reject_test_version CHECK (version <> 2)",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let rotation = || KeyRotation {
+            user_id: user.id,
+            from_device_id: a.id,
+            expected_current_version: 1,
+            new_version: 2,
+            wrapped_keys: &wraps,
+            rotation_interval_hours: 24,
+            approval: Some((b.id, session.id)),
+        };
+        assert!(db.commit_key_rotation(rotation()).await.is_err());
+        assert_eq!(db.get_device_status(b.id).await.unwrap(), "pending");
+        assert!(db.get_approval_session(b.id).await.unwrap().is_some());
+        assert_eq!(
+            db.get_current_group_key_version(user.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            1
+        );
+        sqlx::query("ALTER TABLE device_group_keys DROP CONSTRAINT reject_test_version")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(db.commit_key_rotation(rotation()).await.unwrap());
+        assert_eq!(db.get_device_status(b.id).await.unwrap(), "approved");
+        assert!(db.get_approval_session(b.id).await.unwrap().is_none());
+        let keys = [(a.id, vec![4; 60]), (b.id, vec![5; 60])];
+        let (first, second) = tokio::join!(
+            db.rotate_group_key(user.id, a.id, 2, 3, &keys, 24),
+            db.rotate_group_key(user.id, b.id, 2, 3, &keys, 24),
+        );
+        assert_ne!(first.unwrap(), second.unwrap());
+        let current: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM group_key_versions WHERE user_id = $1 AND is_current",
+        )
+        .bind(user.id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(current, 1);
+    })
+    .await;
 }
 
 /// Runs `body` against a freshly migrated schema, then drops the schema even if the
@@ -103,6 +231,20 @@ async fn make_user(db: &Db, username: &str, pii: Option<&PiiService>) -> User {
     .expect("create user")
 }
 
+/// Every user, through the admin listing (first page, large enough for tests).
+async fn all_users(db: &Db, pii: Option<&PiiService>) -> Vec<AdminUserRow> {
+    db.admin_list_users(
+        &UserListFilter {
+            per_page: 200,
+            ..UserListFilter::default()
+        },
+        pii,
+    )
+    .await
+    .expect("list users")
+    .items
+}
+
 async fn make_device(db: &Db, user: &User, name: &str, status: &str) -> Device {
     db.create_device(user.id, name, &[4, 1, 2, 3], Some(&[0x30]), status, None)
         .await
@@ -113,7 +255,7 @@ fn plan_params<'a>(name: &'a str, sort_order: i32, is_active: bool) -> Subscript
     SubscriptionPlanParams {
         name,
         description: "desc",
-        price: 9.99,
+        price: rust_decimal::Decimal::new(999, 2),
         currency: "EUR",
         billing_period: "yearly",
         max_devices: 7,
@@ -274,7 +416,7 @@ async fn user_lifecycle_with_pii_encryption() {
         );
 
         // Admin listing decrypts on the way out
-        let listed = db.admin_list_users(Some(&p)).await.unwrap();
+        let listed = all_users(&db, Some(&p)).await;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].email, "Carol@Example.com");
         assert_eq!(listed[0].full_name, "Carol Danvers");
@@ -728,8 +870,7 @@ async fn versioned_group_key_rotation_uses_compare_and_swap() {
                 .is_empty()
         );
 
-        // Removing a device cascades its own wrapped keys AND the keys it wrapped for
-        // other devices (they cannot be unwrapped without the sender's public key).
+        // Removing a device keeps historical sender identities with other devices' wraps.
         db.delete_device(a.id, user.id).await.unwrap();
         assert!(
             db.get_device_group_keys_since(a.id, 0)
@@ -738,9 +879,11 @@ async fn versioned_group_key_rotation_uses_compare_and_swap() {
                 .is_empty()
         );
         let b_keys = db.get_device_group_keys_since(b.id, 0).await.unwrap();
-        assert_eq!(b_keys.len(), 1, "v1 was wrapped by the deleted device");
-        assert_eq!(b_keys[0].version, 2);
-        assert_eq!(b_keys[0].from_device_id, b.id);
+        assert_eq!(b_keys.len(), 2);
+        assert_eq!(b_keys[0].version, 1);
+        assert_eq!(b_keys[0].from_public_key, a.public_key);
+        assert_eq!(b_keys[1].from_device_id, b.id);
+        assert!(db.rotation_required(user.id).await.unwrap());
     })
     .await;
 }
@@ -870,7 +1013,7 @@ async fn subscription_plans_crud_and_assignment() {
         db.assign_user_subscription(user.id, inactive.id)
             .await
             .unwrap();
-        let listed = db.admin_list_users(None).await.unwrap();
+        let listed = all_users(&db, None).await;
         assert_eq!(listed[0].subscription_plan_name.as_deref(), Some("Hidden"));
     })
     .await;
@@ -1087,7 +1230,7 @@ async fn admin_listing_and_stats() {
             .unwrap();
         db.assign_user_subscription(b.id, plan.id).await.unwrap();
 
-        let users = db.admin_list_users(None).await.unwrap();
+        let users = all_users(&db, None).await;
         assert_eq!(users.len(), 2);
         let nina = users.iter().find(|u| u.username == "nina").unwrap();
         assert_eq!(nina.device_count, 2);
@@ -1448,7 +1591,9 @@ mod router {
                 login: build_rate_limiter(1000),
                 register: build_rate_limiter(1000),
                 refresh: build_rate_limiter(1000),
+                mfa: build_rate_limiter(1000),
             },
+            settings: cpmesh_server::settings::SettingsCache::new(),
         });
         (cpmesh_server::routes::build_router(state.clone()), state)
     }
@@ -1567,7 +1712,7 @@ mod router {
     }
 
     #[tokio::test]
-    async fn refresh_binds_a_session_to_one_of_the_users_devices() {
+    async fn refresh_never_selects_a_device_without_possession_proof() {
         with_db(|db| async move {
             let (app, state) = app(&db);
             let user = make_user(&db, "yvonne", None).await;
@@ -1586,14 +1731,17 @@ mod router {
                     .unwrap()
             };
 
-            // Someone else's device, or a revoked one, is refused
-            for device_id in [foreign.id, revoked.id] {
+            // Even an approved device of this account cannot be selected by an unbound token.
+            for device_id in [device.id, foreign.id, revoked.id] {
                 let token = state.auth.generate_refresh_token(user.id, None).unwrap();
                 let (status, body) = call(&app, refresh_with(token, device_id)).await;
                 assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
             }
 
-            let token = state.auth.generate_refresh_token(user.id, None).unwrap();
+            let token = state
+                .auth
+                .generate_refresh_token(user.id, Some(device.id))
+                .unwrap();
             let (status, body) = call(&app, refresh_with(token, device.id)).await;
             assert_eq!(status, StatusCode::OK, "{body}");
             let access = state
@@ -1627,4 +1775,413 @@ mod router {
         })
         .await;
     }
+}
+
+// ---- Roles, two-factor state and the admin console -------------------------
+
+#[tokio::test]
+async fn seeded_admins_are_owners_and_roles_keep_is_admin_in_sync() {
+    with_db(|db| async move {
+        use cpmesh_server::db::RoleChange;
+        use cpmesh_server::rbac::Role;
+
+        db.seed_admin("root", "$argon2id$fake", "root@example.com", None)
+            .await
+            .unwrap();
+        let root = db.get_user_by_username("root").await.unwrap();
+        assert_eq!(root.role(), Role::Owner);
+        assert!(root.is_admin);
+
+        let member = make_user(&db, "pat", None).await;
+        assert_eq!(member.role(), Role::User);
+        assert_eq!(
+            db.change_user_role(member.id, Role::Viewer).await.unwrap(),
+            RoleChange::Changed
+        );
+        assert!(db.get_user_by_id(member.id).await.unwrap().is_admin);
+        db.change_user_role(member.id, Role::User).await.unwrap();
+        assert!(!db.get_user_by_id(member.id).await.unwrap().is_admin);
+
+        assert_eq!(
+            db.change_user_role(root.id, Role::Admin).await.unwrap(),
+            RoleChange::LastOwner
+        );
+        assert_eq!(
+            db.change_user_role(uuid::Uuid::new_v4(), Role::Admin)
+                .await
+                .unwrap(),
+            RoleChange::NotFound
+        );
+        // With a second owner the first may step down
+        db.change_user_role(member.id, Role::Owner).await.unwrap();
+        assert_eq!(
+            db.change_user_role(root.id, Role::Admin).await.unwrap(),
+            RoleChange::Changed
+        );
+
+        // Suspension round trip
+        db.suspend_user(member.id, "spam").await.unwrap();
+        let suspended = db.get_user_by_id(member.id).await.unwrap();
+        assert!(suspended.is_suspended());
+        assert_eq!(suspended.suspended_reason.as_deref(), Some("spam"));
+        db.unsuspend_user(member.id).await.unwrap();
+        assert!(!db.get_user_by_id(member.id).await.unwrap().is_suspended());
+        assert!(db.suspend_user(uuid::Uuid::new_v4(), "x").await.is_err());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn second_factor_state_round_trips() {
+    with_db(|db| async move {
+        let user = make_user(&db, "quinn", None).await;
+        assert!(!db.mfa_summary(user.id).await.unwrap().enabled());
+
+        db.set_pending_totp(user.id, "sealed-secret").await.unwrap();
+        let mfa = db.get_user_mfa(user.id).await.unwrap().unwrap();
+        assert_eq!(mfa.totp_pending_secret.as_deref(), Some("sealed-secret"));
+        assert!(mfa.totp_secret.is_none());
+        db.enable_totp(user.id, "sealed-secret", 100).await.unwrap();
+        let mfa = db.get_user_mfa(user.id).await.unwrap().unwrap();
+        assert_eq!(mfa.totp_secret.as_deref(), Some("sealed-secret"));
+        assert!(mfa.totp_pending_secret.is_none());
+        assert_eq!(mfa.totp_last_step, 100);
+
+        // A step is used once, and never an older one
+        assert!(!db.record_totp_step(user.id, 100).await.unwrap());
+        assert!(!db.record_totp_step(user.id, 99).await.unwrap());
+        assert!(db.record_totp_step(user.id, 101).await.unwrap());
+
+        // Failures lock after the threshold and clear on success
+        assert!(!db.record_mfa_failure(user.id, 3, 60).await.unwrap());
+        assert!(!db.record_mfa_failure(user.id, 3, 60).await.unwrap());
+        assert!(db.mfa_locked_until(user.id).await.unwrap().is_none());
+        assert!(db.record_mfa_failure(user.id, 3, 60).await.unwrap());
+        assert!(db.mfa_locked_until(user.id).await.unwrap().is_some());
+        db.clear_mfa_failures(user.id).await.unwrap();
+        assert!(db.mfa_locked_until(user.id).await.unwrap().is_none());
+
+        db.replace_recovery_codes(user.id, &["h1".into(), "h2".into()])
+            .await
+            .unwrap();
+        assert!(db.use_recovery_code(user.id, "h1").await.unwrap());
+        assert!(!db.use_recovery_code(user.id, "h1").await.unwrap());
+        assert!(!db.use_recovery_code(user.id, "nope").await.unwrap());
+        let summary = db.mfa_summary(user.id).await.unwrap();
+        assert!(summary.totp && summary.enabled());
+        assert_eq!(summary.recovery_codes, 1);
+        db.replace_recovery_codes(user.id, &["h3".into()])
+            .await
+            .unwrap();
+        assert!(!db.use_recovery_code(user.id, "h2").await.unwrap());
+
+        let credential = cpmesh_server::mfa::webauthn::NewCredential {
+            credential_id: vec![1, 2, 3],
+            public_key: vec![9; 10],
+            algorithm: -7,
+            sign_count: 5,
+            transports: vec!["usb".into()],
+            backup_eligible: true,
+            user_verified: true,
+        };
+        let stored = db
+            .add_webauthn_credential(user.id, &credential, "Key")
+            .await
+            .unwrap();
+        assert_eq!(stored.transport_list(), vec!["usb"]);
+        assert!(
+            db.add_webauthn_credential(user.id, &credential, "Dup")
+                .await
+                .is_err()
+        );
+        // The counter moves only from the value the assertion was checked against
+        assert!(db.record_webauthn_use(stored.id, 5, 6).await.unwrap());
+        assert!(!db.record_webauthn_use(stored.id, 5, 7).await.unwrap());
+        let other = make_user(&db, "rhea", None).await;
+        assert!(
+            !db.rename_webauthn_credential(other.id, stored.id, "Mine")
+                .await
+                .unwrap()
+        );
+        assert!(
+            db.rename_webauthn_credential(user.id, stored.id, "Yubikey")
+                .await
+                .unwrap()
+        );
+        let listed = db.list_webauthn_credentials(user.id).await.unwrap();
+        assert_eq!(listed[0].name, "Yubikey");
+        assert_eq!(listed[0].sign_count, 6);
+        assert_eq!(db.mfa_summary(user.id).await.unwrap().methods(), 2);
+
+        db.disable_totp(user.id).await.unwrap();
+        assert_eq!(db.mfa_summary(user.id).await.unwrap().methods(), 1);
+        db.reset_user_mfa(user.id).await.unwrap();
+        assert_eq!(
+            db.mfa_summary(user.id).await.unwrap(),
+            cpmesh_server::db::MfaSummary::default()
+        );
+        assert!(db.get_user_mfa(user.id).await.unwrap().is_none());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn emailed_codes_expire_and_allow_few_attempts() {
+    with_db(|db| async move {
+        use cpmesh_server::db::EmailCodeCheck;
+        let user = make_user(&db, "sven", None).await;
+        assert_eq!(
+            db.check_email_code(user.id, "h", 3).await.unwrap(),
+            EmailCodeCheck::Missing
+        );
+
+        db.store_email_code(user.id, "good", 600).await.unwrap();
+        assert!(db.email_code_sent_at(user.id).await.unwrap().is_some());
+        assert_eq!(
+            db.check_email_code(user.id, "bad", 2).await.unwrap(),
+            EmailCodeCheck::Invalid
+        );
+        assert_eq!(
+            db.check_email_code(user.id, "bad", 2).await.unwrap(),
+            EmailCodeCheck::Invalid
+        );
+        // Out of attempts: even the right code is refused, and the code is gone
+        assert_eq!(
+            db.check_email_code(user.id, "good", 2).await.unwrap(),
+            EmailCodeCheck::TooManyAttempts
+        );
+        assert_eq!(
+            db.check_email_code(user.id, "good", 2).await.unwrap(),
+            EmailCodeCheck::Missing
+        );
+
+        db.store_email_code(user.id, "good", 600).await.unwrap();
+        assert_eq!(
+            db.check_email_code(user.id, "good", 2).await.unwrap(),
+            EmailCodeCheck::Valid
+        );
+        assert_eq!(
+            db.check_email_code(user.id, "good", 2).await.unwrap(),
+            EmailCodeCheck::Missing,
+            "a code is used once"
+        );
+
+        db.store_email_code(user.id, "good", -1).await.unwrap();
+        assert!(db.email_code_sent_at(user.id).await.unwrap().is_none());
+        assert_eq!(
+            db.check_email_code(user.id, "good", 2).await.unwrap(),
+            EmailCodeCheck::Expired
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn api_tokens_are_found_only_while_active() {
+    with_db(|db| async move {
+        let user = make_user(&db, "tara", None).await;
+        let token = db
+            .create_api_token(
+                user.id,
+                "CI",
+                "hash-1",
+                "cpm_abcdefgh",
+                &["releases:write"],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(token.username.as_deref(), Some("tara"));
+        assert_eq!(token.scopes, serde_json::json!(["releases:write"]));
+        assert!(db.find_active_api_token("hash-1").await.unwrap().is_some());
+        assert!(db.find_active_api_token("hash-2").await.unwrap().is_none());
+
+        db.create_api_token(
+            user.id,
+            "Old",
+            "hash-2",
+            "cpm_ijklmnop",
+            &["releases:write"],
+            Some(Utc::now() - chrono::Duration::days(1)),
+        )
+        .await
+        .unwrap();
+        assert!(db.find_active_api_token("hash-2").await.unwrap().is_none());
+
+        db.touch_api_token(token.id).await.unwrap();
+        assert!(db.revoke_api_token(token.id).await.unwrap());
+        assert!(!db.revoke_api_token(token.id).await.unwrap());
+        assert!(db.find_active_api_token("hash-1").await.unwrap().is_none());
+
+        let listed = db.list_api_tokens().await.unwrap();
+        assert_eq!(listed.len(), 2);
+        // Revoked tokens sort last
+        assert_eq!(listed[1].id, token.id);
+        assert!(listed[1].last_used_at.is_some());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn audit_entries_name_the_actor_and_the_affected_account() {
+    with_db(|db| async move {
+        use cpmesh_server::db::AuditFilter;
+        let admin = make_user(&db, "uriel", None).await;
+        let target = make_user(&db, "vanya", None).await;
+        let json = serde_json::json!({"reason": "test"});
+        db.write_audit_entry(
+            Some(admin.id),
+            Some(target.id),
+            AUDIT_ADMIN_SUSPEND,
+            Some("203.0.113.1"),
+            Some("ua"),
+            &json,
+        )
+        .await
+        .unwrap();
+        db.write_audit_entry(Some(target.id), None, AUDIT_LOGIN_OK, None, None, &json)
+            .await
+            .unwrap();
+        db.write_audit_entry(Some(admin.id), None, AUDIT_LOGIN_OK, None, None, &json)
+            .await
+            .unwrap();
+
+        let filter = |user_id, action| AuditFilter {
+            user_id,
+            action,
+            limit: 50,
+            offset: 0,
+        };
+        let (rows, total) = db
+            .list_audit_entries(&filter(Some(target.id), None))
+            .await
+            .unwrap();
+        assert_eq!(total, 2, "entries by or about the user");
+        let suspend = rows
+            .iter()
+            .find(|r| r.action == AUDIT_ADMIN_SUSPEND)
+            .unwrap();
+        assert_eq!(suspend.username.as_deref(), Some("uriel"));
+        assert_eq!(suspend.target_username.as_deref(), Some("vanya"));
+        assert_eq!(suspend.details["reason"], "test");
+
+        let (_, total) = db
+            .list_audit_entries(&filter(None, Some(AUDIT_LOGIN_OK)))
+            .await
+            .unwrap();
+        assert_eq!(total, 2);
+        let (rows, total) = db
+            .list_audit_entries(&AuditFilter {
+                limit: 1,
+                offset: 1,
+                ..filter(None, None)
+            })
+            .await
+            .unwrap();
+        assert_eq!((rows.len(), total), (1, 3));
+
+        // Deleting the target keeps the entry
+        db.admin_delete_user(target.id).await.unwrap();
+        let (rows, _) = db
+            .list_audit_entries(&filter(None, Some(AUDIT_ADMIN_SUSPEND)))
+            .await
+            .unwrap();
+        assert!(rows[0].target_user_id.is_none());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn uploaded_installers_are_recorded_once_per_url() {
+    with_db(|db| async move {
+        let params = DownloadLinkParams {
+            name: "cpmesh.dmg",
+            url: "/api/downloads/cpmesh.dmg",
+            platform: "macos",
+            arch: "arm64",
+            format: "dmg",
+            sort_order: 0,
+            is_active: true,
+            release_id: None,
+        };
+        let first = db
+            .upsert_uploaded_download(&params, "aaa", 10)
+            .await
+            .unwrap();
+        assert_eq!(first.sha256.as_deref(), Some("aaa"));
+        let second = db
+            .upsert_uploaded_download(&params, "bbb", 20)
+            .await
+            .unwrap();
+        assert_eq!(second.id, first.id);
+        assert_eq!(second.sha256.as_deref(), Some("bbb"));
+        assert_eq!(second.size_bytes, Some(20));
+        assert_eq!(db.list_download_links().await.unwrap().len(), 1);
+        assert!(
+            db.find_download_link_by_url("/api/downloads/other")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn settings_overrides_round_trip() {
+    with_db(|db| async move {
+        use cpmesh_server::settings::{KEY_BANNER, KEY_REGISTRATION_OPEN, RuntimeSettings};
+        let admin = make_user(&db, "wanda", None).await;
+        assert!(db.load_settings().await.unwrap().is_empty());
+        db.put_setting(
+            KEY_REGISTRATION_OPEN,
+            Some(&serde_json::json!(false)),
+            admin.id,
+        )
+        .await
+        .unwrap();
+        db.put_setting(
+            KEY_BANNER,
+            Some(&serde_json::json!({"message": "Hi", "tone": "info"})),
+            admin.id,
+        )
+        .await
+        .unwrap();
+        db.put_setting(
+            KEY_REGISTRATION_OPEN,
+            Some(&serde_json::json!(true)),
+            admin.id,
+        )
+        .await
+        .unwrap();
+        let settings = RuntimeSettings::from_rows(db.load_settings().await.unwrap());
+        assert_eq!(settings.registration_open, Some(true));
+        assert_eq!(settings.banner.unwrap().message, "Hi");
+
+        db.put_setting(KEY_BANNER, None, admin.id).await.unwrap();
+        let settings = RuntimeSettings::from_rows(db.load_settings().await.unwrap());
+        assert!(settings.banner.is_none());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn plans_cannot_be_assigned_to_missing_users() {
+    with_db(|db| async move {
+        let plan = db
+            .create_subscription_plan(&plan_params("Solo", 0, true))
+            .await
+            .unwrap();
+        assert_eq!(plan.price.to_string(), "9.99");
+        assert!(matches!(
+            db.assign_user_subscription(uuid::Uuid::new_v4(), plan.id)
+                .await,
+            Err(sqlx::Error::RowNotFound)
+        ));
+        assert!(matches!(
+            db.remove_user_subscription(uuid::Uuid::new_v4()).await,
+            Err(sqlx::Error::RowNotFound)
+        ));
+    })
+    .await;
 }

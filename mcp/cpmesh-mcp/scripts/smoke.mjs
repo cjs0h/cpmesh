@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
  * Protocol smoke test: spawns the built server (dist/index.js) and exercises
- * the MCP surface over stdio — initialize, tools/list, prompts/list, a
- * cpmesh_status call (expects a graceful not-logged-in error), and the
- * cpmesh_skill prompt.
+ * the MCP surface over stdio — initialize, tools/list (including the login
+ * tool's two-factor code parameter), prompts/list, a cpmesh_status call
+ * (expects a graceful not-logged-in error), and the cpmesh_skill prompt.
  *
  * Usage: node scripts/smoke.mjs   (run after `npm run build`)
  * Exits non-zero on any failure.
@@ -12,10 +12,14 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { join, dirname } from "node:path";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+const home = await mkdtemp(join(tmpdir(), "cpmesh-protocol-smoke-"));
 const proc = spawn(process.execPath, [join(root, "dist", "index.js")], {
   stdio: ["pipe", "pipe", "pipe"],
+  env: { ...process.env, CPMESH_HOME: home, CPMESH_SERVER_URL: "", CPMESH_USERNAME: "", CPMESH_PASSWORD: "" },
 });
 
 let failures = 0;
@@ -85,10 +89,19 @@ try {
     "cpmesh_list_devices",
     "cpmesh_remove_device",
     "cpmesh_logout",
+    "cpmesh_confirm_pairing",
+    "cpmesh_verify_device",
   ];
   check(
-    "all 11 tools registered",
+    `all ${expected.length} tools registered`,
     expected.every((n) => toolNames.includes(n)),
+  );
+
+  const loginInput = (tools.result?.tools ?? []).find((t) => t.name === "cpmesh_login")?.inputSchema;
+  check(
+    "cpmesh_login takes an optional two-factor code and password",
+    loginInput?.properties?.code?.type === "string" &&
+      !(loginInput.required ?? []).some((name) => name === "code" || name === "password"),
   );
 
   const prompts = await request("prompts/list", {});
@@ -119,6 +132,7 @@ try {
 } finally {
   clearTimeout(timeout);
   proc.kill();
+  await rm(home, { recursive: true, force: true });
 }
 
 process.exit(failures === 0 ? 0 : 1);

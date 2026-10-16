@@ -174,6 +174,37 @@ describe('WebSocket client', () => {
     expect(FakeWebSocket.instances).toHaveLength(1);
   });
 
+  it('disconnect invalidates a pending ticket even when fetch ignores abort', async () => {
+    setTokens('jwt', 'r');
+    let resolve!: (response: Response) => void;
+    fetchMock().mockReturnValueOnce(new Promise<Response>((done) => { resolve = done; }));
+    const attempt = ws.connectWS();
+    ws.disconnectWS();
+    resolve(jsonResponse(200, { ticket: 'late' }));
+    await attempt;
+    expect(FakeWebSocket.instances).toHaveLength(0);
+    expect(ws.getWSStatus()).toBe('offline');
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores callbacks from a replaced socket and coalesces setup calls', async () => {
+    setTokens('jwt', 'r');
+    mockTicket();
+    await Promise.all([ws.connectWS(), ws.connectWS()]);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    const stale = FakeWebSocket.latest();
+    const lateOpen = stale.onopen;
+    const lateClose = stale.onclose;
+    ws.disconnectWS();
+    await ws.connectWS();
+    FakeWebSocket.latest().open();
+    lateOpen?.({});
+    lateClose?.({});
+    expect(ws.getWSStatus()).toBe('online');
+    expect(FakeWebSocket.instances).toHaveLength(2);
+  });
+
   it('reports connection status transitions to subscribers', async () => {
     setTokens('jwt', 'r');
     mockTicket();

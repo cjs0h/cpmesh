@@ -100,9 +100,9 @@ describe('cursorInstallLink', () => {
 });
 
 describe('toolGroups', () => {
-  it('documents all eleven MCP tools', () => {
+  it('documents all thirteen MCP tools', () => {
     const names = toolGroups.flatMap((g) => g.tools.map((t) => t.name));
-    expect(names).toHaveLength(11);
-    expect(new Set(names).size).toBe(11);
+    expect(names).toHaveLength(13);
+    expect(new Set(names).size).toBe(13);
   });
 });

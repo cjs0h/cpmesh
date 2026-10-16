@@ -1,206 +1,294 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
+  import { push, replace, router } from 'svelte-spa-router';
   import { userState } from '../../lib/stores/user.svelte';
   import {
     adminState,
-    fetchAdminUsers,
+    errorMessage,
     fetchAdminPlans,
-    adminDeleteUser,
-    adminAssignSubscription,
-    adminRemoveSubscription,
-    type AdminUserRow,
+    fetchAdminUsers,
+    isMfaRequired,
+    ROLES,
+    USER_STATUSES,
+    type AdminUserQuery,
   } from '../../lib/stores/admin.svelte';
-  import { toast } from '../../lib/stores/toast.svelte';
-  import { api } from '../../lib/api';
-  import { push } from 'svelte-spa-router';
   import { createClock } from '../../lib/clock.svelte';
-  import { absoluteTime, relativeTime, titleCase } from '../../lib/format';
+  import { absoluteTime, relativeTime } from '../../lib/format';
   import Icon from '../../components/Icon.svelte';
+  import Alert from '../../components/ui/Alert.svelte';
   import Avatar from '../../components/ui/Avatar.svelte';
   import Badge from '../../components/ui/Badge.svelte';
   import Button from '../../components/ui/Button.svelte';
   import Card from '../../components/ui/Card.svelte';
-  import ConfirmAction from '../../components/ui/ConfirmAction.svelte';
-  import Dialog from '../../components/ui/Dialog.svelte';
-  import Select from '../../components/ui/Select.svelte';
   import EmptyState from '../../components/ui/EmptyState.svelte';
+  import Field from '../../components/ui/Field.svelte';
+  import Select from '../../components/ui/Select.svelte';
   import Skeleton from '../../components/ui/Skeleton.svelte';
+  import AdminGate from '../../components/admin/AdminGate.svelte';
+  import Pager from '../../components/admin/Pager.svelte';
+  import RoleBadge from '../../components/admin/RoleBadge.svelte';
+  import { rowLink } from '../../components/admin/rowLink';
 
+  const PER_PAGE = 25;
+  const SEARCH_DELAY_MS = 300;
   const clock = createClock();
-  let query = $state('');
-  let planDialog = $state(false);
-  let planUser = $state<AdminUserRow | null>(null);
-  let selectedPlan = $state('');
-  let saving = $state(false);
+
+  let q = $state('');
+  let role = $state('');
+  let status = $state('');
+  let planId = $state('');
+  let page = $state(1);
+  let loaded = $state(false);
+  let loadError = $state('');
+  let searchTimer: ReturnType<typeof setTimeout> | undefined;
+  let active = true;
+  let mounted = $state(false);
+  /** The address this page last read or wrote, to tell its own updates from navigation. */
+  let syncedQuery = '';
+
+  // Filters live in the address, so links (and going back) can open a filtered list
+  function readFilters(querystring: string) {
+    const params = new URLSearchParams(querystring);
+    q = params.get('q') ?? '';
+    role = params.get('role') ?? '';
+    status = params.get('status') ?? '';
+    planId = params.get('plan_id') ?? '';
+    page = Math.max(1, Number.parseInt(params.get('page') ?? '', 10) || 1);
+    syncedQuery = querystring;
+  }
 
   onMount(() => {
     if (!userState.isAdmin) {
       push('/');
       return;
     }
-    fetchAdminUsers();
-    fetchAdminPlans();
+    readFilters(router.querystring ?? '');
+    mounted = true;
+    load();
+    fetchAdminPlans().catch(() => {});
+    return () => {
+      active = false;
+      clearTimeout(searchTimer);
+    };
   });
 
-  const filtered = $derived.by(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return adminState.users;
-    return adminState.users.filter((u) => [u.username, u.full_name, u.email, u.subscription_plan_name ?? ''].some((v) => (v || '').toLowerCase().includes(q)));
+  // A link to another filtered list (or the plain list) while this page is open
+  $effect(() => {
+    const querystring = router.querystring ?? '';
+    if (!mounted || router.location !== '/admin/users' || querystring === syncedQuery) return;
+    untrack(() => {
+      readFilters(querystring);
+      load();
+    });
   });
 
-  const verifiedCount = $derived(adminState.users.filter((u) => u.email_verified).length);
-  const adminCount = $derived(adminState.users.filter((u) => u.is_admin).length);
+  const filtered = $derived(Boolean(q.trim() || role || status || planId));
 
-  function openPlanDialog(user: AdminUserRow) {
-    planUser = user;
-    selectedPlan = user.subscription_plan_id ?? '';
-    planDialog = true;
+  function currentQuery(): AdminUserQuery {
+    return {
+      q: q.trim(),
+      role: role as AdminUserQuery['role'],
+      status: status as AdminUserQuery['status'],
+      plan_id: planId,
+      page,
+    };
   }
 
-  async function savePlan() {
-    if (!planUser) return;
-    saving = true;
+  async function load() {
+    clearTimeout(searchTimer);
+    const query = currentQuery();
     try {
-      if (selectedPlan) await adminAssignSubscription(planUser.id, selectedPlan);
-      else await adminRemoveSubscription(planUser.id);
-      await fetchAdminUsers();
-      toast.success('Plan updated', `${planUser.username} is now on ${selectedPlan ? adminState.plans.find((p) => p.id === selectedPlan)?.name ?? 'the selected plan' : 'no plan'}.`);
-      planDialog = false;
-    } catch (err: any) {
-      toast.error('Could not update plan', err.message);
-    } finally {
-      saving = false;
+      const result = await fetchAdminUsers({ ...query, per_page: PER_PAGE });
+      if (!result || !active) return;
+      loadError = '';
+      loaded = true;
+      const pages = Math.max(1, Math.ceil(result.total / PER_PAGE));
+      if (page > pages) {
+        page = pages;
+        return load();
+      }
+      remember(query);
+    } catch (err) {
+      if (active && !isMfaRequired(err)) loadError = errorMessage(err);
     }
   }
 
-  async function handleDelete(user: AdminUserRow) {
-    try {
-      await adminDeleteUser(user.id);
-      toast.success('User deleted', `${user.username} and their devices were removed.`);
-    } catch (err: any) {
-      toast.error('Could not delete user', err.message);
+  function remember(query: AdminUserQuery) {
+    const params = new URLSearchParams();
+    if (query.q) params.set('q', query.q);
+    if (query.role) params.set('role', query.role);
+    if (query.status) params.set('status', query.status);
+    if (query.plan_id) params.set('plan_id', query.plan_id);
+    if (query.page && query.page > 1) params.set('page', String(query.page));
+    const search = params.toString();
+    adminState.usersQuery = search;
+    syncedQuery = search;
+    if (router.location === '/admin/users' && (router.querystring ?? '') !== search) {
+      replace(search ? `/admin/users?${search}` : '/admin/users');
     }
   }
 
-  async function handleVerifyEmail(user: AdminUserRow) {
-    try {
-      await api(`/api/admin/users/${user.id}/verify-email`, { method: 'PUT' });
-      await fetchAdminUsers();
-      toast.success('Email verified', `${user.username} can now sign in.`);
-    } catch (err: any) {
-      toast.error('Could not verify email', err.message);
-    }
+  function onSearchInput() {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(applyFilters, SEARCH_DELAY_MS);
+  }
+
+  function applyFilters() {
+    page = 1;
+    load();
+  }
+
+  function submitSearch(e: SubmitEvent) {
+    e.preventDefault();
+    applyFilters();
+  }
+
+  function clearFilters() {
+    q = '';
+    role = '';
+    status = '';
+    planId = '';
+    applyFilters();
+  }
+
+  function goTo(next: number) {
+    page = next;
+    load();
   }
 </script>
 
-<div class="mb-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-  <div class="flex flex-wrap items-center gap-2">
-    <Badge tone="neutral">{adminState.users.length} users</Badge>
-    <Badge tone="mint" icon="check">{verifiedCount} verified</Badge>
-    <Badge tone="cyan" icon="shield">{adminCount} admin{adminCount === 1 ? '' : 's'}</Badge>
-  </div>
-  <div class="relative">
-    <span class="pointer-events-none absolute inset-y-0 left-3 flex items-center text-dim"><Icon name="search" size={14} /></span>
-    <input
+<AdminGate onunlock={load}>
+  <form class="mb-4 grid grid-cols-1 gap-3 sm:grid-cols-3 xl:grid-cols-[minmax(0,1fr)_170px_170px_190px]" role="search" onsubmit={submitSearch}>
+    <Field
       type="search"
-      bind:value={query}
-      placeholder="Search name, email, plan…"
-      class="h-9 w-full rounded-md border border-border bg-surface pl-9 pr-3 text-[13px] text-fg shadow-xs outline-none transition-[border-color,box-shadow] duration-150 placeholder:text-dim hover:border-border-strong focus:border-ink focus:shadow-[0_0_0_3px_rgba(10,10,10,0.08)] sm:w-72"
+      icon="search"
+      bind:value={q}
+      oninput={onSearchInput}
+      placeholder="User ID, exact email, or part of a username"
+      aria-label="Search by user ID, exact email address, or part of a username"
+      class="sm:col-span-3 xl:col-span-1"
     />
-  </div>
-</div>
-
-<Card padded={false}>
-  {#if adminState.loading && adminState.users.length === 0}
-    <div class="flex flex-col gap-3 p-5">
-      {#each Array(5) as _, i (i)}
-        <div class="flex items-center gap-3"><Skeleton class="h-8 w-8" rounded="rounded-full" /><Skeleton class="h-3 w-1/4" /><Skeleton class="h-3 w-1/5" /><Skeleton class="ml-auto h-3 w-16" /></div>
+    <Select bind:value={role} onchange={applyFilters} aria-label="Role">
+      <option value="">Any role</option>
+      <option value="staff">All staff</option>
+      {#each ROLES as r (r.value)}
+        <option value={r.value}>{r.value === 'user' ? 'Members' : r.label}</option>
       {/each}
-    </div>
-  {:else if filtered.length === 0}
-    <div class="p-5">
-      <EmptyState icon="users" title={query ? 'No users match' : 'No users yet'} description={query ? 'Try a different search term.' : 'Accounts will appear here as people register.'} compact />
-    </div>
-  {:else}
-    <div class="overflow-x-auto">
-      <table class="tbl min-w-[960px]">
-        <thead>
-          <tr>
-            <th>User</th>
-            <th>Email</th>
-            <th>Provider</th>
-            <th>Role</th>
-            <th>Plan</th>
-            <th class="text-right">Devices</th>
-            <th>Joined</th>
-            <th class="text-right"><span class="sr-only">Actions</span></th>
-          </tr>
-        </thead>
-        <tbody>
-          {#each filtered as user (user.id)}
-            <tr>
-              <td>
-                <div class="flex items-center gap-3">
-                  <Avatar name={user.full_name || user.username} size={32} />
-                  <div class="min-w-0">
-                    <p class="truncate font-medium text-fg">{user.full_name || user.username}</p>
-                    <p class="truncate text-[12px] text-dim">@{user.username}{user.id === userState.id ? ' · you' : ''}</p>
-                  </div>
-                </div>
-              </td>
-              <td>
-                <div class="flex items-center gap-2">
-                  <span class="truncate text-muted">{user.email || '—'}</span>
-                  {#if user.email}
-                    {#if user.email_verified}
-                      <Badge tone="mint" icon="check" title="Email verified">Verified</Badge>
-                    {:else}
-                      <button type="button" class="inline-flex" title="Click to verify manually" onclick={() => handleVerifyEmail(user)}>
-                        <Badge tone="gold" icon="alert-circle" class="cursor-pointer transition-colors hover:bg-amber-100">Unverified</Badge>
-                      </button>
-                    {/if}
-                  {/if}
-                </div>
-              </td>
-              <td><Badge tone="neutral">{titleCase(user.auth_provider || 'local')}</Badge></td>
-              <td>
-                {#if user.is_admin}<Badge tone="cyan" uppercase>admin</Badge>{:else}<span class="text-muted">Member</span>{/if}
-              </td>
-              <td>
-                <button
-                  type="button"
-                  class="group inline-flex items-center gap-1.5 rounded-md border border-border bg-surface py-1 pl-2.5 pr-2 text-[12.5px] font-medium text-fg transition-colors duration-150 hover:border-border-strong hover:bg-bg-deep"
-                  onclick={() => openPlanDialog(user)}
-                  title="Change plan"
-                >
-                  {user.subscription_plan_name ?? 'No plan'}
-                  <Icon name="edit" size={11} class="text-dim transition-colors group-hover:text-fg" />
-                </button>
-              </td>
-              <td class="text-right font-mono text-muted">{user.device_count}</td>
-              <td class="text-muted"><time datetime={user.created_at} title={absoluteTime(user.created_at)}>{relativeTime(user.created_at, clock.now)}</time></td>
-              <td class="text-right">
-                {#if user.id !== userState.id}
-                  <ConfirmAction size="icon-sm" variant="ghost" label="Delete user" confirmLabel="Delete" prompt="Delete user?" onconfirm={() => handleDelete(user)} />
-                {/if}
-              </td>
-            </tr>
-          {/each}
-        </tbody>
-      </table>
-    </div>
-  {/if}
-</Card>
+    </Select>
+    <Select bind:value={status} onchange={applyFilters} aria-label="Status">
+      <option value="">Any status</option>
+      {#each USER_STATUSES as s (s.value)}
+        <option value={s.value}>{s.label}</option>
+      {/each}
+    </Select>
+    <Select bind:value={planId} onchange={applyFilters} aria-label="Plan">
+      <option value="">Any plan</option>
+      {#each adminState.plans as plan (plan.id)}
+        <option value={plan.id}>{plan.name}</option>
+      {/each}
+    </Select>
+  </form>
 
-<Dialog bind:open={planDialog} title="Change subscription plan" description={planUser ? `Applies to @${planUser.username}` : undefined} size="sm">
-  <Select label="Plan" bind:value={selectedPlan} hint="Choosing “No plan” removes the current subscription.">
-    <option value="">No plan</option>
-    {#each adminState.plans as plan (plan.id)}
-      <option value={plan.id}>{plan.name} — {plan.max_devices} devices · {plan.max_clipboard_history} entries</option>
-    {/each}
-  </Select>
-  {#snippet footer()}
-    <Button variant="ghost" onclick={() => (planDialog = false)}>Cancel</Button>
-    <Button loading={saving} onclick={savePlan}>Save plan</Button>
-  {/snippet}
-</Dialog>
+  {#if loadError}
+    <Alert tone="danger" title="Could not load users" class="mb-4">
+      {loadError}
+      <Button variant="link" class="ml-1" onclick={load}>Try again</Button>
+    </Alert>
+  {/if}
+
+  <Card padded={false}>
+    {#if !loaded}
+      <div class="flex flex-col gap-4 p-5" aria-busy="true">
+        {#each Array(6) as _, i (i)}
+          <div class="flex items-center gap-3">
+            <Skeleton class="h-8 w-8" rounded="rounded-full" />
+            <div class="flex-1"><Skeleton class="mb-1.5 h-3 w-1/4" /><Skeleton class="h-2.5 w-1/6" /></div>
+            <Skeleton class="h-3 w-1/5" />
+            <Skeleton class="h-3 w-16" />
+          </div>
+        {/each}
+      </div>
+    {:else if adminState.users.length === 0}
+      <div class="p-5">
+        {#if filtered}
+          <EmptyState icon="search" title="No users match" description="Emails only match in full; usernames match any part. Try another search or clear the filters." compact>
+            <Button variant="outline" size="sm" icon="x" onclick={clearFilters}>Clear filters</Button>
+          </EmptyState>
+        {:else}
+          <EmptyState icon="users" title="No users yet" description="Accounts appear here as people register." compact />
+        {/if}
+      </div>
+    {:else}
+      <div class="overflow-x-auto">
+        <table class="tbl min-w-[1100px] {adminState.loading ? 'opacity-60' : ''}" aria-busy={adminState.loading}>
+          <thead>
+            <tr>
+              <th>User</th>
+              <th>Email</th>
+              <th>Role</th>
+              <th>Plan</th>
+              <th>2FA</th>
+              <th>Status</th>
+              <th class="text-right">Devices</th>
+              <th>Last seen</th>
+              <th>Joined</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each adminState.users as user (user.id)}
+              <tr class="cursor-pointer" use:rowLink={`#/admin/users/${user.id}`}>
+                <td>
+                  <div class="flex items-center gap-3">
+                    <Avatar name={user.full_name || user.username} size={32} />
+                    <div class="min-w-0">
+                      <a href="#/admin/users/{user.id}" class="block max-w-[220px] truncate font-medium text-fg hover:underline">{user.full_name || user.username}</a>
+                      <p class="max-w-[220px] truncate text-[12px] text-dim">@{user.username}{user.id === userState.id ? ' · you' : ''}</p>
+                    </div>
+                  </div>
+                </td>
+                <td>
+                  {#if user.email}
+                    <span class="flex items-center gap-2">
+                      <span class="max-w-[240px] truncate text-muted" title={user.email}>{user.email}</span>
+                      {#if user.email_verified}
+                        <span class="text-success" title="Email verified"><Icon name="check-circle" size={14} /><span class="sr-only">Verified</span></span>
+                      {:else}
+                        <Badge tone="gold">Unverified</Badge>
+                      {/if}
+                    </span>
+                  {:else}
+                    <span class="text-dim">—</span>
+                  {/if}
+                </td>
+                <td>
+                  {#if user.role === 'user'}<span class="text-muted">Member</span>{:else}<RoleBadge role={user.role} />{/if}
+                </td>
+                <td class={user.subscription_plan_name ? 'text-fg' : 'text-dim'}>{user.subscription_plan_name ?? 'No plan'}</td>
+                <td>
+                  {#if user.mfa_enabled}<Badge tone="mint" icon="shield-check">On</Badge>{:else}<Badge tone="neutral">Off</Badge>{/if}
+                </td>
+                <td>
+                  {#if user.suspended_at}
+                    <Badge tone="rose" icon="lock" title="Suspended {absoluteTime(user.suspended_at)}">Suspended</Badge>
+                  {:else}
+                    <span class="text-muted">Active</span>
+                  {/if}
+                </td>
+                <td class="text-right font-mono text-muted">{user.device_count}</td>
+                <td class="whitespace-nowrap text-muted">
+                  {#if user.last_seen}
+                    <time datetime={user.last_seen} title={absoluteTime(user.last_seen)}>{relativeTime(user.last_seen, clock.now)}</time>
+                  {:else}
+                    <span class="text-dim">Never</span>
+                  {/if}
+                </td>
+                <td class="whitespace-nowrap text-muted"><time datetime={user.created_at} title={absoluteTime(user.created_at)}>{relativeTime(user.created_at, clock.now)}</time></td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+      <Pager {page} perPage={PER_PAGE} total={adminState.usersTotal} noun="users" loading={adminState.loading} onpage={goTo} />
+    {/if}
+  </Card>
+</AdminGate>

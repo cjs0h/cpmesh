@@ -118,6 +118,9 @@ fn browser_session() -> crate::routes::middleware::AuthClaims {
         user_id: uuid::Uuid::new_v4(),
         device_id: None,
         iat: 0,
+        session_start: 0,
+        mfa: false,
+        auth_time: 0,
     }
 }
 
@@ -176,18 +179,55 @@ async fn websocket_rejects_unknown_tickets() {
 }
 
 #[tokio::test]
-async fn public_endpoints_do_not_require_auth() {
+async fn oidc_callback_requires_nonempty_matching_cookie_and_state() {
     let app = test_router(test_state(test_config()).await);
-    for path in ["/api/downloads", "/api/downloads/current", "/api/plans"] {
-        let resp = send(&app, request("GET", path).body(Body::empty()).unwrap()).await;
-        // Database is unreachable: handlers degrade to an empty list
-        assert_eq!(resp.status(), StatusCode::OK, "{path}");
-        assert_eq!(body_json(resp).await, serde_json::json!([]), "{path}");
+    for (uri, cookie) in [
+        (
+            "/api/auth/social/callback?code=x",
+            Some("cpmesh_oidc_state=expected"),
+        ),
+        ("/api/auth/social/callback?code=x&state=expected", None),
+        (
+            "/api/auth/social/callback?code=x&state=",
+            Some("cpmesh_oidc_state=expected"),
+        ),
+        (
+            "/api/auth/social/callback?code=x&state=wrong",
+            Some("cpmesh_oidc_state=expected"),
+        ),
+        (
+            "/api/auth/social/callback?code=x&state=expected",
+            Some("cpmesh_oidc_state="),
+        ),
+    ] {
+        let mut req = request("GET", uri);
+        if let Some(cookie) = cookie {
+            req = req.header(header::COOKIE, cookie);
+        }
+        let response = send(&app, req.body(Body::empty()).unwrap()).await;
+        assert!(response.status().is_redirection());
+        assert!(
+            response.headers()[header::LOCATION]
+                .to_str()
+                .unwrap()
+                .contains("invalid+state+parameter")
+        );
     }
 }
 
 #[tokio::test]
-async fn update_check_requires_platform_and_degrades_without_db() {
+async fn public_endpoints_do_not_require_auth() {
+    let app = test_router(test_state(test_config()).await);
+    for path in ["/api/downloads", "/api/downloads/current", "/api/plans"] {
+        let resp = send(&app, request("GET", path).body(Body::empty()).unwrap()).await;
+        // Public does not mean failures should look like an empty catalogue.
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR, "{path}");
+        assert!(body_json(resp).await["error"].is_string());
+    }
+}
+
+#[tokio::test]
+async fn update_check_reports_database_failure_instead_of_no_update() {
     let app = test_router(test_state(test_config()).await);
     let resp = send(
         &app,
@@ -212,11 +252,8 @@ async fn update_check_requires_platform_and_degrades_without_db() {
         .unwrap(),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        body_json(resp).await,
-        serde_json::json!({"update_available": false})
-    );
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(body_json(resp).await["error"].is_string());
 }
 
 #[tokio::test]
@@ -243,7 +280,47 @@ async fn download_file_serves_from_downloads_dir_with_attachment_headers() {
         resp.headers()[header::CONTENT_DISPOSITION],
         "attachment; filename=\"cpmesh-setup.exe\""
     );
+    let etag = resp.headers()[header::ETAG].clone();
+    assert_eq!(resp.headers()[header::ACCEPT_RANGES], "bytes");
     assert_eq!(body_bytes(resp).await, b"MZ-binary");
+
+    for (range, expected) in [
+        ("bytes=3-5", b"bin".as_slice()),
+        ("bytes=-3", b"ary".as_slice()),
+    ] {
+        let response = send(
+            &app,
+            request("GET", "/api/downloads/cpmesh-setup.exe")
+                .header(header::RANGE, range)
+                .header(header::IF_RANGE, &etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "3");
+        assert_eq!(body_bytes(response).await, expected);
+    }
+    let response = send(
+        &app,
+        request("GET", "/api/downloads/cpmesh-setup.exe")
+            .header(header::RANGE, "bytes=99-")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes */9");
+    let response = send(
+        &app,
+        request("GET", "/api/downloads/cpmesh-setup.exe")
+            .header(header::IF_NONE_MATCH, &etag)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert!(body_bytes(response).await.is_empty());
 
     // Unknown file
     let resp = send(

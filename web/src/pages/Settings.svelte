@@ -4,6 +4,8 @@
   import { devicesState, fetchDevices } from '../lib/stores/devices.svelte';
   import { toast } from '../lib/stores/toast.svelte';
   import { api } from '../lib/api';
+  import { clearTokens } from '../lib/auth';
+  import { formatPrice, priceForDisplay } from '../lib/money';
   import { titleCase, truncateMiddle } from '../lib/format';
   import Icon from '../components/Icon.svelte';
   import Avatar from '../components/ui/Avatar.svelte';
@@ -13,12 +15,13 @@
   import Field from '../components/ui/Field.svelte';
   import CopyButton from '../components/ui/CopyButton.svelte';
   import Alert from '../components/ui/Alert.svelte';
+  import TwoFactorSettings from '../components/mfa/TwoFactorSettings.svelte';
 
   interface SubscriptionInfo {
     plan_id: string | null;
     plan_name: string | null;
     plan_description: string | null;
-    price: number | null;
+    price: string | null;
     currency: string | null;
     billing_period: string | null;
     max_devices: number | null;
@@ -32,18 +35,26 @@
   let error = $state('');
   let loading = $state(false);
   let subscription = $state<SubscriptionInfo | null>(null);
+  let subscriptionError = $state('');
+  let subscriptionLoading = $state(true);
 
   onMount(async () => {
     fetchDevices();
     try {
-      subscription = await api<SubscriptionInfo>('/api/me/subscription');
-    } catch {
-      /* subscription is optional */
+      const response = await api<SubscriptionInfo>('/api/me/subscription');
+      if (response.price !== null) priceForDisplay(response.price);
+      subscription = response;
+    } catch (error) {
+      subscriptionError = error instanceof Error ? error.message : String(error);
+      toast.error('Could not load subscription', subscriptionError);
+    } finally {
+      subscriptionLoading = false;
     }
   });
 
   const displayName = $derived(userState.fullName || userState.username);
   const isLocal = $derived(userState.authProvider === 'local');
+  const roleLabel = $derived(userState.role === 'user' ? 'Member' : titleCase(userState.role));
   const deviceUsage = $derived.by(() => {
     const max = subscription?.max_devices ?? null;
     const used = devicesState.list.length;
@@ -79,7 +90,9 @@
         method: 'PUT',
         body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
       });
-      toast.success('Password updated', 'Use your new password the next time you sign in.');
+      clearTokens();
+      window.location.hash = '#/login';
+      toast.success('Password updated', 'All sessions ended. Sign in with your new password.');
       currentPassword = '';
       newPassword = '';
       confirmPassword = '';
@@ -105,7 +118,7 @@
         <div class="min-w-0 flex-1">
           <div class="flex flex-wrap items-center gap-2">
             <h3 class="text-lg font-semibold tracking-tight text-fg">{displayName}</h3>
-            {#if userState.isAdmin}<Badge tone="cyan" uppercase>admin</Badge>{/if}
+            {#if userState.isAdmin}<Badge tone="cyan" uppercase>{userState.role}</Badge>{/if}
             {#if userState.emailVerified}
               <Badge tone="mint" icon="check">Verified</Badge>
             {:else if userState.email}
@@ -130,7 +143,7 @@
         </div>
         <div class="rounded-md border border-border bg-bg-deep px-4 py-3">
           <dt class="text-xs text-muted">Role</dt>
-          <dd class="mt-1 text-sm font-medium text-fg">{userState.isAdmin ? 'Administrator' : 'Member'}</dd>
+          <dd class="mt-1 text-sm font-medium text-fg">{roleLabel}</dd>
         </div>
       </dl>
     </Card>
@@ -167,12 +180,18 @@
         </form>
       {/if}
     </Card>
+
+    <TwoFactorSettings />
   </div>
 
   <div class="flex flex-col gap-6">
     <!-- Plan -->
-    <Card title="Plan" description={subscription?.plan_name ? 'Your current subscription' : 'No plan assigned'} icon="star" accent="gold">
-      {#if subscription?.plan_name}
+    <Card title="Plan" description={subscriptionError ? 'Subscription unavailable' : subscriptionLoading ? 'Loading subscription' : subscription?.plan_name ? 'Your current subscription' : 'No plan assigned'} icon="star" accent="gold">
+      {#if subscriptionError}
+        <Alert tone="danger">{subscriptionError}</Alert>
+      {:else if subscriptionLoading}
+        <p role="status" class="text-sm text-muted">Loading subscription...</p>
+      {:else if subscription?.plan_name}
         <div class="flex items-start justify-between gap-3">
           <div>
             <p class="text-lg font-semibold tracking-tight text-fg">{subscription.plan_name}</p>
@@ -180,9 +199,9 @@
           </div>
           <div class="text-right">
             <p class="text-lg font-semibold tracking-tight text-fg">
-              {subscription.price === 0 || subscription.price == null ? 'Free' : `${subscription.currency ?? ''} ${subscription.price.toFixed(2)}`}
+              {formatPrice(subscription.price, subscription.currency)}
             </p>
-            {#if subscription.price && subscription.price > 0}<p class="text-[11.5px] text-dim">{formatBilling(subscription.billing_period)}</p>{/if}
+            {#if subscription.price !== null && priceForDisplay(subscription.price) > 0}<p class="text-[11.5px] text-dim">{formatBilling(subscription.billing_period)}</p>{/if}
           </div>
         </div>
 

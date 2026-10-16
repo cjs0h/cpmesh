@@ -1,7 +1,8 @@
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, mpsc};
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use cpmesh_proto::models::*;
@@ -10,6 +11,23 @@ use crate::AppState;
 
 pub type UserId = String;
 pub type DeviceId = String;
+pub const QUEUE_CAPACITY: usize = 8;
+const USER_QUEUE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CONNECTIONS: usize = 10;
+
+pub struct QueuedMessage {
+    pub text: axum::extract::ws::Utf8Bytes,
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+impl QueuedMessage {
+    pub fn control(text: String) -> Arc<Self> {
+        Arc::new(Self {
+            text: text.into(),
+            _permit: None,
+        })
+    }
+}
 
 pub struct Client {
     pub user_id: String,
@@ -22,12 +40,15 @@ pub struct Client {
     /// Whether the user's other devices are told when this client goes on- or offline.
     /// True for devices, false for browser sessions.
     pub announce: bool,
-    pub tx: mpsc::UnboundedSender<String>,
+    pub tx: mpsc::Sender<Arc<QueuedMessage>>,
+    /// Signalled to close the connection (account suspended, deleted or signed out).
+    pub kick: CancellationToken,
 }
 
 #[derive(Default)]
 pub struct Hub {
     pub clients: RwLock<HashMap<UserId, HashMap<DeviceId, Client>>>,
+    budgets: RwLock<HashMap<UserId, Arc<Semaphore>>>,
 }
 
 impl Hub {
@@ -35,23 +56,33 @@ impl Hub {
         Self::default()
     }
 
-    pub async fn register(&self, client: Client) {
+    pub async fn register(&self, client: Client) -> bool {
         let user_id = client.user_id.clone();
         let device_id = client.device_id.clone();
         let device_name = client.device_name.clone();
         let announce = client.announce;
 
         let mut clients = self.clients.write().await;
-        clients
+        let user_clients = clients.entry(user_id.clone()).or_default();
+        if user_clients.len() >= MAX_CONNECTIONS && !user_clients.contains_key(&device_id) {
+            client.kick.cancel();
+            return false;
+        }
+        if let Some(old) = user_clients.insert(device_id.clone(), client) {
+            old.kick.cancel();
+        }
+        self.budgets
+            .write()
+            .await
             .entry(user_id.clone())
-            .or_default()
-            .insert(device_id.clone(), client);
+            .or_insert_with(|| Arc::new(Semaphore::new(USER_QUEUE_BYTES)));
         drop(clients);
 
         if announce {
             self.broadcast_device_status(&user_id, &device_id, &device_name, true)
                 .await;
         }
+        true
     }
 
     /// Removes connection `conn_id` of `device_id`. Does nothing if the device has
@@ -71,6 +102,13 @@ impl Hub {
             let removed = user_clients.remove(device_id);
             if user_clients.is_empty() {
                 clients.remove(user_id);
+                let mut budgets = self.budgets.write().await;
+                if budgets
+                    .get(user_id)
+                    .is_some_and(|budget| budget.available_permits() == USER_QUEUE_BYTES)
+                {
+                    budgets.remove(user_id);
+                }
             }
             removed
         };
@@ -102,6 +140,29 @@ impl Hub {
     }
 
     pub async fn broadcast_to_user(&self, user_id: &str, exclude_device_id: &str, msg: &WsMessage) {
+        let browser_message = if msg.msg_type == MSG_CLIPBOARD_NEW {
+            let source = &msg.payload["entry"];
+            let mut entry = serde_json::Map::new();
+            for field in [
+                "id",
+                "device_id",
+                "device_name",
+                "content_type",
+                "encrypted_size",
+                "created_at",
+                "key_version",
+            ] {
+                entry.insert(field.to_string(), source[field].clone());
+            }
+            Some(QueuedMessage::control(
+                json!({
+                    "type": MSG_CLIPBOARD_NEW, "payload": {"entry": entry},
+                })
+                .to_string(),
+            ))
+        } else {
+            None
+        };
         let data = match serde_json::to_string(msg) {
             Ok(d) => d,
             Err(e) => {
@@ -110,21 +171,90 @@ impl Hub {
             }
         };
         let clients = self.clients.read().await;
+        let budget = self.budgets.read().await.get(user_id).cloned();
+        let Some(budget) = budget else {
+            return;
+        };
+        let Ok(permit) = budget.try_acquire_many_owned(data.len() as u32) else {
+            drop(clients);
+            warn!(%user_id, "Relay byte budget exhausted; reconnect to resume from history");
+            self.disconnect_user(user_id).await;
+            return;
+        };
+        let message = Arc::new(QueuedMessage {
+            text: data.into(),
+            _permit: Some(permit),
+        });
+        let mut overflowed = Vec::new();
         if let Some(user_clients) = clients.get(user_id) {
             for (device_id, client) in user_clients {
                 if device_id == exclude_device_id {
                     continue;
                 }
-                if client.tx.send(data.clone()).is_err() {
-                    warn!("Client {} buffer full, dropping message", device_id);
+                let outgoing = if !client.announce {
+                    browser_message.as_ref().unwrap_or(&message)
+                } else {
+                    &message
+                };
+                if client.tx.try_send(outgoing.clone()).is_err() {
+                    warn!(%device_id, "Relay queue unavailable; disconnecting slow consumer");
+                    client.kick.cancel();
+                    overflowed.push((device_id.clone(), client.conn_id));
                 }
             }
+        }
+        drop(clients);
+        for (device, connection) in overflowed {
+            Box::pin(self.remove(user_id, &device, connection)).await;
+        }
+    }
+
+    /// Closes every connection of `user_id`, returning how many there were. Nobody is
+    /// told the devices went offline: the user has no connection left to tell.
+    pub async fn disconnect_user(&self, user_id: &str) -> usize {
+        let mut all_clients = self.clients.write().await;
+        let removed = all_clients.remove(user_id);
+        {
+            let mut budgets = self.budgets.write().await;
+            if budgets
+                .get(user_id)
+                .is_some_and(|budget| budget.available_permits() == USER_QUEUE_BYTES)
+            {
+                budgets.remove(user_id);
+            }
+        }
+        drop(all_clients);
+        match removed {
+            Some(clients) => {
+                for client in clients.values() {
+                    client.kick.cancel();
+                }
+
+                clients.len()
+            }
+            None => 0,
         }
     }
 
     pub async fn total_connections(&self) -> i64 {
         let clients = self.clients.read().await;
         clients.values().map(|uc| uc.len() as i64).sum()
+    }
+
+    pub async fn disconnect_device(&self, user_id: &str, device_id: &str) {
+        let connection = {
+            let clients = self.clients.read().await;
+            clients
+                .get(user_id)
+                .and_then(|c| c.get(device_id))
+                .map(|c| {
+                    c.kick.cancel();
+                    c.conn_id
+                })
+        };
+        if let Some(connection) = connection {
+            self.remove(user_id, device_id, connection).await;
+        }
     }
 
     pub async fn is_device_online(&self, user_id: &str, device_id: &str) -> bool {
@@ -141,8 +271,27 @@ impl Hub {
     }
 }
 
-pub fn start_hub_cleanup(_state: Arc<AppState>) {
-    // Hub cleanup is handled by WebSocket connection drops
+pub fn start_hub_cleanup(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+        loop {
+            interval.tick().await;
+            {
+                let clients = state.hub.clients.read().await;
+                state.hub.budgets.write().await.retain(|user, budget| {
+                    clients.contains_key(user) || budget.available_permits() < USER_QUEUE_BYTES
+                });
+            }
+            if let Err(error) = sqlx::query(
+                "DELETE FROM clipboard_requests WHERE created_at < NOW() - INTERVAL '24 hours'",
+            )
+            .execute(&state.db.pool)
+            .await
+            {
+                warn!("Failed to expire clipboard request receipts: {error}");
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -150,8 +299,8 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc::error::TryRecvError;
 
-    fn client(user: &str, device: &str) -> (Client, mpsc::UnboundedReceiver<String>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+    fn client(user: &str, device: &str) -> (Client, mpsc::Receiver<Arc<QueuedMessage>>) {
+        let (tx, rx) = mpsc::channel(QUEUE_CAPACITY);
         (
             Client {
                 user_id: user.to_string(),
@@ -160,13 +309,60 @@ mod tests {
                 conn_id: uuid::Uuid::new_v4(),
                 announce: true,
                 tx,
+                kick: CancellationToken::new(),
             },
             rx,
         )
     }
 
-    fn parse(raw: String) -> WsMessage {
-        serde_json::from_str(&raw).unwrap()
+    fn parse(raw: Arc<QueuedMessage>) -> WsMessage {
+        serde_json::from_str(&raw.text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn slow_consumers_are_disconnected_instead_of_growing_the_queue() {
+        let hub = Hub::new();
+        let (client, _rx) = client("u", "slow");
+        let kick = client.kick.clone();
+        hub.register(client).await;
+        let msg = WsMessage {
+            msg_type: MSG_PING.into(),
+            payload: json!({}),
+        };
+        for _ in 0..=QUEUE_CAPACITY {
+            hub.broadcast_to_user("u", "", &msg).await;
+        }
+        assert!(kick.is_cancelled());
+        assert_eq!(hub.user_connection_count("u").await, 0);
+    }
+
+    #[tokio::test]
+    async fn per_user_byte_budget_and_connection_limit_are_enforced() {
+        let hub = Hub::new();
+        let mut receivers = Vec::new();
+        for i in 0..MAX_CONNECTIONS {
+            let (mut client, rx) = client("u", &i.to_string());
+            client.announce = false;
+            assert!(hub.register(client).await);
+            receivers.push(rx);
+        }
+        let (extra, _rx) = client("u", "extra");
+        assert!(!hub.register(extra).await);
+        assert_eq!(hub.user_connection_count("u").await, MAX_CONNECTIONS);
+        hub.budgets
+            .write()
+            .await
+            .insert("u".into(), Arc::new(Semaphore::new(32)));
+        hub.broadcast_to_user(
+            "u",
+            "",
+            &WsMessage {
+                msg_type: MSG_PING.into(),
+                payload: json!({"data": "x".repeat(100)}),
+            },
+        )
+        .await;
+        assert_eq!(hub.user_connection_count("u").await, 0);
     }
 
     #[tokio::test]
@@ -357,6 +553,35 @@ mod tests {
         assert_eq!(hub.user_connection_count("u2").await, 1);
         assert!(hub.is_device_online("u1", "a").await);
         assert!(!hub.is_device_online("u2", "a").await);
+    }
+
+    #[tokio::test]
+    async fn disconnect_user_kicks_every_connection_of_that_user_only() {
+        let hub = Hub::new();
+        let (a, _ra) = client("u1", "a");
+        let (b, _rb) = client("u1", "b");
+        let (x, _rx) = client("u2", "x");
+        let (kick_a, kick_b, kick_x) = (a.kick.clone(), b.kick.clone(), x.kick.clone());
+        for c in [a, b, x] {
+            hub.register(c).await;
+        }
+
+        assert_eq!(hub.disconnect_user("u1").await, 2);
+        assert_eq!(hub.user_connection_count("u1").await, 0);
+        assert_eq!(hub.user_connection_count("u2").await, 1);
+        // The kicked connections are woken (a stored permit completes immediately)
+        for kick in [kick_a, kick_b] {
+            tokio::time::timeout(std::time::Duration::from_secs(1), kick.cancelled())
+                .await
+                .expect("connection was kicked");
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), kick_x.cancelled())
+                .await
+                .is_err(),
+            "other users stay connected"
+        );
+        assert_eq!(hub.disconnect_user("u1").await, 0);
     }
 
     #[tokio::test]

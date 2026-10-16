@@ -14,8 +14,11 @@
  *
  * Environment:
  *   CPMESH_URL              Server base URL (default https://cpmesh.com)
- *   CPMESH_ADMIN_USERNAME   Admin account used for the admin API (publishing is skipped when unset)
- *   CPMESH_ADMIN_PASSWORD
+ *   CPMESH_ADMIN_TOKEN      API token (cpm_...) with the releases:write scope, created by an owner or admin in the
+ *                           admin console under API tokens. Publishing is skipped when neither it nor the
+ *                           username and password are set.
+ *   CPMESH_ADMIN_USERNAME   Admin account to sign in with instead of a token. Only for servers without two-factor
+ *   CPMESH_ADMIN_PASSWORD   authentication: the admin API needs a 2FA-verified session, which this script cannot get.
  *
  * Installers must be named cpmesh-<version>-<os>[-<arch>][-setup].<ext>. For every update target
  * (the platform/arch pair an app reports) the best installer becomes a current app release, and
@@ -137,9 +140,25 @@ function oneLine(text) {
   return String(text ?? '').replace(/\s+/g, ' ').trim().slice(0, 300);
 }
 
-/** Minimal client for the cpmesh REST API. */
-export function createApi(baseUrl, { fetch: fetchImpl = globalThis.fetch } = {}) {
-  let token = null;
+/**
+ * The admin API credentials from the environment: an API token, else a username and password,
+ * else null (publishing is skipped).
+ */
+export function adminCredentials(env = process.env) {
+  const token = env.CPMESH_ADMIN_TOKEN?.trim();
+  if (token) return { token };
+  if (env.CPMESH_ADMIN_USERNAME && env.CPMESH_ADMIN_PASSWORD) {
+    return { username: env.CPMESH_ADMIN_USERNAME, password: env.CPMESH_ADMIN_PASSWORD };
+  }
+  return null;
+}
+
+/**
+ * Minimal client for the cpmesh REST API. Admin calls use the API token passed as `token`, or the
+ * session from login().
+ */
+export function createApi(baseUrl, { fetch: fetchImpl = globalThis.fetch, token: apiToken = null } = {}) {
+  let token = apiToken;
 
   async function call(method, pathname, { body, auth = true } = {}) {
     const headers = { Accept: 'application/json', 'User-Agent': 'cpmesh-release-publisher' };
@@ -168,9 +187,23 @@ export function createApi(baseUrl, { fetch: fetchImpl = globalThis.fetch } = {})
       data = undefined;
     }
     if (!res.ok) {
+      const tokensPage = new URL('/#/admin/tokens', url).href;
+      // A password sign-in stops at the second factor, and the admin API only takes 2FA-verified sessions
+      if (res.status === 403 && data?.code === 'mfa_required') {
+        throw new Error(
+          `${method} ${url.pathname} returned HTTP 403: the admin account uses two-factor authentication, so the ` +
+            'release cannot be published with a username and password. Create an API token with the releases:write ' +
+            `scope in the admin console (API tokens, ${tokensPage}) and save it as the CPMESH_ADMIN_TOKEN secret.`,
+        );
+      }
       const detail =
         data?.message ?? data?.error ?? `${res.headers.get('content-type') ?? 'no content type'}: ${text.slice(0, 120)}`;
-      throw new Error(`${method} ${url.pathname} returned HTTP ${res.status} (${detail})`);
+      const hint =
+        auth && apiToken && (res.status === 401 || res.status === 403)
+          ? `; CPMESH_ADMIN_TOKEN must be a current API token with the releases:write scope, from an owner or admin ` +
+            `(create a new one in the admin console under API tokens, ${tokensPage})`
+          : '';
+      throw new Error(`${method} ${url.pathname} returned HTTP ${res.status} (${detail})${hint}`);
     }
     if (data === undefined) {
       throw new Error(
@@ -355,11 +388,12 @@ async function main() {
   console.log(formatPlan(plan));
   if (values['dry-run']) return;
 
-  const { CPMESH_ADMIN_USERNAME: username, CPMESH_ADMIN_PASSWORD: password } = process.env;
-  if (!username || !password) {
+  const credentials = adminCredentials();
+  if (!credentials) {
     warn(
       'Website not updated',
-      'CPMESH_ADMIN_USERNAME and CPMESH_ADMIN_PASSWORD are not set, so the release was not registered on the website.',
+      'Neither CPMESH_ADMIN_TOKEN nor CPMESH_ADMIN_USERNAME and CPMESH_ADMIN_PASSWORD are set, so the release was ' +
+        'not registered on the website.',
     );
     return;
   }
@@ -367,11 +401,11 @@ async function main() {
 
   if (!values['skip-url-check']) await checkDownloadUrls(plan);
 
-  const api = createApi(baseUrl);
-  const token = await api.login(username, password);
+  const api = createApi(baseUrl, { token: credentials.token });
+  const token = credentials.token ?? (await api.login(credentials.username, credentials.password));
   if (IN_ACTIONS) console.log(`::add-mask::${token}`);
 
-  console.log(`\nPublishing to ${baseUrl}`);
+  console.log(`\nPublishing to ${baseUrl} (${credentials.token ? 'API token' : 'admin sign-in with password'})`);
   await publishPlan(plan, api, { force: values.force, log: (line) => console.log(`  ${line}`) });
   await verifyPublished(plan, api);
   console.log(`Verified: ${baseUrl} lists the installers and offers ${plan.version} to the apps.`);

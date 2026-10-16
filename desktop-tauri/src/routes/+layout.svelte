@@ -7,6 +7,7 @@
 		destroyEventListeners,
 		getAppStateValue,
 		getAvailableUpdate,
+		getSyncError,
 		dismissUpdate
 	} from '#lib/store.svelte.js';
 
@@ -14,6 +15,7 @@
 		downloadAndInstallUpdate,
 		getConfig,
 		getMyApprovalStatus,
+		confirmPairing,
 		connectToServer,
 		logout,
 		type MyApprovalStatus
@@ -63,7 +65,8 @@
 	async function pollApprovalStatus() {
 		try {
 			approvalStatus = await getMyApprovalStatus();
-			if (approvalStatus.status === 'approved') {
+			approvalError = '';
+			if (approvalStatus.status === 'approved' && approvalStatus.locally_verified) {
 				// Device was approved! Stop polling and transition
 				if (approvalPollTimer) {
 					clearInterval(approvalPollTimer);
@@ -84,9 +87,17 @@
 				}
 				deviceStatus = 'rejected';
 			}
-		} catch {
-			// ignore polling errors
+		} catch (e) {
+			approvalError = `Approval status unavailable: ${e}`;
 		}
+	}
+
+	async function handleConfirmPairing() {
+		if (!approvalStatus?.session_id || !approvalStatus.approval_code) return;
+		try {
+			await confirmPairing(approvalStatus.session_id, approvalStatus.approval_code);
+			await pollApprovalStatus();
+		} catch (e) { approvalError = String(e); }
 	}
 
 	async function handleLogout() {
@@ -96,8 +107,9 @@
 	}
 
 	const appState = $derived(getAppStateValue());
+	const syncError = $derived(getSyncError());
 	const isConfigured = $derived(appState !== 'not_configured');
-	const isPendingApproval = $derived(isConfigured && deviceStatus === 'pending');
+	const isPendingApproval = $derived(isConfigured && deviceStatus === 'pending' && page.url.pathname !== '/devices');
 	const isRejected = $derived(isConfigured && deviceStatus === 'rejected');
 	const updateInfo = $derived(getAvailableUpdate());
 	const desktop = isDesktop();
@@ -120,6 +132,7 @@
 	}
 </script>
 
+{#if syncError}<p class="approval-error" role="alert">{syncError}</p>{/if}
 {#if !isConfigured}
 	{@render children()}
 {:else if isPendingApproval}
@@ -134,9 +147,12 @@
 				<p class="approval-error">{approvalError}</p>
 				<button class="logout-btn" onclick={() => { approvalError = ''; startApprovalPolling(); }}>Retry</button>
 			{:else if approvalStatus?.approval_code}
-				<p class="code-label">Verification Code</p>
+				<p class="code-label">Full pairing fingerprint</p>
 				<div class="approval-code">{approvalStatus.approval_code}</div>
-				<p class="code-hint">Confirm this code matches on the approving device.</p>
+				<p class="code-hint">Compare all 64 characters directly on the approving device, or through an independent trusted channel. Confirm on both devices.</p>
+				<button class="primary" onclick={handleConfirmPairing} disabled={approvalStatus.locally_verified}>
+					{approvalStatus.locally_verified ? 'Fingerprint verified' : 'All characters match - trust approver'}
+				</button>
 			{:else}
 				<div class="waiting-steps">
 					<p class="steps-label">To approve this device:</p>
@@ -154,6 +170,7 @@
 			{/if}
 
 			<button class="logout-btn" onclick={handleLogout}>Cancel & Log Out</button>
+			<a href="/devices">Recover trust by verifying an existing device's full fingerprint</a>
 		</div>
 	</div>
 {:else if isRejected}
@@ -425,7 +442,8 @@
 
 	.approval-code {
 		font-family: monospace;
-		font-size: 2rem;
+		font-size: 0.9rem;
+		overflow-wrap: anywhere;
 		font-weight: 700;
 		letter-spacing: 0.2em;
 		padding: 1rem;

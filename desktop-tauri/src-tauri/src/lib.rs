@@ -4,6 +4,7 @@ mod config;
 mod crypto;
 mod fingerprint;
 mod history;
+mod key_sync;
 mod proto;
 mod secure_storage;
 mod state;
@@ -179,8 +180,11 @@ pub fn run() {
             commands::get_status,
             commands::get_app_state,
             commands::setup_and_login,
+            commands::complete_mfa_login,
+            commands::cancel_mfa_login,
             commands::setup_with_oauth_tokens,
             commands::check_social_status,
+            commands::check_browser_sign_in,
             commands::get_user_info,
             commands::exchange_oauth_code,
             commands::connect,
@@ -192,6 +196,9 @@ pub fn run() {
             commands::confirm_device_approval,
             commands::reject_pending_device,
             commands::get_my_approval_status,
+            commands::confirm_pairing,
+            commands::get_own_identity,
+            commands::verify_device_identity,
             commands::get_history,
             commands::search_history,
             commands::copy_entry,
@@ -367,7 +374,7 @@ pub fn run() {
                 });
             }
 
-            // Auto-connect on startup if configured
+            // Startup uses the same restoration, authorization and persistence path as reconnect.
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let ctx: tauri::State<'_, AppContext> = handle.state::<AppContext>();
@@ -375,51 +382,11 @@ pub fn run() {
                     let config = ctx.config.read().await;
                     config.is_configured() && config.auto_connect
                 };
-                if should_connect {
-                    let cfg: config::AppConfig = ctx.config.read().await.clone();
-                    let key_path = config::AppConfig::key_path(&ctx.config_dir);
-                    if let Ok(kp) = crypto::keys::KeyPair::load_or_generate(&key_path) {
-                        let mut exchange = crypto::exchange::KeyExchange::new(kp);
-
-                        // Restore the stored session
-                        *ctx.api.lock().await = commands::restore_api_client(
-                            &cfg.server_url,
-                            &ctx.config_dir,
-                            &cfg.device_id,
-                        );
-
-                        // Try to setup group key
-                        {
-                            let api: tokio::sync::MutexGuard<'_, api::client::ApiClient> =
-                                ctx.api.lock().await;
-                            if let Ok(gk) = api.get_group_key().await {
-                                if let Some(gk_resp) = gk {
-                                    if let Ok(peer_pub) = crypto::keys::KeyPair::parse_public_key(
-                                        &gk_resp.from_public_key,
-                                    ) {
-                                        let version = gk_resp.version;
-                                        let _ = exchange.decrypt_from_device(
-                                            &gk_resp.encrypted_key,
-                                            &peer_pub,
-                                            version,
-                                        );
-                                    }
-                                } else {
-                                    exchange.init_group_key();
-                                }
-                            }
-                        }
-                        *ctx.exchange.lock().await = Some(exchange);
-
-                        // Initialize history
-                        let db_path = ctx.config_dir.join("history.db");
-                        if let Ok(h) = history::History::open(&db_path, 1000) {
-                            *ctx.history.lock().await = Some(h);
-                        }
-
-                        // Connect
-                        let _ = commands::connect(handle.clone(), handle.state()).await;
-                    }
+                if should_connect
+                    && let Err(error) = commands::connect(handle.clone(), handle.state()).await
+                {
+                    log::error!("Auto-connect failed: {error}");
+                    let _ = handle.emit("sync-error", error);
                 }
             });
             Ok(())

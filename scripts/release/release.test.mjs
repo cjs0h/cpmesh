@@ -7,6 +7,7 @@ import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
+  adminCredentials,
   buildPlan,
   checkBaseUrl,
   checkDownloadUrls,
@@ -48,10 +49,16 @@ const ALL_INSTALLERS = (v) => [
   `cpmesh-${v}-android.apk`,
 ];
 
-/** In-memory stand-in for the cpmesh admin and public release APIs. */
+/**
+ * In-memory stand-in for the cpmesh admin and public release APIs. The admin API takes the session
+ * from a password sign-in or the API token; with `mfa`, the password sign-in asks for a second factor.
+ */
 class FakeCpmesh {
-  constructor({ password = 'secret' } = {}) {
+  constructor({ password = 'secret', apiToken = 'cpm_release-token', mfa = false } = {}) {
     this.password = password;
+    this.apiToken = apiToken;
+    this.mfa = mfa;
+    this.authorizations = [];
     this.releases = [];
     this.links = [];
     this.calls = [];
@@ -78,12 +85,27 @@ class FakeCpmesh {
     this.calls.push(`${method} ${url.pathname}`);
 
     if (method === 'POST' && url.pathname === '/api/auth/login') {
-      return body.username === 'admin' && body.password === this.password
-        ? this.json(200, { access_token: 'access-token', refresh_token: 'refresh', user_id: 'u1' })
-        : this.json(401, { error: 'invalid credentials' });
+      if (body.username !== 'admin' || body.password !== this.password) {
+        return this.json(401, { error: 'invalid credentials' });
+      }
+      if (this.mfa) {
+        return this.json(403, {
+          error: 'Two-factor authentication is required: enter the code from your authenticator app or use a passkey.',
+          code: 'mfa_required',
+          mfa_token: 'sign-in-ticket',
+          stage: 'verify',
+          methods: ['totp', 'recovery'],
+        });
+      }
+      return this.json(200, { access_token: 'access-token', refresh_token: 'refresh', user_id: 'u1' });
     }
-    if (url.pathname.startsWith('/api/admin/') && init.headers?.Authorization !== 'Bearer access-token') {
-      return this.json(401, { error: 'missing authorization token' });
+    if (url.pathname.startsWith('/api/admin/')) {
+      const authorization = init.headers?.Authorization;
+      this.authorizations.push(authorization);
+      if (authorization !== 'Bearer access-token' && authorization !== `Bearer ${this.apiToken}`) {
+        const apiToken = authorization?.startsWith('Bearer cpm_');
+        return this.json(401, { error: apiToken ? 'invalid or expired API token' : 'missing authorization token' });
+      }
     }
 
     const releaseId = url.pathname.match(/^\/api\/admin\/releases\/(.+)$/)?.[1];
@@ -141,6 +163,13 @@ class FakeCpmesh {
 async function publishWith(server, plan, options) {
   const api = createApi('https://cpmesh.test/', { fetch: server.fetch });
   await api.login('admin', server.password);
+  await publishPlan(plan, api, options);
+  await verifyPublished(plan, api);
+  return api;
+}
+
+async function publishWithToken(server, plan, options) {
+  const api = createApi('https://cpmesh.test/', { fetch: server.fetch, token: server.apiToken });
   await publishPlan(plan, api, options);
   await verifyPublished(plan, api);
   return api;
@@ -265,6 +294,36 @@ describe('publishPlan', () => {
     assert.ok(server.releases.filter((r) => r.is_current).every((r) => r.version === '0.2.0'));
   });
 
+  it('publishes with an API token without signing in', async () => {
+    const server = new FakeCpmesh({ mfa: true });
+    const plan = buildPlan(release('0.2.0', ALL_INSTALLERS('0.2.0')));
+    await publishWithToken(server, plan);
+
+    assert.equal(server.releases.length, 6);
+    assert.equal(server.links.length, 5);
+    assert.ok(!server.calls.includes('POST /api/auth/login'), server.calls.join('\n'));
+    assert.ok(server.authorizations.length > 0);
+    assert.ok(server.authorizations.every((a) => a === 'Bearer cpm_release-token'), server.authorizations.join('\n'));
+  });
+
+  it('explains how to publish when the admin account uses two-factor authentication', async () => {
+    const server = new FakeCpmesh({ mfa: true });
+    const plan = buildPlan(release('0.2.0', ALL_INSTALLERS('0.2.0')));
+    await assert.rejects(
+      publishWith(server, plan),
+      (err) => {
+        assert.match(err.message, /^POST \/api\/auth\/login returned HTTP 403: the admin account uses two-factor authentication/);
+        assert.match(
+          err.message,
+          /Create an API token with the releases:write scope in the admin console \(API tokens, https:\/\/cpmesh\.test\/#\/admin\/tokens\) and save it as the CPMESH_ADMIN_TOKEN secret\./,
+        );
+        assert.ok(!err.message.includes('sign-in-ticket'));
+        return true;
+      },
+    );
+    assert.deepEqual(server.calls, ['POST /api/auth/login']);
+  });
+
   it('verifyPublished reports links the website does not list', async () => {
     const server = new FakeCpmesh();
     const plan = buildPlan(release('0.2.0', ALL_INSTALLERS('0.2.0')));
@@ -300,6 +359,48 @@ describe('createApi', () => {
     await assert.rejects(api.get('/api/admin/releases'), /not logged in/);
   });
 
+  it('explains when the admin API wants a session verified with a second factor', async () => {
+    const api = createApi('https://cpmesh.test/', {
+      fetch: async (url) =>
+        String(url).endsWith('/api/auth/login')
+          ? new Response('{"access_token":"t0k"}', { status: 200, headers: { 'content-type': 'application/json' } })
+          : new Response(
+              '{"error":"Set up two-factor authentication to use the admin console.","code":"mfa_required","enrolled":false}',
+              { status: 403, headers: { 'content-type': 'application/json' } },
+            ),
+    });
+    await api.login('admin', 'pw');
+    await assert.rejects(api.get('/api/admin/releases'), /GET \/api\/admin\/releases returned HTTP 403: .*CPMESH_ADMIN_TOKEN/);
+  });
+
+  it('points at the admin console when the API token is rejected', async () => {
+    const server = new FakeCpmesh();
+    const expired = createApi('https://cpmesh.test/', { fetch: server.fetch, token: 'cpm_expired' });
+    await assert.rejects(
+      expired.get('/api/admin/releases'),
+      /HTTP 401 \(invalid or expired API token\); CPMESH_ADMIN_TOKEN must be a current API token with the releases:write scope.*https:\/\/cpmesh\.test\/#\/admin\/tokens/,
+    );
+    // Public endpoints never send the token
+    await expired.get('/api/downloads/current', { auth: false });
+  });
+
+  it('sends the API token as the bearer token without signing in', async () => {
+    const seen = [];
+    const api = createApi('https://cpmesh.test/', {
+      token: 'cpm_abc',
+      fetch: async (url, init) => {
+        seen.push([String(url), init.headers.Authorization]);
+        return new Response('[]', { status: 200, headers: { 'content-type': 'application/json' } });
+      },
+    });
+    await api.get('/api/admin/releases');
+    await api.get('/api/downloads/current', { auth: false });
+    assert.deepEqual(seen, [
+      ['https://cpmesh.test/api/admin/releases', 'Bearer cpm_abc'],
+      ['https://cpmesh.test/api/downloads/current', undefined],
+    ]);
+  });
+
   it('sends the bearer token after logging in, and never follows redirects', async () => {
     const seen = [];
     const api = createApi('https://cpmesh.test/', {
@@ -317,6 +418,21 @@ describe('createApi', () => {
 });
 
 describe('helpers', () => {
+  it('adminCredentials prefers an API token and skips publishing without credentials', () => {
+    assert.deepEqual(adminCredentials({ CPMESH_ADMIN_TOKEN: ' cpm_abc\n' }), { token: 'cpm_abc' });
+    assert.deepEqual(
+      adminCredentials({ CPMESH_ADMIN_TOKEN: 'cpm_abc', CPMESH_ADMIN_USERNAME: 'admin', CPMESH_ADMIN_PASSWORD: 'pw' }),
+      { token: 'cpm_abc' },
+    );
+    // GitHub Actions passes unset secrets as empty strings
+    assert.deepEqual(
+      adminCredentials({ CPMESH_ADMIN_TOKEN: '', CPMESH_ADMIN_USERNAME: 'admin', CPMESH_ADMIN_PASSWORD: 'pw' }),
+      { username: 'admin', password: 'pw' },
+    );
+    assert.equal(adminCredentials({ CPMESH_ADMIN_TOKEN: '', CPMESH_ADMIN_USERNAME: 'admin', CPMESH_ADMIN_PASSWORD: '' }), null);
+    assert.equal(adminCredentials({}), null);
+  });
+
   it('compareVersions orders numerically', () => {
     assert.ok(compareVersions('0.10.0', '0.9.9') > 0);
     assert.ok(compareVersions('v1.0.0', '1.0.1') < 0);

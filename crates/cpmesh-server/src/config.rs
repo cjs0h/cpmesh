@@ -24,6 +24,35 @@ pub struct Config {
     pub trust_proxy_headers: bool,
     // Group key rotation
     pub group_key_rotation_interval_hours: i64,
+    // Two-factor authentication
+    pub mfa_policy: MfaPolicy,
+    /// WebAuthn relying party ID (a registrable domain); empty disables passkeys.
+    pub webauthn_rp_id: String,
+    /// Origins passkey ceremonies may run on (the BASE_URL origin plus WEBAUTHN_ORIGINS).
+    pub webauthn_origins: Vec<String>,
+    // Release publishing
+    /// Contents of the apps' `updater-key.pub`; when set, uploaded installers must carry a
+    /// valid signature from that key.
+    pub updater_public_key: String,
+    /// URL prefixes download links and releases may point to; empty allows any URL.
+    pub download_url_prefixes: Vec<String>,
+}
+
+/// Which accounts must use two-factor authentication (`MFA_REQUIRED`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MfaPolicy {
+    /// Every account (the default).
+    All,
+    /// Only staff accounts; everyone else may opt in.
+    Staff,
+}
+
+fn split_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 impl Config {
@@ -52,6 +81,35 @@ impl Config {
         let reg = env("REGISTRATION_OPEN", "true");
         let registration_open = !matches!(reg.to_lowercase().as_str(), "false" | "0");
 
+        let base_url = env("BASE_URL", "").trim_end_matches('/').to_string();
+        let parsed_base = reqwest::Url::parse(&base_url).ok();
+
+        let mfa_policy = match env("MFA_REQUIRED", "all").trim().to_lowercase().as_str() {
+            "staff" => MfaPolicy::Staff,
+            _ => MfaPolicy::All,
+        };
+
+        let webauthn_rp_id = match lookup("WEBAUTHN_RP_ID").map(|v| v.trim().to_lowercase()) {
+            Some(id) if !id.is_empty() => id,
+            _ => parsed_base
+                .as_ref()
+                .and_then(|u| u.host_str())
+                .unwrap_or_default()
+                .to_lowercase(),
+        };
+        let mut webauthn_origins: Vec<String> = parsed_base
+            .as_ref()
+            .map(|u| u.origin().ascii_serialization())
+            .filter(|o| o != "null")
+            .into_iter()
+            .collect();
+        for origin in split_list(&env("WEBAUTHN_ORIGINS", "")) {
+            let origin = origin.trim_end_matches('/').to_string();
+            if !webauthn_origins.contains(&origin) {
+                webauthn_origins.push(origin);
+            }
+        }
+
         Config {
             database_url: env(
                 "DATABASE_URL",
@@ -70,7 +128,7 @@ impl Config {
             initial_admin_email: env("INITIAL_ADMIN_EMAIL", ""),
             insecure_dev: env("CPNET_INSECURE_DEV", "0") == "1",
             registration_open,
-            base_url: env("BASE_URL", "").trim_end_matches('/').to_string(),
+            base_url,
             oidc_issuer_url: env("OIDC_ISSUER_URL", ""),
             oidc_client_id: env("OIDC_CLIENT_ID", ""),
             oidc_client_secret: env("OIDC_CLIENT_SECRET", ""),
@@ -79,7 +137,41 @@ impl Config {
             group_key_rotation_interval_hours: env("GROUP_KEY_ROTATION_INTERVAL_HOURS", "24")
                 .parse()
                 .unwrap_or(24),
+            mfa_policy,
+            webauthn_rp_id,
+            webauthn_origins,
+            updater_public_key: env("UPDATER_PUBLIC_KEY", "").trim().to_string(),
+            download_url_prefixes: split_list(&env("DOWNLOAD_URL_PREFIXES", "")),
         }
+    }
+
+    /// Whether passkeys can be offered (a relying party ID and at least one origin).
+    pub fn passkeys_enabled(&self) -> bool {
+        !self.webauthn_rp_id.is_empty() && !self.webauthn_origins.is_empty()
+    }
+
+    /// Whether `url` may be published as a download or release link: a file this server
+    /// hosts, or an http(s) URL under one of `DOWNLOAD_URL_PREFIXES` when that is set.
+    pub fn download_url_allowed(&self, url: &str) -> bool {
+        // Files this server hosts itself are uploaded through the (signature-checked) API
+        if let Some(name) = url.strip_prefix("/api/downloads/") {
+            return !name.is_empty() && !name.contains(['/', '\\']) && !name.contains("..");
+        }
+        let Ok(parsed) = reqwest::Url::parse(url) else {
+            return false;
+        };
+        if !matches!(parsed.scheme(), "https" | "http") {
+            return false;
+        }
+        if self.download_url_prefixes.is_empty() {
+            return true;
+        }
+        // Compare parsed URLs, so dot segments and look-alike hosts cannot slip past
+        self.download_url_prefixes.iter().any(|prefix| {
+            reqwest::Url::parse(prefix).is_ok_and(|allowed| {
+                allowed.origin() == parsed.origin() && parsed.path().starts_with(allowed.path())
+            })
+        })
     }
 }
 
@@ -215,5 +307,94 @@ mod tests {
     fn from_env_does_not_panic() {
         // Smoke test: reads whatever the process environment holds.
         let _ = Config::from_env();
+    }
+
+    #[test]
+    fn mfa_is_required_for_everyone_unless_limited_to_staff() {
+        assert_eq!(config_from(&[]).mfa_policy, MfaPolicy::All);
+        assert_eq!(
+            config_from(&[("MFA_REQUIRED", "anything")]).mfa_policy,
+            MfaPolicy::All
+        );
+        assert_eq!(
+            config_from(&[("MFA_REQUIRED", " Staff ")]).mfa_policy,
+            MfaPolicy::Staff
+        );
+    }
+
+    #[test]
+    fn passkey_relying_party_derives_from_base_url() {
+        let cfg = config_from(&[("BASE_URL", "https://CPMesh.example:8443/app/")]);
+        assert_eq!(cfg.webauthn_rp_id, "cpmesh.example");
+        assert_eq!(cfg.webauthn_origins, vec!["https://cpmesh.example:8443"]);
+        assert!(cfg.passkeys_enabled());
+
+        let cfg = config_from(&[
+            ("BASE_URL", "https://app.cpmesh.example"),
+            ("WEBAUTHN_RP_ID", "cpmesh.example"),
+            (
+                "WEBAUTHN_ORIGINS",
+                "https://cpmesh.example/, https://app.cpmesh.example",
+            ),
+        ]);
+        assert_eq!(cfg.webauthn_rp_id, "cpmesh.example");
+        assert_eq!(
+            cfg.webauthn_origins,
+            vec!["https://app.cpmesh.example", "https://cpmesh.example"]
+        );
+
+        let cfg = config_from(&[]);
+        assert_eq!(cfg.webauthn_rp_id, "");
+        assert!(cfg.webauthn_origins.is_empty());
+        assert!(!cfg.passkeys_enabled());
+    }
+
+    #[test]
+    fn download_urls_must_be_http_or_hosted_here() {
+        let cfg = config_from(&[]);
+        assert!(cfg.download_url_allowed("https://example.com/cpmesh.exe"));
+        assert!(cfg.download_url_allowed("/api/downloads/cpmesh-1.0.0.dmg"));
+        for bad in [
+            "javascript:alert(1)",
+            "data:text/html,hi",
+            "ftp://example.com/a",
+            "not a url",
+            "/api/downloads/",
+            "/api/downloads/../admin",
+            "/api/downloads/a/b",
+            "/elsewhere/file",
+        ] {
+            assert!(!cfg.download_url_allowed(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn download_url_prefixes_compare_origin_and_normalised_path() {
+        let cfg = config_from(&[(
+            "DOWNLOAD_URL_PREFIXES",
+            "https://github.com/cjs0h/cpmesh/releases/download/, https://cdn.example",
+        )]);
+        assert_eq!(cfg.download_url_prefixes.len(), 2);
+        assert!(cfg.download_url_allowed(
+            "https://github.com/cjs0h/cpmesh/releases/download/v1.0.0/cpmesh.exe"
+        ));
+        assert!(cfg.download_url_allowed("https://cdn.example/any/file.dmg"));
+        assert!(cfg.download_url_allowed("/api/downloads/cpmesh.deb"));
+        for bad in [
+            "https://github.com/cjs0h/cpmesh/releases/download/../../../evil/x/releases/download/v1/a.exe",
+            "https://github.com/evil/cpmesh/releases/download/v1/a.exe",
+            "https://github.com.evil.example/cjs0h/cpmesh/releases/download/v1/a.exe",
+            "https://github.com@evil.example/cjs0h/cpmesh/releases/download/v1/a.exe",
+            "http://github.com/cjs0h/cpmesh/releases/download/v1/a.exe",
+            "https://cdn.example.evil/file.dmg",
+        ] {
+            assert!(!cfg.download_url_allowed(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn updater_public_key_is_trimmed() {
+        let cfg = config_from(&[("UPDATER_PUBLIC_KEY", "  abc==\n")]);
+        assert_eq!(cfg.updater_public_key, "abc==");
     }
 }

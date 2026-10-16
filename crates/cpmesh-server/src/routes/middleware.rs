@@ -12,6 +12,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use crate::AppState;
+use crate::rbac::{self, Permission, Role};
 
 pub type IpRateLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
 
@@ -26,29 +27,98 @@ pub struct AuthClaims {
     pub user_id: uuid::Uuid,
     pub device_id: Option<uuid::Uuid>,
     pub iat: u64,
+    pub session_start: u64,
+    /// The session was established with a second factor.
+    pub mfa: bool,
+    /// When the user last signed in or confirmed a second factor (0 when unknown).
+    pub auth_time: u64,
 }
 
-/// A refused request; becomes a JSON error response.
+impl AuthClaims {
+    pub fn session_started_at(&self) -> u64 {
+        if self.session_start == 0 {
+            self.iat
+        } else {
+            self.session_start.min(self.iat)
+        }
+    }
+
+    /// Whether the user signed in or confirmed their second factor within `window`.
+    pub fn authenticated_within(&self, window: std::time::Duration) -> bool {
+        self.auth_time > 0
+            && crate::routes::auth_service::now_epoch().saturating_sub(self.auth_time)
+                <= window.as_secs()
+    }
+}
+
+/// A refused request; becomes a JSON error response. Small, so helpers can return
+/// `Result<T, ApiError>` cheaply and handlers convert it at the edge.
 #[derive(Debug)]
-pub(crate) struct Rejection {
+pub struct ApiError {
     status: StatusCode,
     message: Cow<'static, str>,
+    code: Option<&'static str>,
+    extra: Option<Box<serde_json::Value>>,
 }
 
-impl Rejection {
-    fn new(status: StatusCode, message: impl Into<Cow<'static, str>>) -> Self {
-        Rejection {
+impl ApiError {
+    pub fn new(status: StatusCode, message: impl Into<Cow<'static, str>>) -> Self {
+        ApiError {
             status,
             message: message.into(),
+            code: None,
+            extra: None,
+        }
+    }
+
+    /// An error clients can recognize by its `code`.
+    pub fn coded(
+        status: StatusCode,
+        code: &'static str,
+        message: impl Into<Cow<'static, str>>,
+    ) -> Self {
+        ApiError {
+            code: Some(code),
+            ..ApiError::new(status, message)
+        }
+    }
+
+    /// Adds fields to the JSON body.
+    pub fn with_extra(mut self, extra: serde_json::Value) -> Self {
+        self.extra = Some(Box::new(extra));
+        self
+    }
+
+    /// An unexpected failure: logged, and reported without details.
+    pub fn internal(error: impl std::fmt::Display) -> Self {
+        tracing::warn!("request failed: {error}");
+        ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+    }
+
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let extra = self.extra.map(|e| *e).unwrap_or_else(|| json!({}));
+        match self.code {
+            Some(code) => json_error_code(code, &self.message, self.status, extra),
+            None => {
+                let mut body = json!({"error": self.message});
+                if let (Some(body), serde_json::Value::Object(extra)) =
+                    (body.as_object_mut(), extra)
+                {
+                    body.extend(extra);
+                }
+                (self.status, axum::Json(body)).into_response()
+            }
         }
     }
 }
 
-impl IntoResponse for Rejection {
-    fn into_response(self) -> Response {
-        json_error(&self.message, self.status)
-    }
-}
+pub(crate) type Rejection = ApiError;
 
 pub async fn auth_middleware(
     State(state): State<Arc<AppState>>,
@@ -81,19 +151,26 @@ pub(crate) async fn authenticate(
     Ok(claims)
 }
 
-/// Confirms the user still exists and has not revoked all sessions since `claims`
-/// were issued.
+/// Confirms the user still exists, is not suspended, and has not revoked all sessions
+/// since `claims` were issued.
 pub(crate) async fn check_session(state: &AppState, claims: &AuthClaims) -> Result<(), Rejection> {
     match state.db.get_user_by_id(claims.user_id).await {
         Ok(user) => {
             // Check if token was issued before bulk revocation
             if let Some(revoked_before) = user.tokens_revoked_before
                 && revoked_before > 0
-                && (claims.iat as i64) < revoked_before
+                && (claims.session_started_at() as i64) < revoked_before
             {
                 return Err(Rejection::new(
                     StatusCode::UNAUTHORIZED,
                     "session has been revoked, please log in again",
+                ));
+            }
+            if user.is_suspended() {
+                return Err(Rejection::coded(
+                    StatusCode::UNAUTHORIZED,
+                    "account_suspended",
+                    "this account is suspended",
                 ));
             }
             Ok(())
@@ -148,9 +225,65 @@ pub(crate) async fn require_approved_device(
     Ok(())
 }
 
+/// The staff member behind an admin request, and how they authenticated.
+#[derive(Clone, Debug)]
+pub struct AdminContext {
+    pub user_id: uuid::Uuid,
+    pub role: Role,
+    /// The session's claims, or `None` when an API token was used.
+    pub claims: Option<AuthClaims>,
+    pub api_token_id: Option<uuid::Uuid>,
+}
+
+impl AdminContext {
+    pub fn require(&self, permission: Permission) -> Result<(), ApiError> {
+        if rbac::permits(self.role, permission) {
+            Ok(())
+        } else {
+            Err(forbidden_for_role())
+        }
+    }
+
+    /// Like [`Self::require`], for an action on the account of a user with `target` role.
+    pub fn require_on(&self, permission: Permission, target: Role) -> Result<(), ApiError> {
+        if rbac::permits_on_target(self.role, permission, target) {
+            Ok(())
+        } else {
+            Err(forbidden_for_role())
+        }
+    }
+
+    /// Sensitive actions need a recent sign-in or second-factor confirmation, and an
+    /// interactive session (never an API token).
+    pub fn require_recent_auth(&self) -> Result<(), ApiError> {
+        match &self.claims {
+            Some(claims) if claims.authenticated_within(crate::mfa::RECENT_AUTH) => Ok(()),
+            Some(_) => Err(ApiError::coded(
+                StatusCode::FORBIDDEN,
+                "reauth_required",
+                "Confirm it's you with your second factor to continue.",
+            )),
+            None => Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "API tokens cannot perform this action",
+            )),
+        }
+    }
+}
+
+fn forbidden_for_role() -> ApiError {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        "your role does not allow this action",
+    )
+}
+
+/// Admits staff whose session was established with a second factor. Runs after
+/// [`auth_middleware`]; the role is read from the database on every request so a
+/// demotion takes effect immediately.
 pub async fn admin_middleware(
     State(state): State<Arc<AppState>>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
     let claims = match req.extensions().get::<AuthClaims>() {
@@ -158,10 +291,199 @@ pub async fn admin_middleware(
         None => return json_error("unauthorized", StatusCode::UNAUTHORIZED),
     };
 
-    match state.db.get_user_by_id(claims.user_id).await {
-        Ok(user) if user.is_admin => next.run(req).await,
-        _ => json_error("forbidden", StatusCode::FORBIDDEN),
+    match staff_context(&state, claims).await {
+        Ok(ctx) => {
+            req.extensions_mut().insert(ctx);
+            next.run(req).await
+        }
+        Err(error) => error.into_response(),
     }
+}
+
+async fn staff_context(state: &AppState, claims: AuthClaims) -> Result<AdminContext, ApiError> {
+    let user = match state.db.get_user_by_id(claims.user_id).await {
+        Ok(user) => user,
+        Err(_) => return Err(ApiError::new(StatusCode::FORBIDDEN, "forbidden")),
+    };
+    let role = user.role();
+    if !role.is_staff() {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "forbidden"));
+    }
+    if !claims.mfa {
+        let enrolled = state
+            .db
+            .mfa_summary(user.id)
+            .await
+            .map(|s| s.enabled())
+            .unwrap_or(false);
+        let message = if enrolled {
+            "Confirm your second factor to use the admin console."
+        } else {
+            "Set up two-factor authentication to use the admin console."
+        };
+        return Err(
+            ApiError::coded(StatusCode::FORBIDDEN, "mfa_required", message)
+                .with_extra(json!({ "enrolled": enrolled })),
+        );
+    }
+    Ok(AdminContext {
+        user_id: user.id,
+        role,
+        claims: Some(claims),
+        api_token_id: None,
+    })
+}
+
+/// Prefix of API tokens, which tells them apart from session JWTs.
+pub const API_TOKEN_PREFIX: &str = "cpm_";
+/// Scope for publishing releases and download links (the release workflow).
+pub const SCOPE_RELEASES: &str = "releases:write";
+
+/// For the release and download admin routes: a staff session (as
+/// [`admin_middleware`]), or an API token with the releases scope.
+pub async fn release_admin_middleware(
+    State(state): State<Arc<AppState>>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    if let Some(token) = bearer_token(req.headers())
+        && token.starts_with(API_TOKEN_PREFIX)
+    {
+        return match api_token_context(&state, &token, SCOPE_RELEASES).await {
+            Ok(ctx) => {
+                req.extensions_mut().insert(ctx);
+                next.run(req).await
+            }
+            Err(rejection) => rejection.into_response(),
+        };
+    }
+
+    let claims = match authenticate(&state, req.headers()).await {
+        Ok(claims) => claims,
+        Err(rejection) => return rejection.into_response(),
+    };
+    match staff_context(&state, claims).await {
+        Ok(ctx) => {
+            req.extensions_mut().insert(ctx);
+            next.run(req).await
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
+/// SHA-256 of an API token, as stored.
+pub fn api_token_hash(token: &str) -> String {
+    use sha2::Digest;
+    crate::mfa::codes::hex(&sha2::Sha256::digest(token.as_bytes()))
+}
+
+async fn api_token_context(
+    state: &AppState,
+    token: &str,
+    scope: &str,
+) -> Result<AdminContext, Rejection> {
+    let invalid = || Rejection::new(StatusCode::UNAUTHORIZED, "invalid or expired API token");
+    let record = state
+        .db
+        .find_active_api_token(&api_token_hash(token))
+        .await
+        .map_err(|_| invalid())?
+        .ok_or_else(invalid)?;
+    let scopes: Vec<String> = serde_json::from_value(record.scopes.clone()).unwrap_or_default();
+    if !scopes.iter().any(|s| s == scope) {
+        return Err(Rejection::new(
+            StatusCode::FORBIDDEN,
+            format!("this API token does not have the {scope} scope"),
+        ));
+    }
+    // The token acts for its creator, who must still be allowed to do this
+    let owner = state
+        .db
+        .get_user_by_id(record.user_id)
+        .await
+        .map_err(|_| invalid())?;
+    let role = owner.role();
+    if owner.is_suspended() || !rbac::permits(role, Permission::ManageContent) {
+        return Err(Rejection::new(
+            StatusCode::FORBIDDEN,
+            "the owner of this API token can no longer manage releases",
+        ));
+    }
+    let pool = state.db.pool.clone();
+    let id = record.id;
+    tokio::spawn(async move {
+        let _ = crate::db::Db { pool }.touch_api_token(id).await;
+    });
+    Ok(AdminContext {
+        user_id: owner.id,
+        role,
+        claims: None,
+        api_token_id: Some(record.id),
+    })
+}
+
+/// Who is using the two-factor endpoints: a signed-in session, or a sign-in waiting
+/// for its second factor (holding a ticket from the login response).
+#[derive(Clone, Debug)]
+pub enum MfaPrincipal {
+    Session(AuthClaims),
+    SignIn(crate::routes::auth_service::MfaTicket),
+}
+
+impl MfaPrincipal {
+    pub fn user_id(&self) -> uuid::Uuid {
+        match self {
+            MfaPrincipal::Session(claims) => claims.user_id,
+            MfaPrincipal::SignIn(ticket) => ticket.user_id,
+        }
+    }
+}
+
+/// Accepts an access token or a sign-in ticket in the Authorization header.
+pub async fn mfa_principal_middleware(
+    State(state): State<Arc<AppState>>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let Some(token) = bearer_token(req.headers()) else {
+        return json_error("missing authorization token", StatusCode::UNAUTHORIZED);
+    };
+
+    let principal = if let Ok(claims) = state.auth.validate_access_token(&token) {
+        if let Err(rejection) = check_session(&state, &claims).await {
+            return rejection.into_response();
+        }
+        MfaPrincipal::Session(claims)
+    } else if let Ok(ticket) = state.auth.validate_mfa_ticket(&token) {
+        // Used tickets are recorded in the database, shared by every instance
+        if state.auth.check_revoked_db_async(&ticket.jti).await {
+            return json_error(
+                "this sign-in was already completed; sign in again",
+                StatusCode::UNAUTHORIZED,
+            );
+        }
+        match state.db.get_user_by_id(ticket.user_id).await {
+            Ok(user) if user.is_suspended() => {
+                return Rejection::coded(
+                    StatusCode::FORBIDDEN,
+                    "account_suspended",
+                    "this account is suspended",
+                )
+                .into_response();
+            }
+            Ok(_) => {}
+            Err(_) => return json_error("user no longer exists", StatusCode::UNAUTHORIZED),
+        }
+        MfaPrincipal::SignIn(ticket)
+    } else {
+        return json_error(
+            "invalid or expired token; sign in again",
+            StatusCode::UNAUTHORIZED,
+        );
+    };
+
+    req.extensions_mut().insert(principal);
+    next.run(req).await
 }
 
 pub async fn security_headers(req: Request, next: Next) -> Response {
@@ -210,7 +532,7 @@ pub async fn security_headers(req: Request, next: Next) -> Response {
 /// Reads the bearer token from the Authorization header. Tokens are never accepted
 /// from the query string, where they would end up in proxy and access logs; browser
 /// WebSockets use a single-use ticket instead (see `websocket::ws_auth_middleware`).
-fn bearer_token(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<String> {
     let auth = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     auth.strip_prefix("Bearer ").map(str::to_string)
 }
@@ -240,9 +562,11 @@ pub async fn rate_limit_auth(
     next: Next,
 ) -> Response {
     let ip = extract_client_ip(req.headers(), &addr, state.config.trust_proxy_headers);
-    let limiter = match req.uri().path() {
+    let path = req.uri().path();
+    let limiter = match path {
         "/api/auth/login" => &state.rate_limiters.login,
         "/api/auth/register" => &state.rate_limiters.register,
+        _ if path.starts_with("/api/mfa/") => &state.rate_limiters.mfa,
         _ => &state.rate_limiters.refresh,
     };
     match limiter.check_key(&ip) {
@@ -256,6 +580,21 @@ pub async fn rate_limit_auth(
 
 pub fn json_error(message: &str, status: StatusCode) -> Response {
     (status, axum::Json(json!({"error": message}))).into_response()
+}
+
+/// An error clients recognize by `code`, with a readable `error` message and any
+/// `extra` fields merged in.
+pub fn json_error_code(
+    code: &str,
+    message: &str,
+    status: StatusCode,
+    extra: serde_json::Value,
+) -> Response {
+    let mut body = json!({"error": message, "code": code});
+    if let (Some(body), serde_json::Value::Object(extra)) = (body.as_object_mut(), extra) {
+        body.extend(extra);
+    }
+    (status, axum::Json(body)).into_response()
 }
 
 pub fn json_response<T: serde::Serialize>(status: StatusCode, data: T) -> Response {

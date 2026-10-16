@@ -19,12 +19,25 @@ export const appRoutes: RouteMeta[] = [
   { path: '/admin/plans', label: 'Plans', description: 'Subscription tiers and their limits.', icon: 'star', admin: true },
   { path: '/admin/downloads', label: 'Downloads', description: 'Installer links shown on the public site.', icon: 'download', admin: true },
   { path: '/admin/releases', label: 'Releases', description: 'Versions advertised to clients for auto-update.', icon: 'upload', admin: true },
-  { path: '/admin/settings', label: 'Site Settings', description: 'Verify SMTP and social login configuration.', icon: 'sliders', admin: true },
-  { path: '/admin/stats', label: 'Stats', description: 'Live counters for this relay.', icon: 'bar-chart', admin: true },
+  { path: '/admin/audit', label: 'Audit log', description: 'Who did what, and when: sign-ins, security changes and admin actions.', icon: 'activity', admin: true },
+  { path: '/admin/tokens', label: 'API tokens', description: 'Tokens for automation such as the release workflow.', icon: 'key', admin: true },
+  { path: '/admin/settings', label: 'Site Settings', description: 'Registration, announcements and integration checks.', icon: 'sliders', admin: true },
+  { path: '/admin/stats', label: 'Stats', description: 'Growth, activity and storage on this relay.', icon: 'bar-chart', admin: true },
 ];
 
+/** Pages below a navigation entry; they render their own heading. */
+const detailRoutes: RouteMeta[] = [
+  { path: '/admin/users/:id', label: 'User', description: 'Account details and actions.', icon: 'user', admin: true, hideTitle: true },
+];
+
+function matchesPattern(pattern: string, location: string): boolean {
+  const want = pattern.split('/');
+  const have = location.split('/');
+  return want.length === have.length && want.every((part, i) => (part.startsWith(':') ? have[i] !== '' : part === have[i]));
+}
+
 export function routeFor(location: string): RouteMeta | undefined {
-  return appRoutes.find((r) => r.path === location);
+  return appRoutes.find((r) => r.path === location) ?? detailRoutes.find((r) => matchesPattern(r.path, location));
 }
 
 export function isRouteActive(path: string, location: string): boolean {

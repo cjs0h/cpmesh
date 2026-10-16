@@ -3,7 +3,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiError, CpmeshApi, SessionExpiredError } from "../src/api.js";
+import { ApiError, CpmeshApi, MfaRequiredError, SessionExpiredError } from "../src/api.js";
 
 function mockFetch(handler: (url: string, init?: RequestInit) => { status: number; body: unknown }) {
   const calls: { url: string; init?: RequestInit }[] = [];
@@ -40,8 +40,10 @@ describe("CpmeshApi", () => {
 
   it("registerDevice switches to the device-bound token", async () => {
     const calls = mockFetch((url) =>
-      url.includes("/api/devices")
-        ? { status: 201, body: { device: { id: "d1", status: "pending", is_reregistration: false }, access_token: "device-token" } }
+      url.endsWith("/api/devices/challenge")
+        ? { status: 200, body: { challenge: "session-challenge" } }
+        : url.endsWith("/api/devices")
+        ? { status: 201, body: { device: { id: "d1", status: "pending", is_reregistration: false }, access_token: "device-token", refresh_token: "device-refresh" } }
         : { status: 404, body: { error: "nf" } },
     );
     const api = new CpmeshApi("https://srv");
@@ -51,9 +53,11 @@ describe("CpmeshApi", () => {
       public_key: "cHVi",
       public_key_sig: "c2ln",
       fingerprint: "fp",
-    });
+    }, () => "cHJvb2Y=");
     expect(res.device.id).toBe("d1");
     expect(api.access).toBe("device-token");
+    expect(api.refresh).toBe("device-refresh");
+    expect(JSON.parse(calls[1]!.init!.body as string).proof).toEqual({ challenge: "session-challenge", signature: "cHJvb2Y=" });
     expect((calls[0]!.init!.headers as Record<string, string>).Authorization).toBe("Bearer old");
   });
 
@@ -62,6 +66,66 @@ describe("CpmeshApi", () => {
     const api = new CpmeshApi("https://srv");
     await expect(api.login("x", "y", "z")).rejects.toThrow(ApiError);
     await expect(api.login("x", "y", "z")).rejects.toThrow("invalid credentials");
+  });
+
+  it("reports a second factor after the password as MfaRequiredError with the challenge", async () => {
+    mockFetch(() => ({
+      status: 403,
+      body: {
+        error: "Two-factor authentication is required: enter the code from your authenticator app or use a passkey.",
+        code: "mfa_required",
+        mfa_token: "ticket-1",
+        stage: "verify",
+        methods: ["totp", "webauthn", "recovery"],
+        email_code_required: false,
+        email_hint: null,
+        passkeys_available: true,
+      },
+    }));
+    const api = new CpmeshApi("https://srv");
+    const error = await api.login("alice", "pw", "MCP").catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(MfaRequiredError);
+    expect(error).toMatchObject({
+      status: 403,
+      code: "mfa_required",
+      challenge: { mfa_token: "ticket-1", stage: "verify", methods: ["totp", "webauthn", "recovery"] },
+    });
+  });
+
+  it("keeps the code of structured errors", async () => {
+    mockFetch(() => ({
+      status: 403,
+      body: { error: "This account is suspended. Contact your administrator.", code: "account_suspended" },
+    }));
+    const error = await new CpmeshApi("https://srv").login("alice", "pw", "MCP").catch((e: unknown) => e);
+    expect(error).not.toBeInstanceOf(MfaRequiredError);
+    expect(error).toMatchObject({ status: 403, code: "account_suspended", message: "This account is suspended. Contact your administrator." });
+  });
+
+  it("verifyMfa sends the sign-in ticket instead of the session and never refreshes it", async () => {
+    const calls = mockFetch((url, init) => {
+      if (!url.endsWith("/api/mfa/verify")) return { status: 500, body: { error: "unexpected" } };
+      const { code } = JSON.parse(init!.body as string) as { code: string };
+      return code === "123456"
+        ? { status: 200, body: { access_token: "at", refresh_token: "rt" } }
+        : { status: 401, body: { error: "invalid authentication code" } };
+    });
+    const api = new CpmeshApi("https://srv");
+    api.setTokens("session-access", "session-refresh");
+
+    await expect(api.verifyMfa("ticket-1", "totp", "000000")).rejects.toMatchObject({
+      status: 401,
+      message: "invalid authentication code",
+    });
+    await expect(api.verifyMfa("ticket-1", "totp", "123456")).resolves.toEqual({
+      access_token: "at",
+      refresh_token: "rt",
+    });
+
+    expect(calls.map((c) => c.url)).toEqual(["https://srv/api/mfa/verify", "https://srv/api/mfa/verify"]);
+    expect((calls[0]!.init!.headers as Record<string, string>).Authorization).toBe("Bearer ticket-1");
+    expect(JSON.parse(calls[1]!.init!.body as string)).toEqual({ method: "totp", code: "123456" });
+    expect(api.access).toBe("session-access");
   });
 
   it("refreshes the access token once on 401 and retries", async () => {
@@ -104,10 +168,11 @@ describe("CpmeshApi", () => {
       if (url.endsWith("/api/auth/refresh")) {
         return { status: 200, body: { access_token: "unbound", refresh_token: "rt2" } };
       }
+      if (url.endsWith("/api/devices/challenge")) return { status: 200, body: { challenge: "fresh-challenge" } };
       const auth = (init?.headers as Record<string, string>).Authorization;
       if (url.endsWith("/api/devices") && init?.method === "POST") {
         return auth === "Bearer unbound"
-          ? { status: 200, body: { device: { id: "d1", status: "approved", is_reregistration: false }, access_token: "bound" } }
+          ? { status: 200, body: { device: { id: "d1", status: "approved", is_reregistration: false }, access_token: "bound", refresh_token: "rt2" } }
           : { status: 401, body: { error: "expired" } };
       }
       return auth === "Bearer bound" ? { status: 200, body: [] } : { status: 401, body: { error: "expired" } };
@@ -119,6 +184,7 @@ describe("CpmeshApi", () => {
     api.rebind = async (a) => {
       await a.registerDevice(
         { name: "MCP", public_key: "cHVi", public_key_sig: "c2ln", fingerprint: "fp" },
+        () => "cHJvb2Y=",
         { retryOnExpiry: false },
       );
     };

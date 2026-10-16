@@ -4,8 +4,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::proto::models::*;
@@ -52,6 +53,7 @@ fn build_ws_request(
         .header("Host", url.host_str().unwrap_or("localhost"))
         .header("Connection", "Upgrade")
         .header("Upgrade", "websocket")
+        .header("X-Cpmesh-Protocol", PROTOCOL_VERSION)
         .header("Sec-WebSocket-Version", "13")
         .header(
             "Sec-WebSocket-Key",
@@ -77,6 +79,7 @@ pub enum WsEvent {
     ClipboardNew(ClipboardNewPayload),
     DeviceStatus(DeviceStatusPayload),
     GroupKeyUpdated,
+    RotationNeeded,
     Connected,
     Disconnected,
     /// The session can no longer be refreshed; the connection has stopped.
@@ -89,10 +92,17 @@ pub struct WsConnection {
     server_url: String,
     token_provider: TokenProvider,
     fingerprint: Option<String>,
-    event_tx: mpsc::UnboundedSender<WsEvent>,
-    outgoing_tx: mpsc::UnboundedSender<WsMessage>,
-    outgoing_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<WsMessage>>>>,
-    shutdown: Arc<Notify>,
+    event_tx: mpsc::Sender<WsEvent>,
+    outgoing_tx: mpsc::Sender<WsMessage>,
+    outgoing_rx: Arc<Mutex<Option<mpsc::Receiver<WsMessage>>>>,
+    shutdown: CancellationToken,
+    pending: std::sync::Mutex<std::collections::HashMap<String, oneshot::Sender<ClipboardAck>>>,
+}
+
+#[derive(Debug)]
+pub struct ClipboardReceipt {
+    pub id: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl WsConnection {
@@ -100,9 +110,9 @@ impl WsConnection {
         server_url: &str,
         token_provider: TokenProvider,
         fingerprint: Option<String>,
-    ) -> (Self, mpsc::UnboundedReceiver<WsEvent>) {
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel();
+    ) -> (Self, mpsc::Receiver<WsEvent>) {
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let (outgoing_tx, outgoing_rx) = mpsc::channel(4);
 
         let conn = WsConnection {
             server_url: server_url.to_string(),
@@ -111,52 +121,106 @@ impl WsConnection {
             event_tx,
             outgoing_tx,
             outgoing_rx: Arc::new(Mutex::new(Some(outgoing_rx))),
-            shutdown: Arc::new(Notify::new()),
+            shutdown: CancellationToken::new(),
+            pending: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
 
         (conn, event_rx)
     }
 
     /// Sends a clipboard push message.
-    pub fn send_clipboard(&self, payload: ClipboardPushPayload) -> Result<(), String> {
+    pub async fn send_clipboard(
+        &self,
+        mut payload: ClipboardPushPayload,
+    ) -> Result<ClipboardReceipt, String> {
+        if self.is_closed() {
+            return Err("connection closed".into());
+        }
+        let id = payload
+            .request_id
+            .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
+            .clone();
         let payload_json = serde_json::to_value(&payload).map_err(|e| format!("serialize: {e}"))?;
         let msg = WsMessage {
             msg_type: MSG_CLIPBOARD_PUSH.to_string(),
             payload: payload_json,
         };
-        self.outgoing_tx
-            .send(msg)
-            .map_err(|_| "connection closed".to_string())
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self
+                .pending
+                .lock()
+                .expect("pending clipboard lock poisoned");
+            if pending.len() >= 32 || pending.contains_key(&id) {
+                return Err("clipboard request already pending or queue full".into());
+            }
+            pending.insert(id.clone(), tx);
+        }
+        let sent = self.outgoing_tx.try_send(msg);
+        let result = if sent.is_err() {
+            Err("clipboard queue full or connection closed".into())
+        } else {
+            tokio::select! {
+                biased;
+                _ = self.shutdown.cancelled() => Err("connection closed before persistence acknowledgement".into()),
+                ack = tokio::time::timeout(Duration::from_secs(10), rx) => match ack {
+                    Ok(Ok(ClipboardAck::Accepted { entry_id, created_at, .. })) => Ok(ClipboardReceipt { id: entry_id, created_at }),
+                    Ok(Ok(ClipboardAck::Rejected { code, message, .. })) => Err(format!("{code}: {message}")),
+                    _ => Err("persistence acknowledgement timed out; delivery is unknown".into()),
+                }
+            }
+        };
+        self.pending
+            .lock()
+            .expect("pending clipboard lock poisoned")
+            .remove(&id);
+        result
     }
 
     /// Sends a ping message.
-    fn send_ping(tx: &mpsc::UnboundedSender<WsMessage>) {
+    fn send_ping(tx: &mpsc::Sender<WsMessage>) {
         let msg = WsMessage {
             msg_type: MSG_PING.to_string(),
             payload: serde_json::Value::Null,
         };
-        let _ = tx.send(msg);
+        let _ = tx.try_send(msg);
     }
 
     /// Starts the connection with automatic reconnect.
     pub async fn connect_with_reconnect(self: Arc<Self>) {
         let mut outgoing_rx = self.outgoing_rx.lock().await.take();
+        if outgoing_rx.is_none() {
+            return;
+        }
 
         let mut backoff_ms = INITIAL_BACKOFF_MS;
         let mut force_refresh = false;
 
         loop {
-            let Some(access_token) = (self.token_provider)(force_refresh).await else {
+            let token = tokio::select! {
+                biased;
+                _ = self.shutdown.cancelled() => return,
+                token = (self.token_provider)(force_refresh) => token,
+            };
+            let Some(access_token) = token else {
                 warn!("Session has ended; not reconnecting");
-                let _ = self.event_tx.send(WsEvent::SessionExpired);
+                self.emit(WsEvent::SessionExpired);
                 return;
             };
             force_refresh = false;
 
-            match self.dial(&access_token).await {
+            let dialed = tokio::select! {
+                biased;
+                _ = self.shutdown.cancelled() => return,
+                result = self.dial(&access_token) => result,
+            };
+            match dialed {
                 Ok((mut write, mut read)) => {
+                    if self.is_closed() {
+                        return;
+                    }
                     backoff_ms = INITIAL_BACKOFF_MS;
-                    let _ = self.event_tx.send(WsEvent::Connected);
+                    self.emit(WsEvent::Connected);
                     info!("WebSocket connected");
 
                     // Heartbeat task
@@ -170,7 +234,7 @@ impl WsConnection {
                                 _ = interval.tick() => {
                                     Self::send_ping(&outgoing_tx);
                                 }
-                                _ = shutdown.notified() => break,
+                                _ = shutdown.cancelled() => break,
                             }
                         }
                     });
@@ -204,22 +268,22 @@ impl WsConnection {
                             } => {
                                 if let Some(msg) = out {
                                     let json = serde_json::to_string(&msg).unwrap_or_default();
-                                    if let Err(e) = write.send(Message::Text(json.into())).await {
-                                        warn!("WebSocket write error: {e}");
+                                    if !matches!(tokio::time::timeout(Duration::from_secs(5), write.send(Message::Text(json.into()))).await, Ok(Ok(()))) {
+                                        warn!("WebSocket write failed or timed out");
                                         break false;
                                     }
                                 }
                             }
                             // Shutdown signal
-                            _ = self.shutdown.notified() => {
-                                let _ = write.close().await;
+                            _ = self.shutdown.cancelled() => {
+                                let _ = tokio::time::timeout(Duration::from_secs(1), write.close()).await;
                                 break true;
                             }
                         }
                     };
 
                     heartbeat.abort();
-                    let _ = self.event_tx.send(WsEvent::Disconnected);
+                    self.emit(WsEvent::Disconnected);
                     info!("WebSocket disconnected");
 
                     if disconnected {
@@ -230,7 +294,7 @@ impl WsConnection {
                     // An expired or revoked token: refresh before the next attempt
                     force_refresh = is_unauthorized(e.as_ref());
                     warn!("WebSocket connect failed: {e}");
-                    let _ = self.event_tx.send(WsEvent::Error(e.to_string()));
+                    self.emit(WsEvent::Error(e.to_string()));
                 }
             }
 
@@ -238,7 +302,7 @@ impl WsConnection {
             info!("Reconnecting in {backoff_ms}ms...");
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
-                _ = self.shutdown.notified() => return,
+                _ = self.shutdown.cancelled() => return,
             }
             backoff_ms = next_backoff_ms(backoff_ms);
         }
@@ -246,7 +310,24 @@ impl WsConnection {
 
     /// Shut down the connection permanently.
     pub fn close(&self) {
-        self.shutdown.notify_waiters();
+        self.shutdown.cancel();
+        self.pending
+            .lock()
+            .expect("pending clipboard lock poisoned")
+            .clear();
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.shutdown.is_cancelled()
+    }
+
+    fn emit(&self, event: WsEvent) {
+        if let Err(error) = self.event_tx.try_send(event) {
+            if matches!(error, mpsc::error::TrySendError::Full(_)) {
+                error!("Clipboard event queue full; reconnect to resume from history");
+            }
+            self.close();
+        }
     }
 
     async fn dial(
@@ -256,7 +337,16 @@ impl WsConnection {
         let request =
             build_ws_request(&self.server_url, access_token, self.fingerprint.as_deref())?;
 
-        let (ws_stream, _) = tokio_tungstenite::connect_async(request).await?;
+        let (mut ws_stream, response) = tokio_tungstenite::connect_async(request).await?;
+        if response
+            .headers()
+            .get("x-cpmesh-protocol")
+            .and_then(|value| value.to_str().ok())
+            != Some(PROTOCOL_VERSION)
+        {
+            let _ = tokio::time::timeout(Duration::from_secs(1), ws_stream.close(None)).await;
+            return Err("Server upgrade required: WebSocket protocol 2 was not confirmed".into());
+        }
         Ok(ws_stream.split())
     }
 
@@ -272,22 +362,38 @@ impl WsConnection {
         match msg.msg_type.as_str() {
             MSG_CLIPBOARD_NEW => {
                 if let Ok(payload) = serde_json::from_value::<ClipboardNewPayload>(msg.payload) {
-                    let _ = self.event_tx.send(WsEvent::ClipboardNew(payload));
+                    self.emit(WsEvent::ClipboardNew(payload));
                 }
             }
             MSG_DEVICE_STATUS => {
                 if let Ok(payload) = serde_json::from_value::<DeviceStatusPayload>(msg.payload) {
-                    let _ = self.event_tx.send(WsEvent::DeviceStatus(payload));
+                    self.emit(WsEvent::DeviceStatus(payload));
                 }
             }
             MSG_PONG => {} // heartbeat response, ignore
             MSG_GROUP_KEY_UPDATED => {
                 info!("Group key updated by another device");
-                let _ = self.event_tx.send(WsEvent::GroupKeyUpdated);
+                self.emit(WsEvent::GroupKeyUpdated);
             }
+            MSG_ROTATION_NEEDED => {
+                self.emit(WsEvent::RotationNeeded);
+            }
+            MSG_CLIPBOARD_ACK => match serde_json::from_value::<ClipboardAck>(msg.payload) {
+                Ok(ack) => {
+                    if let Some(waiter) = self
+                        .pending
+                        .lock()
+                        .expect("pending clipboard lock poisoned")
+                        .remove(ack.request_id())
+                    {
+                        let _ = waiter.send(ack);
+                    }
+                }
+                Err(e) => error!("Invalid clipboard acknowledgement: {e}"),
+            },
             MSG_ERROR => {
                 if let Ok(payload) = serde_json::from_value::<ErrorPayload>(msg.payload) {
-                    let _ = self.event_tx.send(WsEvent::Error(format!(
+                    self.emit(WsEvent::Error(format!(
                         "{}: {}",
                         payload.code, payload.message
                     )));
@@ -318,7 +424,7 @@ mod tests {
         Arc::new(move |_| Box::pin(async move { Some(token.to_string()) }))
     }
 
-    fn conn() -> (WsConnection, mpsc::UnboundedReceiver<WsEvent>) {
+    fn conn() -> (WsConnection, mpsc::Receiver<WsEvent>) {
         WsConnection::new("https://cpmesh.example", fixed_token("tok"), None)
     }
 
@@ -431,23 +537,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_clipboard_enqueues_outgoing_message() {
+    async fn clipboard_success_requires_correlated_persistence_ack() {
         let (c, _rx) = conn();
-        c.send_clipboard(ClipboardPushPayload {
+        let id = uuid::Uuid::new_v4().to_string();
+        let send = c.send_clipboard(ClipboardPushPayload {
+            request_id: Some(id.clone()),
             content_type: ContentType::Image,
             encrypted_data: vec![9, 8, 7],
             metadata: Some("bWV0YQ==".into()),
             key_version: 3,
-        })
-        .unwrap();
+        });
+        tokio::pin!(send);
 
         let mut outgoing = c.outgoing_rx.lock().await.take().unwrap();
-        let msg = outgoing.try_recv().unwrap();
+        let msg = tokio::select! {
+            _ = &mut send => panic!("write was mistaken for persistence"),
+            msg = outgoing.recv() => msg.unwrap(),
+        };
         assert_eq!(msg.msg_type, MSG_CLIPBOARD_PUSH);
         assert_eq!(msg.payload["content_type"], "image");
         assert_eq!(msg.payload["encrypted_data"], "CQgH");
         assert_eq!(msg.payload["metadata"], "bWV0YQ==");
         assert_eq!(msg.payload["key_version"], 3);
+        let canonical_id = uuid::Uuid::new_v4().to_string();
+        c.handle_message(&serde_json::json!({
+            "type": MSG_CLIPBOARD_ACK,
+            "payload": {"status":"accepted", "request_id":id, "entry_id":canonical_id, "created_at":"2026-01-01T00:00:00Z"},
+        }).to_string());
+        assert_eq!(send.await.unwrap().id, canonical_id);
     }
 
     #[tokio::test]
@@ -466,13 +583,15 @@ mod tests {
         drop(c.outgoing_rx.lock().await.take());
         let err = c
             .send_clipboard(ClipboardPushPayload {
+                request_id: None,
                 content_type: ContentType::Text,
                 encrypted_data: vec![],
                 metadata: None,
                 key_version: 1,
             })
+            .await
             .unwrap_err();
-        assert_eq!(err, "connection closed");
+        assert!(err.contains("connection closed"));
     }
 
     #[tokio::test]
@@ -491,25 +610,28 @@ mod tests {
                 let (stream, _) = listener.accept().await.unwrap();
                 let seen_tx = seen_tx.clone();
                 tokio::spawn(async move {
-                    let check =
-                        move |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
-                            let auth = req
-                                .headers()
-                                .get("authorization")
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or_default()
-                                .to_string();
-                            let accepted = auth == "Bearer fresh";
-                            let _ = seen_tx.send(auth);
-                            if accepted {
-                                Ok(resp)
-                            } else {
-                                Err(http::Response::builder()
-                                    .status(http::StatusCode::UNAUTHORIZED)
-                                    .body(None)
-                                    .unwrap())
-                            }
-                        };
+                    let check = move |req: &Request,
+                                      mut resp: Response|
+                          -> Result<Response, ErrorResponse> {
+                        let auth = req
+                            .headers()
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        let accepted = auth == "Bearer fresh";
+                        let _ = seen_tx.send(auth);
+                        resp.headers_mut()
+                            .insert("x-cpmesh-protocol", "2".parse().unwrap());
+                        if accepted {
+                            Ok(resp)
+                        } else {
+                            Err(http::Response::builder()
+                                .status(http::StatusCode::UNAUTHORIZED)
+                                .body(None)
+                                .unwrap())
+                        }
+                    };
                     if let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(stream, check).await {
                         while let Some(Ok(_)) = ws.next().await {}
                     }
@@ -545,6 +667,59 @@ mod tests {
 
         conn.close();
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn close_during_token_loading_is_durable_and_never_dials() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let signal = entered.clone();
+        let provider: TokenProvider = Arc::new(move |_| {
+            let signal = signal.clone();
+            Box::pin(async move {
+                signal.notify_one();
+                std::future::pending::<Option<String>>().await
+            })
+        });
+        let (connection, mut events) = WsConnection::new(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            provider,
+            None,
+        );
+        let connection = Arc::new(connection);
+        let task = tokio::spawn(connection.clone().connect_with_reconnect());
+        entered.notified().await;
+        connection.close();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(connection.is_closed());
+        assert!(events.try_recv().is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn close_cancels_an_incomplete_websocket_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (connection, mut events) = WsConnection::new(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            fixed_token("token"),
+            None,
+        );
+        let connection = Arc::new(connection);
+        let task = tokio::spawn(connection.clone().connect_with_reconnect());
+        let (_unanswered_handshake, _) = listener.accept().await.unwrap();
+        connection.close();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(events.try_recv().is_err());
     }
 
     #[tokio::test]

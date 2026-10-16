@@ -36,6 +36,15 @@ hmac = "0.13"
 sha2 = "0.11"
 rand = "0.10"
 
+# Two-factor authentication: TOTP (HMAC-SHA1) and passkey signature checks use aws-lc-rs,
+# the crypto provider rustls already builds; ciborium decodes WebAuthn's CBOR structures.
+aws-lc-rs = "1"
+ciborium = "0.2"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+
+# Verifies uploaded installers against the update signing key (same format as the apps)
+minisign-verify = "0.3"
+
 # Email (blocking SmtpTransport; rustls with the aws-lc-rs provider shared by reqwest/sqlx/jsonwebtoken)
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "rustls", "aws-lc-rs", "webpki-roots", "builder", "hostname"] }
 
@@ -60,6 +69,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 regex = "1"
 rust_decimal = "1"
 futures-util = "0.3"
+tokio-util = { version = "0.7", features = ["io", "rt"] }
 
 # Static file embedding
 rust-embed = "8"
@@ -68,5 +78,5 @@ mime_guess = "2"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-aws-lc-rs = "1"
 tempfile = "3"
+tokio-tungstenite = "0.30"

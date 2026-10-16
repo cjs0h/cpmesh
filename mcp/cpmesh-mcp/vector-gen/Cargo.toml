@@ -12,6 +12,9 @@ description = "Generates golden crypto vectors for the cpmesh-mcp TypeScript pac
 # The desktop crypto modules are compiled here verbatim via #[path], so the
 # edition and these crate versions must match desktop-tauri/src-tauri/Cargo.toml.
 [dependencies]
+cpmesh-proto = { path = "../../../crates/cpmesh-proto" }
+serde = { version = "1", features = ["derive"] }
+tempfile = "3"
 p256 = { version = "0.14", features = ["ecdh", "ecdsa", "getrandom"] }
 aes-gcm = "0.11"
 hkdf = "0.13"

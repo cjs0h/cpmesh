@@ -16,7 +16,7 @@ Thank you for your interest in contributing to cpmesh! This document provides gu
 ### Server
 
 ```bash
-# Requires Rust 1.94+ and a running PostgreSQL instance
+# Requires Rust 1.94+, Node.js 22.12+ and a running PostgreSQL instance
 cp .env.example .env
 # Generate repo-local dev JWT keys
 ./scripts/generate-dev-jwt.sh
@@ -24,6 +24,8 @@ cp .env.example .env
 # pwsh ./scripts/generate-dev-jwt.ps1
 #
 # Then edit .env with the required secrets and database credentials
+npm --prefix web ci
+npm --prefix web run build  # RustEmbed requires web/dist, including for tests and Clippy
 cargo build -p cpmesh-server
 cargo run -p cpmesh-server
 ```
@@ -53,6 +55,9 @@ All suites run in CI; please run the ones relevant to your change locally first.
 ### Rust
 
 ```bash
+# On a clean checkout, build the embedded dashboard first:
+npm --prefix web ci && npm --prefix web run build
+
 # Server + shared proto crate: unit tests, router tests (no database needed) and wire-format tests
 cargo test --workspace
 
@@ -107,7 +112,42 @@ cd mcp/cpmesh-mcp/vector-gen && cargo run --release > ../test/vectors.json
 `vector-gen` compiles those crypto modules verbatim, so keep its Rust edition and crypto crate
 versions in step with `desktop-tauri/src-tauri/Cargo.toml`.
 
-#### Web dashboard UI conventions
+The vectors also contain actual shared-Rust JSON and canonical membership signatures. The desktop
+consumes `cpmesh-proto` directly; update these contracts and every client together.
+
+For the same real-relay gate as MCP CI, build `web/dist`, the relay and the MCP executable, then provide
+a **disposable loopback database whose name starts with `cpmesh_e2e`**:
+
+```bash
+cargo build --locked -p cpmesh-server
+npm --prefix mcp/cpmesh-mcp run build
+CPMESH_E2E_DATABASE_URL=postgres://postgres:pw@127.0.0.1:55432/cpmesh_e2e \
+  node mcp/cpmesh-mcp/scripts/live-smoke.mjs
+```
+
+This creates a synthetic account with TOTP, uses a recovery code to sign in through the MCP protocol,
+checks persistence/retry/restart, and probes two stalled 128 MiB installer downloads. It generates its own
+keys and isolated profile, disables inherited auto-login credentials, and removes its processes and files.
+The supplied database is not deleted automatically. Windows skips the Unix RSS probe.
+
+### Dependency constraints
+
+Compatible patch/minor updates are applied without changing the published MCP Node 18.19+ runtime target.
+Its build uses patched esbuild directly rather than tsup's affected esbuild range; the Node 18/20 build and
+stdio smoke matrix is retained. TypeScript 7, noble 2, Zod 4 and Node 26 typings are deliberately not forced
+into the existing runtime/crypto contracts merely to make an outdated report empty.
+
+Two upstream Linux GTK-chain notices remain in the desktop lockfile:
+
+| Notice | Constraint |
+|---|---|
+| [GLib RUSTSEC-2024-0429](https://rustsec.org/advisories/RUSTSEC-2024-0429.html) | Tauri 2.12.4 still requires GTK 0.18 and GLib 0.18.5. The fix starts in GLib 0.20, which is not a compatible override. Linux reachability of `VariantStrIter` is unproven; a compatible upstream backport or GTK migration is still needed. |
+| [proc-macro-error RUSTSEC-2024-0370](https://rustsec.org/advisories/RUSTSEC-2024-0370.html) | GTK/GLib macros still require the unmaintained 1.0.4 line. No patched release is listed. This is a maintenance notice, not a demonstrated runtime exploit. |
+
+Do not suppress these notices or replace GTK/GLib with incompatible major versions. Recheck the upstream
+graph on future Tauri updates and exercise Linux builds when a compatible fix becomes available.
+
+### Web dashboard UI conventions
 
 - The visual language is **minimal monochrome**: white surfaces, 1px `#e5e5e5` hairlines
   (`border border-border`), near-black text, Geist for UI text and Geist Mono for identifiers/code.
@@ -182,8 +222,8 @@ Each desktop installer is accompanied by `<installer>.sig`, the signature the in
 [Signing updates](#signing-updates)).
 
 The release stays a draft until every build succeeds; re-running failed jobs replaces the installers. Once it
-is published, `scripts/release/publish-website.mjs` signs in to the server's admin API and creates a download
-link for each installer plus a current app release for each platform the update check reports
+is published, `scripts/release/publish-website.mjs` uses the server's admin API, authenticated with an API token,
+to create a download link for each installer plus a current app release for each platform the update check reports
 (`windows/amd64`, `darwin/arm64`, `darwin/amd64`, `linux/amd64`, `android/arm64`, `android/amd64`).
 Re-publishing a version is safe, and the script refuses to replace a newer version unless run by hand with
 `--force`. Use `--dry-run` to preview what a release JSON (from `gh release view <tag> --json tagName,url,isDraft,assets`)
@@ -220,7 +260,8 @@ key secret is missing, and every signature is checked against the public key bef
 | Name | Needed for | Purpose |
 | --- | --- | --- |
 | `TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | In-app updates | Signs the desktop installers (see [Signing updates](#signing-updates)) |
-| `CPMESH_ADMIN_USERNAME`, `CPMESH_ADMIN_PASSWORD` | Website update | Admin account on the server the release is registered with |
+| `CPMESH_ADMIN_TOKEN` | Website update | API token with the `releases:write` scope, created by an owner or admin in the admin console (**API tokens**, `<server>/#/admin/tokens`); it expires after 90 days unless another period is chosen |
+| `CPMESH_ADMIN_USERNAME`, `CPMESH_ADMIN_PASSWORD` | Optional | Admin sign-in instead of a token; only works on servers without two-factor authentication |
 | `CPMESH_URL` (variable) | Optional | Server to update, `https://cpmesh.com` by default |
 | `ANDROID_KEYSTORE_BASE64` | Android | The release keystore, base64 encoded |
 | `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS` | Android | Keystore password and key alias |
@@ -228,8 +269,10 @@ key secret is missing, and every signature is checked against the public key bef
 | `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY` | Optional | Developer ID signing for macOS (base64 `.p12`) |
 | `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` | Optional | Notarization for macOS (app-specific password) |
 
-Without the Android secrets the APK is skipped with a warning; without the admin credentials the GitHub
-Release is still published but the website is left unchanged. Android only installs an update signed with the
+Without the Android secrets the APK is skipped with a warning; without `CPMESH_ADMIN_TOKEN` (or the username and
+password) the GitHub Release is still published but the website is left unchanged. Creating a token needs a recent
+sign-in with your second factor; when the token expires or is revoked, the website step fails and explains how to
+replace it. Android only installs an update signed with the
 same key as the installed app, so keep the keystore and its password backed up. Without Apple credentials the
 macOS app is ad-hoc signed and users allow it on first launch in **System Settings → Privacy & Security**;
 the Windows installer is unsigned, so SmartScreen may warn as well.

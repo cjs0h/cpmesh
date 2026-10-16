@@ -2,8 +2,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 // WebSocket message types — must match between server and clients.
+pub const PROTOCOL_VERSION: &str = "2";
 pub const MSG_CLIPBOARD_PUSH: &str = "clipboard_push";
 pub const MSG_CLIPBOARD_NEW: &str = "clipboard_new";
+pub const MSG_CLIPBOARD_ACK: &str = "clipboard_ack";
 pub const MSG_DEVICE_STATUS: &str = "device_status";
 pub const MSG_GROUP_KEY_UPDATED: &str = "group_key_updated";
 pub const MSG_ROTATION_NEEDED: &str = "rotation_needed";
@@ -97,8 +99,10 @@ pub struct WsMessage {
 }
 
 /// Client → Server: push a new clipboard entry.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClipboardPushPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     pub content_type: ContentType,
     #[serde(with = "base64_serde")]
     pub encrypted_data: Vec<u8>,
@@ -106,6 +110,42 @@ pub struct ClipboardPushPayload {
     pub metadata: Option<String>,
     #[serde(default = "default_key_version")]
     pub key_version: i32,
+}
+
+/// An acknowledgement means database persistence, not receipt by another device.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ClipboardAck {
+    Accepted {
+        request_id: String,
+        entry_id: String,
+        created_at: DateTime<Utc>,
+    },
+    Rejected {
+        request_id: String,
+        code: String,
+        message: String,
+    },
+}
+
+impl ClipboardAck {
+    pub fn request_id(&self) -> &str {
+        match self {
+            Self::Accepted { request_id, .. } | Self::Rejected { request_id, .. } => request_id,
+        }
+    }
+}
+
+pub const ENCRYPTION_OVERHEAD: usize = 16 + 12 + 16;
+pub const MAX_METADATA_BYTES: usize = 16 * 1024;
+pub const MAX_FILE_BYTES: usize = 25 * 1024 * 1024;
+
+pub fn content_size_limit(content_type: &ContentType) -> usize {
+    match content_type {
+        ContentType::Text => 1024 * 1024,
+        ContentType::Image => 10 * 1024 * 1024,
+        ContentType::File => MAX_FILE_BYTES,
+    }
 }
 
 fn default_key_version() -> i32 {
@@ -178,6 +218,27 @@ pub struct RegisterDeviceRequest {
     /// Stable device fingerprint: SHA-256 hex of platform hardware ID salted with user_id.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<DeviceSessionProof>,
+}
+
+/// Single-use, session-bound proof of possession of the device's private key.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeviceSessionProof {
+    pub challenge: String,
+    #[serde(with = "base64_serde")]
+    pub signature: Vec<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeviceChallengeResponse {
+    pub challenge: String,
+}
+
+/// Domain separation prevents an untrusted relay from turning registration into
+/// an oracle for signatures over mesh membership transitions.
+pub fn device_proof_transcript(challenge: &str) -> Vec<u8> {
+    format!("cpmesh-device-proof-v1\n{challenge}").into_bytes()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +278,8 @@ pub struct DeviceKeysResponse {
 pub struct RegisterDeviceResponse {
     pub device: DeviceIdResponse,
     pub access_token: String,
+    #[serde(default)]
+    pub refresh_token: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -266,6 +329,17 @@ pub struct ClipboardHistoryResponse {
     pub has_more: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateCheckResponse {
+    pub update_available: bool,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub download_url: Option<String>,
+    #[serde(default)]
+    pub release_notes: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ChangePasswordRequest {
     pub current_password: String,
@@ -281,6 +355,8 @@ pub struct GroupKeyResponse {
     pub from_public_key: Vec<u8>,
     #[serde(default, with = "option_base64_serde")]
     pub from_public_key_sig: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub membership: Option<KeyMembership>,
     #[serde(default = "default_key_version")]
     pub version: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -298,6 +374,8 @@ pub struct VersionedGroupKey {
     pub from_public_key: Vec<u8>,
     #[serde(default, with = "option_base64_serde")]
     pub from_public_key_sig: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub membership: Option<KeyMembership>,
 }
 
 /// Response for GET /api/group-keys/current with optional since_version.
@@ -305,6 +383,8 @@ pub struct VersionedGroupKey {
 pub struct GroupKeysResponse {
     pub current_version: i32,
     pub keys: Vec<VersionedGroupKey>,
+    #[serde(default)]
+    pub rotation_required: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rotation_due_at: Option<DateTime<Utc>>,
 }
@@ -314,6 +394,82 @@ pub struct StoreGroupKeyEntry {
     pub device_id: String,
     #[serde(with = "base64_serde")]
     pub encrypted_key: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub membership: Option<KeyMembership>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceIdentity {
+    pub id: String,
+    #[serde(with = "base64_serde")]
+    pub public_key: Vec<u8>,
+}
+
+/// One signed manifest binds every member and recipient-specific wrap. It is sent
+/// once per rotation, avoiding quadratic request size as subscription limits grow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyMembership {
+    pub members: Vec<DeviceIdentity>,
+    pub wrapped_key_hashes: std::collections::BTreeMap<String, String>,
+    #[serde(with = "base64_serde")]
+    pub signature: Vec<u8>,
+}
+
+pub fn membership_transcript(
+    version: i32,
+    sender: &str,
+    members: &[DeviceIdentity],
+    hashes: &std::collections::BTreeMap<String, String>,
+) -> Result<Vec<u8>, &'static str> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    if version < 1
+        || !canonical_device_id(sender)
+        || members
+            .iter()
+            .any(|member| !canonical_device_id(&member.id))
+        || hashes.len() != members.len()
+        || hashes.values().any(|hash| {
+            hash.len() != 64
+                || !hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    {
+        return Err("invalid wrapped-key commitments");
+    }
+    let mut transcript = format!("cpmesh-membership-v2\n{version}\n{sender}\n");
+    let mut members: Vec<_> = members.iter().collect();
+    members.sort_by(|a, b| a.id.cmp(&b.id));
+    for member in members {
+        transcript.push_str(&format!(
+            "{}:{}:{}\n",
+            member.id,
+            STANDARD.encode(&member.public_key),
+            hashes
+                .get(&member.id)
+                .ok_or("missing wrapped-key commitment")?,
+        ));
+    }
+    Ok(transcript.into_bytes())
+}
+
+pub fn wrapped_key_hash(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub fn canonical_device_id(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+            }
+        })
 }
 
 /// Request body for POST /api/group-keys/rotate and approval approve endpoint.
@@ -341,6 +497,8 @@ pub struct PendingDeviceInfo {
 /// Response for POST /api/device-approvals/{id}/begin.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ApprovalSessionResponse {
+    #[serde(default)]
+    pub pairing_version: u32,
     pub session_id: String,
     pub pending_device_id: String,
     #[serde(with = "base64_serde")]
@@ -362,6 +520,8 @@ pub struct ApproveDeviceRequest {
 /// Response for GET /api/device-approvals/me (pending device checks its status).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ApprovalStatusResponse {
+    #[serde(default)]
+    pub pairing_version: u32,
     pub status: DeviceStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approver_device_id: Option<String>,

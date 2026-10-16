@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
-import { api } from './api';
+import { api, ApiError, apiWithToken, requestReauth, setReauthHandler } from './api';
 import { getAccessToken, getRefreshToken, setTokens } from './auth';
 import { jsonResponse } from '../test/setup';
 
@@ -8,6 +8,7 @@ const fetchMock = () => fetch as unknown as Mock;
 describe('api()', () => {
   beforeEach(() => {
     fetchMock().mockReset();
+    setReauthHandler(null);
   });
 
   it('sends unauthenticated requests without an Authorization header', async () => {
@@ -113,14 +114,14 @@ describe('api()', () => {
     expect(fetch).toHaveBeenCalledTimes(2);
   });
 
-  it('treats a network failure during refresh as a failed refresh', async () => {
+  it('surfaces a network failure without deleting the session', async () => {
     setTokens('expired', 'refresh-1');
     fetchMock()
       .mockResolvedValueOnce(jsonResponse(401, { error: 'expired' }))
       .mockRejectedValueOnce(new TypeError('network down'));
 
-    await expect(api('/api/me')).rejects.toThrow('Session expired');
-    expect(getAccessToken()).toBeNull();
+    await expect(api('/api/me')).rejects.toThrow('network down');
+    expect(getAccessToken()).toBe('expired');
   });
 
   it('does not refresh when there is no refresh token', async () => {
@@ -141,7 +142,7 @@ describe('api()', () => {
     setTokens('expired-again', 'refresh-2');
     fetchMock()
       .mockResolvedValueOnce(jsonResponse(401, { error: 'expired' }))
-      .mockResolvedValueOnce(jsonResponse(200, { access_token: 'fresh-2' }))
+      .mockResolvedValueOnce(jsonResponse(200, { access_token: 'fresh-2', refresh_token: 'refresh-3' }))
       .mockResolvedValueOnce(jsonResponse(200, { id: 'me' }));
 
     await expect(api('/api/me')).resolves.toEqual({ id: 'me' });
@@ -166,7 +167,7 @@ describe('api()', () => {
     // Let both initial requests fail and both callers reach tryRefresh()
     await Promise.resolve();
     await Promise.resolve();
-    resolveRefresh(jsonResponse(200, { access_token: 'fresh' }));
+    resolveRefresh(jsonResponse(200, { access_token: 'fresh', refresh_token: 'refresh-2' }));
 
     await expect(first).resolves.toEqual({ url: '/api/a' });
     await expect(second).resolves.toEqual({ url: '/api/b' });
@@ -240,5 +241,179 @@ describe('api()', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('api() errors and step-up', () => {
+  beforeEach(() => {
+    fetchMock().mockReset();
+    setReauthHandler(null);
+  });
+
+  it('throws ApiError with the status, code and body', async () => {
+    fetchMock().mockResolvedValueOnce(jsonResponse(403, { error: 'Finish two-factor authentication first.', code: 'mfa_required', enrolled: true }));
+
+    const error = await api('/api/admin/users').catch((e) => e);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toBeInstanceOf(Error);
+    if (!(error instanceof ApiError)) throw new Error('Expected ApiError');
+    expect(error.message).toBe('Finish two-factor authentication first.');
+    expect(error.status).toBe(403);
+    expect(error.code).toBe('mfa_required');
+    expect(error.data).toEqual({ error: 'Finish two-factor authentication first.', code: 'mfa_required', enrolled: true });
+  });
+
+  it('leaves the code unset for plain errors', async () => {
+    fetchMock().mockResolvedValueOnce(jsonResponse(409, { error: 'conflict' }));
+    const error = await api('/api/x').catch((e) => e);
+    if (!(error instanceof ApiError)) throw new Error('Expected ApiError');
+    expect(error.status).toBe(409);
+    expect(error.code).toBeUndefined();
+  });
+
+  it('asks for a confirmation on reauth_required and retries with the new session', async () => {
+    setTokens('stale', 'refresh-1');
+    const handler = vi.fn(async () => {
+      setTokens('confirmed', 'refresh-2');
+      return true;
+    });
+    setReauthHandler(handler);
+    fetchMock()
+      .mockResolvedValueOnce(jsonResponse(403, { error: "Confirm it's you to continue.", code: 'reauth_required' }))
+      .mockResolvedValueOnce(jsonResponse(200, { done: true }));
+
+    await expect(api('/api/mfa/recovery-codes', { method: 'POST' })).resolves.toEqual({ done: true });
+
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    const [url, init] = fetchMock().mock.calls[1];
+    expect(url).toBe('/api/mfa/recovery-codes');
+    expect(init.method).toBe('POST');
+    expect(init.headers.Authorization).toBe('Bearer confirmed');
+  });
+
+  it('returns undefined when the retried request answers 204', async () => {
+    setTokens('stale', 'refresh-1');
+    setReauthHandler(async () => true);
+    fetchMock()
+      .mockResolvedValueOnce(jsonResponse(403, { error: 'Confirm', code: 'reauth_required' }))
+      .mockResolvedValueOnce(jsonResponse(204, null));
+
+    await expect(api('/api/admin/users/u1', { method: 'DELETE' })).resolves.toBeUndefined();
+  });
+
+  it('throws reauth_required when the user cancels', async () => {
+    setTokens('stale', 'refresh-1');
+    const handler = vi.fn(async () => false);
+    setReauthHandler(handler);
+    fetchMock().mockResolvedValueOnce(jsonResponse(403, { error: "Confirm it's you to continue.", code: 'reauth_required' }));
+
+    const error = await api('/api/mfa/totp', { method: 'DELETE' }).catch((e) => e);
+    if (!(error instanceof ApiError)) throw new Error('Expected ApiError');
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error.code).toBe('reauth_required');
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('throws reauth_required without a registered handler', async () => {
+    setTokens('stale', 'refresh-1');
+    fetchMock().mockResolvedValueOnce(jsonResponse(403, { error: 'Confirm', code: 'reauth_required' }));
+
+    await expect(api('/api/mfa/totp', { method: 'DELETE' })).rejects.toMatchObject({ code: 'reauth_required', status: 403 });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries only once and reports the second answer', async () => {
+    setTokens('stale', 'refresh-1');
+    const handler = vi.fn(async () => true);
+    setReauthHandler(handler);
+    fetchMock()
+      .mockResolvedValueOnce(jsonResponse(403, { error: 'Confirm', code: 'reauth_required' }))
+      .mockResolvedValueOnce(jsonResponse(409, { error: 'add another method before removing this one' }));
+
+    await expect(api('/api/mfa/totp', { method: 'DELETE' })).rejects.toMatchObject({
+      status: 409,
+      message: 'add another method before removing this one',
+    });
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  it('sends FormData without a JSON content type', async () => {
+    setTokens('tok', 'ref');
+    fetchMock().mockResolvedValueOnce(jsonResponse(200, { uploaded: [] }));
+    const body = new FormData();
+    body.append('replace', 'true');
+
+    await api('/api/admin/downloads/upload', { method: 'POST', body });
+
+    const [, init] = fetchMock().mock.calls[0];
+    expect(init.body).toBe(body);
+    expect(init.headers).not.toHaveProperty('Content-Type');
+    expect(init.headers.Authorization).toBe('Bearer tok');
+  });
+
+  it('runs the registered handler through requestReauth', async () => {
+    await expect(requestReauth()).resolves.toBe(false);
+    setReauthHandler(async () => true);
+    await expect(requestReauth()).resolves.toBe(true);
+  });
+});
+
+describe('apiWithToken()', () => {
+  beforeEach(() => {
+    fetchMock().mockReset();
+  });
+
+  it('uses the given token instead of the stored session', async () => {
+    setTokens('stored', 'stored-refresh');
+    fetchMock().mockResolvedValueOnce(jsonResponse(200, { ok: true }));
+
+    await expect(apiWithToken('/api/mfa', 'ticket', { headers: { 'X-Custom': '1' } })).resolves.toEqual({ ok: true });
+
+    const [, init] = fetchMock().mock.calls[0];
+    expect(init.headers.Authorization).toBe('Bearer ticket');
+    expect(init.headers['x-custom']).toBe('1');
+  });
+
+  it('sends no Authorization header without a token', async () => {
+    setTokens('stored', 'stored-refresh');
+    fetchMock().mockResolvedValueOnce(jsonResponse(200, {}));
+
+    await apiWithToken('/api/auth/login', null, { method: 'POST', body: JSON.stringify({ username: 'a' }) });
+
+    const [, init] = fetchMock().mock.calls[0];
+    expect(init.headers).not.toHaveProperty('Authorization');
+    expect(init.headers['Content-Type']).toBe('application/json');
+  });
+
+  it('throws ApiError on 401 without refreshing or signing out', async () => {
+    setTokens('stored', 'stored-refresh');
+    fetchMock().mockResolvedValueOnce(jsonResponse(401, { error: 'invalid or expired token; sign in again' }));
+
+    const error = await apiWithToken('/api/mfa/verify', 'ticket', { method: 'POST', body: '{}' }).catch((e) => e);
+    if (!(error instanceof ApiError)) throw new Error('Expected ApiError');
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error.status).toBe(401);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(getAccessToken()).toBe('stored');
+    expect(window.location.hash).toBe('');
+  });
+
+  it('keeps structured error fields', async () => {
+    fetchMock().mockResolvedValueOnce(jsonResponse(403, { error: 'suspended', code: 'account_suspended' }));
+    await expect(apiWithToken('/api/auth/login', null, { method: 'POST', body: '{}' })).rejects.toMatchObject({
+      status: 403,
+      code: 'account_suspended',
+      data: { error: 'suspended', code: 'account_suspended' },
+    });
+  });
+
+  it('returns undefined for 204 responses', async () => {
+    fetchMock().mockResolvedValueOnce(jsonResponse(204, null));
+    await expect(apiWithToken('/api/x', 't', { method: 'DELETE' })).resolves.toBeUndefined();
   });
 });

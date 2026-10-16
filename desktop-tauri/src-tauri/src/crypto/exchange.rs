@@ -3,18 +3,22 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use zeroize::Zeroize;
 
+#[cfg(test)]
+use super::encrypt::generate_group_key;
 use super::encrypt::{
     CryptoError, decrypt, decrypt_group_key, derive_key_from_group_key, encrypt, encrypt_group_key,
-    fill_random, generate_group_key,
+    fill_random,
 };
 use super::keys::KeyPair;
 
 /// A group key encrypted for a specific peer device: `(device_id, encrypted_key)`.
+#[cfg(test)]
 pub type WrappedKey = (String, Vec<u8>);
 
 /// Manages versioned group keys for a user's devices.
 /// Supports multiple key versions to allow decryption of historical clipboard entries
 /// while ensuring forward secrecy for newly approved devices.
+#[derive(Clone)]
 pub struct KeyExchange {
     key_pair: KeyPair,
     pub current_version: i32,
@@ -39,6 +43,7 @@ impl KeyExchange {
     }
 
     /// Generates a new group key as version 1 (called by the first device in an account).
+    #[cfg(test)]
     pub fn init_group_key(&mut self) {
         let key = generate_group_key().to_vec();
         self.current_version = 1;
@@ -46,14 +51,30 @@ impl KeyExchange {
     }
 
     /// Add a key version to the keyring.
-    pub fn add_key_version(&mut self, version: i32, key: Vec<u8>) {
+    pub fn add_key_version(&mut self, version: i32, key: Vec<u8>) -> Result<(), CryptoError> {
+        if version < 1 || key.len() != 32 {
+            return Err(CryptoError::Decrypt(
+                "invalid group key version or length".into(),
+            ));
+        }
+        if self
+            .keys_by_version
+            .get(&version)
+            .is_some_and(|existing| *existing != key)
+        {
+            return Err(CryptoError::Decrypt(
+                "refusing to replace existing key material".into(),
+            ));
+        }
         if version > self.current_version {
             self.current_version = version;
         }
         self.keys_by_version.insert(version, key);
+        Ok(())
     }
 
     /// Returns true if any group key is available.
+    #[cfg(test)]
     pub fn has_group_key(&self) -> bool {
         !self.keys_by_version.is_empty()
     }
@@ -75,6 +96,7 @@ impl KeyExchange {
     }
 
     /// Encrypts the current group key for a specific device's public key.
+    #[cfg(test)]
     pub fn encrypt_for_device(&self, peer_public_key: &PublicKey) -> Result<Vec<u8>, CryptoError> {
         let gk = self.current_key()?;
         encrypt_group_key(gk, &self.key_pair.private, peer_public_key)
@@ -99,12 +121,12 @@ impl KeyExchange {
         version: i32,
     ) -> Result<(), CryptoError> {
         let gk = decrypt_group_key(encrypted_key, &self.key_pair.private, peer_public_key)?;
-        self.add_key_version(version, gk);
-        Ok(())
+        self.add_key_version(version, gk)
     }
 
     /// Generates the next group key version and returns wrapped keys for all provided devices.
     /// Returns `(new_version, wrapped_keys)`.
+    #[cfg(test)]
     pub fn generate_next_version(
         &mut self,
         peer_devices: &[(String, PublicKey)],
@@ -118,7 +140,7 @@ impl KeyExchange {
             wrapped.push((device_id.clone(), encrypted));
         }
 
-        self.add_key_version(new_version, new_key);
+        self.add_key_version(new_version, new_key)?;
         Ok((new_version, wrapped))
     }
 
@@ -199,7 +221,7 @@ impl KeyExchange {
             std::fs::create_dir_all(dir)
                 .map_err(|e| CryptoError::Encrypt(format!("create dir: {e}")))?;
         }
-        std::fs::write(path, &output)
+        super::keys::write_private_file(path, &output)
             .map_err(|e| CryptoError::Encrypt(format!("write keyring: {e}")))?;
         Ok(())
     }
@@ -220,19 +242,39 @@ impl KeyExchange {
             super::encrypt::derive_key_from_secret(&private_bytes, salt, b"cpnet-keyring-v1")?;
         let plaintext = decrypt(&kek, encrypted)?;
 
-        let keyring_data: serde_json::Value = serde_json::from_slice(&plaintext)
+        #[derive(serde::Deserialize)]
+        struct SavedKeyring {
+            current_version: i32,
+            keys: BTreeMap<i32, String>,
+        }
+        let keyring_data: SavedKeyring = serde_json::from_slice(&plaintext)
             .map_err(|e| CryptoError::Decrypt(format!("deserialize keyring: {e}")))?;
 
-        self.current_version = keyring_data["current_version"].as_i64().unwrap_or(0) as i32;
-        if let Some(keys) = keyring_data["keys"].as_object() {
-            for (v_str, k_val) in keys {
-                if let (Ok(version), Some(key_b64)) = (v_str.parse::<i32>(), k_val.as_str())
-                    && let Ok(key_bytes) =
-                        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, key_b64)
-                {
-                    self.keys_by_version.insert(version, key_bytes);
-                }
+        let mut restored = BTreeMap::new();
+        for (version, value) in keyring_data.keys {
+            let key = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, value)
+                .map_err(|e| CryptoError::Decrypt(format!("invalid saved key: {e}")))?;
+            if version < 1
+                || key.len() != 32
+                || version > keyring_data.current_version
+                || self
+                    .keys_by_version
+                    .get(&version)
+                    .is_some_and(|existing| *existing != key)
+            {
+                return Err(CryptoError::Decrypt(
+                    "invalid or conflicting saved keyring".into(),
+                ));
             }
+            restored.insert(version, key);
+        }
+        if !restored.contains_key(&keyring_data.current_version) {
+            return Err(CryptoError::Decrypt(
+                "saved keyring has no active key".into(),
+            ));
+        }
+        for (version, key) in restored {
+            self.add_key_version(version, key)?;
         }
 
         Ok(())
@@ -379,10 +421,10 @@ mod tests {
     fn test_add_key_version_tracks_highest_version() {
         let kp = KeyPair::generate();
         let mut exch = KeyExchange::new(kp);
-        exch.add_key_version(3, vec![3u8; 32]);
+        exch.add_key_version(3, vec![3u8; 32]).unwrap();
         assert_eq!(exch.current_version, 3);
         // Adding an older version must not lower the current version
-        exch.add_key_version(1, vec![1u8; 32]);
+        exch.add_key_version(1, vec![1u8; 32]).unwrap();
         assert_eq!(exch.current_version, 3);
         assert_eq!(exch.keys_by_version.len(), 2);
     }

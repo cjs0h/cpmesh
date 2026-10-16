@@ -19,6 +19,7 @@ pub enum KeyError {
 }
 
 /// Holds an ECDH P-256 key pair for E2E encryption.
+#[derive(Clone)]
 pub struct KeyPair {
     pub private: SecretKey,
     pub public: PublicKey,
@@ -51,13 +52,7 @@ impl KeyPair {
         let key_bytes = self.private.to_bytes();
         let pem_data = pem::Pem::new("ECDH PRIVATE KEY", &*key_bytes);
         let pem_str = pem::encode(&pem_data);
-        fs::write(path, pem_str)?;
-        // Set restrictive permissions on Unix
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-        }
+        write_private_file(path, pem_str.as_bytes())?;
         Ok(())
     }
 
@@ -104,6 +99,7 @@ impl KeyPair {
     }
 
     /// Returns the first 8 bytes of the fingerprint for compact display.
+    #[cfg(test)]
     pub fn short_fingerprint(public_key: &PublicKey) -> String {
         let fp = Self::fingerprint(public_key);
         let parts: Vec<&str> = fp.splitn(9, ':').collect();
@@ -123,7 +119,25 @@ impl KeyPair {
         signature.to_der().as_bytes().to_vec()
     }
 
+    pub fn sign_message(&self, message: &[u8]) -> Vec<u8> {
+        let signature: Signature = SigningKey::from(&self.private).sign(message);
+        signature.to_der().as_bytes().to_vec()
+    }
+
+    pub fn verify_message(
+        public_key: &PublicKey,
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<(), KeyError> {
+        let signature =
+            Signature::from_der(signature).map_err(|e| KeyError::InvalidKey(e.to_string()))?;
+        VerifyingKey::from(public_key)
+            .verify(message, &signature)
+            .map_err(|_| KeyError::InvalidKey("message signature is invalid".into()))
+    }
+
     /// Verifies that a public key was self-signed by its owner.
+    #[cfg(test)]
     pub fn verify_public_key_signature(
         public_key: &PublicKey,
         signature: &[u8],
@@ -145,13 +159,9 @@ pub fn public_key_to_bytes(public_key: &PublicKey) -> Vec<u8> {
     public_key.to_sec1_point(false).as_bytes().to_vec()
 }
 
-/// Derives an 8-digit approval code from an ECDH shared secret.
-///
-/// Both the approver and the pending device call this with their respective keys.
-/// The code is derived entirely from the two public keys (via ECDH), so the server
-/// cannot influence the result even if compromised.
-///
-/// Derivation: HKDF(ECDH(our_private, peer_public), salt=SHA256(sorted_pubkeys), info="cpnet-approval-v1")
+/// Full 256-bit pairing fingerprint, compared through an independent trusted
+/// channel on BOTH devices. Never shorten this to a short authentication string:
+/// without a commitment protocol a short comparison admits birthday attacks.
 pub fn derive_approval_code(
     our_private: &SecretKey,
     peer_public: &PublicKey,
@@ -179,13 +189,22 @@ pub fn derive_approval_code(
 
     // HKDF derivation
     let hk = Hkdf::<Sha256>::new(Some(&salt), secret_bytes);
-    let mut derived = [0u8; 4];
-    hk.expand(b"cpnet-approval-v1", &mut derived)
+    let mut derived = [0u8; 32];
+    hk.expand(b"cpmesh-pairing-fingerprint-v2", &mut derived)
         .map_err(|_| super::encrypt::CryptoError::Hkdf)?;
 
-    // Truncate to 8 decimal digits
-    let code = u32::from_be_bytes(derived) % 100_000_000;
-    Ok(format!("{:08}", code))
+    Ok(derived.iter().map(|b| format!("{b:02X}")).collect())
+}
+
+pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
+    use std::io::Write;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    file.write_all(bytes)?;
+    file.as_file().sync_all()?;
+    file.persist(path).map_err(|e| e.error)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -352,14 +371,14 @@ mod tests {
     }
 
     #[test]
-    fn test_approval_code_symmetric_and_8_digits() {
+    fn pairing_fingerprint_is_symmetric_and_full_256_bits() {
         let a = KeyPair::generate();
         let b = KeyPair::generate();
         let code_a = derive_approval_code(&a.private, &b.public, &a.public).unwrap();
         let code_b = derive_approval_code(&b.private, &a.public, &b.public).unwrap();
         assert_eq!(code_a, code_b);
-        assert_eq!(code_a.len(), 8);
-        assert!(code_a.chars().all(|c| c.is_ascii_digit()));
+        assert_eq!(code_a.len(), 64);
+        assert!(code_a.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]

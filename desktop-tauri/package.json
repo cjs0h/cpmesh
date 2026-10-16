@@ -18,21 +18,21 @@
   },
   "license": "(MIT OR Apache-2.0)",
   "dependencies": {
-    "@tauri-apps/api": "^2.12.1",
-    "@tauri-apps/plugin-deep-link": "^2.6.1",
-    "@tauri-apps/plugin-notification": "^2.5.1",
-    "@tauri-apps/plugin-opener": "^2.7.0"
+    "@tauri-apps/api": "^2.12.4",
+    "@tauri-apps/plugin-deep-link": "^2.6.2",
+    "@tauri-apps/plugin-notification": "^2.7.0",
+    "@tauri-apps/plugin-opener": "^2.7.2"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^4.0.0",
-    "@sveltejs/kit": "^3.0.1",
+    "@sveltejs/kit": "^3.1.0",
     "@sveltejs/vite-plugin-svelte": "^7.3.1",
-    "@tauri-apps/cli": "^2.12.1",
+    "@tauri-apps/cli": "^2.12.3",
     "svelte": "^5.57.2",
     "svelte-check": "^4.7.6",
     "typescript": "^6.0.3",
     "vite": "^8.3.4",
-    "vitest": "^5.0.3"
+    "vitest": "^5.0.5"
   },
   "imports": {
     "#lib": "./src/lib/index.js",

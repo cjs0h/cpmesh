@@ -18,6 +18,7 @@ import {
   adminState,
   adminUpdateRelease,
   adminUploadBinary,
+  fetchAdminPlans,
   fetchAdminStats,
   fetchAdminUsers,
 } from './admin.svelte';
@@ -27,12 +28,10 @@ const fetchMock = () => fetch as unknown as Mock;
 function entry(id: string) {
   return {
     id,
-    user_id: 'u',
     device_id: 'd',
     device_name: 'Laptop',
     content_type: 'text',
-    encrypted_data: 'AA==',
-    metadata: '',
+    encrypted_size: 1,
     created_at: '2026-01-01T00:00:00Z',
   };
 }
@@ -46,6 +45,7 @@ beforeEach(() => {
   clipboardState.offset = 0;
   devicesState.list = [];
   adminState.users = [];
+  adminState.usersTotal = 0;
   adminState.stats = null;
   adminState.plans = [];
   adminState.releases = [];
@@ -121,7 +121,7 @@ describe('clipboard store', () => {
     expect(clipboardState.loading).toBe(true);
     await pending;
 
-    expect(fetchMock().mock.calls[0][0]).toBe('/api/clipboard?limit=20&offset=0');
+    expect(fetchMock().mock.calls[0][0]).toBe('/api/clipboard?metadata_only=true&limit=20&offset=0');
     expect(clipboardState.entries.map((e) => e.id)).toEqual(['e1', 'e2']);
     expect(clipboardState.hasMore).toBe(true);
     expect(clipboardState.loading).toBe(false);
@@ -132,7 +132,7 @@ describe('clipboard store', () => {
 
     await loadNextPage();
     expect(clipboardState.offset).toBe(20);
-    expect(fetchMock().mock.calls.at(-1)?.[0]).toBe('/api/clipboard?limit=20&offset=20');
+    expect(fetchMock().mock.calls.at(-1)?.[0]).toBe('/api/clipboard?metadata_only=true&limit=20&offset=20');
 
     await loadNextPage();
     expect(clipboardState.offset).toBe(40);
@@ -149,17 +149,19 @@ describe('clipboard store', () => {
     expect(clipboardState.offset).toBe(0);
   });
 
-  it('empties the list on error and tolerates a missing entries field', async () => {
+  it('preserves the last snapshot and reports failed or malformed loads', async () => {
     clipboardState.entries = [entry('old')];
     fetchMock().mockResolvedValueOnce(jsonResponse(500, { error: 'boom' }));
     await fetchClipboard();
-    expect(clipboardState.entries).toEqual([]);
+    expect(clipboardState.entries).toEqual([entry('old')]);
+    expect(clipboardState.error).toBe('boom');
     expect(clipboardState.hasMore).toBe(false);
     expect(clipboardState.loading).toBe(false);
 
     fetchMock().mockResolvedValueOnce(jsonResponse(200, { has_more: false }));
     await fetchClipboard();
-    expect(clipboardState.entries).toEqual([]);
+    expect(clipboardState.entries).toEqual([entry('old')]);
+    expect(clipboardState.error).not.toBe('');
   });
 
   it('deletes a single entry and clears everything', async () => {
@@ -231,75 +233,106 @@ describe('devices store', () => {
     expect(devicesState.list).toHaveLength(2);
   });
 
-  it('clears the list on error', async () => {
+  it('preserves the list and reports errors', async () => {
     devicesState.list = [{ id: 'd1', name: 'x', last_seen: '', online: false, status: 'approved' }];
     fetchMock().mockResolvedValueOnce(jsonResponse(401, { error: 'nope' }));
     await fetchDevices();
-    expect(devicesState.list).toEqual([]);
+    expect(devicesState.list).toHaveLength(1);
+    expect(devicesState.error).toBe('nope');
     expect(devicesState.loading).toBe(false);
   });
 });
 
 describe('admin store', () => {
-  it('loads users and stats, and removes deleted users locally', async () => {
+  it('loads a page of users with its total, and removes deleted users locally', async () => {
     fetchMock()
-      .mockResolvedValueOnce(jsonResponse(200, [{ id: 'u1', username: 'a' }, { id: 'u2', username: 'b' }]))
+      .mockResolvedValueOnce(
+        jsonResponse(200, { items: [{ id: 'u1', username: 'a' }, { id: 'u2', username: 'b' }], total: 27, page: 2, per_page: 25 }),
+      )
       .mockResolvedValueOnce(
         jsonResponse(200, { total_users: 2, total_devices: 3, total_entries: 4, active_connections: 1 }),
       )
       .mockResolvedValueOnce(jsonResponse(204, null));
 
-    await fetchAdminUsers();
+    const page = await fetchAdminUsers({ q: 'ali', role: 'staff', status: '', page: 2, per_page: 25 });
     await fetchAdminStats();
+    // Empty filters are left out of the query string
+    expect(fetchMock().mock.calls[0][0]).toBe('/api/admin/users?q=ali&role=staff&page=2&per_page=25');
+    expect(page?.total).toBe(27);
     expect(adminState.users).toHaveLength(2);
+    expect(adminState.usersTotal).toBe(27);
+    expect(adminState.loading).toBe(false);
     expect(adminState.stats?.total_devices).toBe(3);
 
     await adminDeleteUser('u1');
     expect(fetchMock().mock.calls[2][0]).toBe('/api/admin/users/u1');
+    expect(fetchMock().mock.calls[2][1].method).toBe('DELETE');
     expect(adminState.users.map((u) => u.id)).toEqual(['u2']);
+    expect(adminState.usersTotal).toBe(26);
   });
 
-  it('appends created plans and replaces updated releases', async () => {
+  it('turns decimal plan prices into numbers, appends created plans and replaces updated releases', async () => {
     fetchMock()
-      .mockResolvedValueOnce(jsonResponse(200, { id: 'p1', name: 'Pro' }))
+      .mockResolvedValueOnce(jsonResponse(200, [{ id: 'p0', name: 'Free', price: '0.00', allowed_file_types: [] }]))
+      .mockResolvedValueOnce(jsonResponse(201, { id: 'p1', name: 'Pro', price: '4.99', allowed_file_types: ['text'] }))
       .mockResolvedValueOnce(jsonResponse(200, { id: 'r1', version: '0.2.0', is_current: true }));
 
-    const plan = await adminCreatePlan({ name: 'Pro' });
+    const plans = await fetchAdminPlans();
+    expect(plans[0].price).toBe(0);
+
+    const plan = await adminCreatePlan({ name: 'Pro', price: 4.99 });
     expect(plan.id).toBe('p1');
-    expect(adminState.plans.map((p) => p.id)).toEqual(['p1']);
-    const [, init] = fetchMock().mock.calls[0];
+    expect(plan.price).toBe(4.99);
+    expect(adminState.plans.map((p) => p.id)).toEqual(['p0', 'p1']);
+    const [url, init] = fetchMock().mock.calls[1];
+    expect(url).toBe('/api/admin/plans');
     expect(init.method).toBe('POST');
-    expect(JSON.parse(init.body)).toEqual({ name: 'Pro' });
+    expect(JSON.parse(init.body)).toEqual({ name: 'Pro', price: 4.99 });
 
     adminState.releases = [
       { id: 'r1', version: '0.1.0', is_current: false } as (typeof adminState.releases)[number],
       { id: 'r2', version: '0.0.9', is_current: false } as (typeof adminState.releases)[number],
     ];
     await adminUpdateRelease('r1', { version: '0.2.0', is_current: true });
+    expect(fetchMock().mock.calls[2][1].method).toBe('PUT');
     expect(adminState.releases.map((r) => r.version)).toEqual(['0.2.0', '0.0.9']);
   });
 
-  it('uploads binaries as multipart with the bearer token', async () => {
+  it('uploads installers and their signatures as multipart through api()', async () => {
     setTokens('tok', 'r');
     fetchMock().mockResolvedValueOnce(
-      jsonResponse(200, { uploaded: [{ filename: 'a.exe', size: 3, url: '/api/downloads/a.exe' }] }),
+      jsonResponse(200, {
+        uploaded: [{ filename: 'a.exe', size: 3, sha256: 'ab'.repeat(32), url: '/api/downloads/a.exe', signed: true }],
+      }),
     );
-    const file = new File([new Uint8Array([1, 2, 3])], 'a.exe');
+    const installer = new File([new Uint8Array([1, 2, 3])], 'a.exe');
+    const other = new File([new Uint8Array([4])], 'b.dmg');
+    const signature = new File(['sig'], 'renamed-signature.sig');
 
-    const result = await adminUploadBinary(file);
+    const result = await adminUploadBinary([installer, other], { signatures: { 'a.exe': signature }, replace: true });
 
-    expect(result.uploaded[0].filename).toBe('a.exe');
+    expect(result.uploaded[0].signed).toBe(true);
     const [url, init] = fetchMock().mock.calls[0];
     expect(url).toBe('/api/admin/downloads/upload');
     expect(init.method).toBe('POST');
     expect(init.headers.Authorization).toBe('Bearer tok');
     expect(init.body).toBeInstanceOf(FormData);
-    expect((init.body as FormData).get('file')).toBeInstanceOf(File);
+    const form = init.body as FormData;
+    expect(form.getAll('file').map((f) => (f as File).name)).toEqual(['a.exe', 'b.dmg']);
+    // Each signature is sent under the name of the installer it signs
+    expect(form.getAll('signature').map((f) => (f as File).name)).toEqual(['a.exe.sig']);
+    expect(form.get('replace')).toBe('true');
     // No explicit content type: the browser must set the multipart boundary
     expect(init.headers['Content-Type']).toBeUndefined();
   });
 
-  it('surfaces upload errors from the server', async () => {
+  it('leaves out the replace flag by default and surfaces upload errors from the server', async () => {
+    fetchMock().mockResolvedValueOnce(jsonResponse(409, { error: 'a.exe already exists; upload again with replace to overwrite it' }));
+    await expect(adminUploadBinary(new File([], 'a.exe'))).rejects.toThrow('already exists');
+    const form = fetchMock().mock.calls[0][1].body as FormData;
+    expect(form.has('replace')).toBe(false);
+    expect(form.has('signature')).toBe(false);
+
     fetchMock().mockResolvedValueOnce(jsonResponse(413, { error: 'file too large' }));
     await expect(adminUploadBinary(new File([], 'big.exe'))).rejects.toThrow('file too large');
   });

@@ -4,6 +4,14 @@ use sqlx::postgres::PgPoolOptions;
 use crate::models::*;
 use crate::pii::PiiService;
 
+mod console;
+mod mfa;
+mod relay;
+
+pub use console::{AuditFilter, RoleChange, UserListFilter};
+pub use mfa::{EmailCodeCheck, MfaSummary};
+pub use relay::{ClipboardWrite, KeyRotation};
+
 pub struct CreateUserParams<'a> {
     pub username: &'a str,
     pub password_hash: &'a str,
@@ -27,7 +35,7 @@ pub struct CreateOidcUserParams<'a> {
 pub struct SubscriptionPlanParams<'a> {
     pub name: &'a str,
     pub description: &'a str,
-    pub price: f64,
+    pub price: rust_decimal::Decimal,
     pub currency: &'a str,
     pub billing_period: &'a str,
     pub max_devices: i32,
@@ -204,11 +212,16 @@ impl Db {
         user_id: uuid::Uuid,
         new_hash: &str,
     ) -> Result<(), sqlx::Error> {
-        let result = sqlx::query("UPDATE users SET password = $1 WHERE id = $2")
-            .bind(new_hash)
-            .bind(user_id)
-            .execute(&self.pool)
-            .await?;
+        let result = sqlx::query(
+            "UPDATE users SET password = $1,
+             tokens_revoked_before = GREATEST(COALESCE(tokens_revoked_before, 0),
+                 FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT + 1)
+             WHERE id = $2",
+        )
+        .bind(new_hash)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(sqlx::Error::RowNotFound);
         }
@@ -259,8 +272,8 @@ impl Db {
         };
 
         sqlx::query(
-            "INSERT INTO users (username, password, is_admin, username_idx, email, email_idx, email_verified, auth_provider, full_name)
-             VALUES ($1, $2, TRUE, $3, $4, NULLIF($5,''), TRUE, 'local', $6)
+            "INSERT INTO users (username, password, is_admin, role, username_idx, email, email_idx, email_verified, auth_provider, full_name)
+             VALUES ($1, $2, TRUE, 'owner', $3, $4, NULLIF($5,''), TRUE, 'local', $6)
              ON CONFLICT (username_idx) DO NOTHING"
         )
         .bind(username)
@@ -398,14 +411,36 @@ impl Db {
         device_id: uuid::Uuid,
         user_id: uuid::Uuid,
     ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM devices WHERE id = $1 AND user_id = $2 FOR UPDATE",
+        )
+        .bind(device_id)
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if status == "approved" {
+            sqlx::query(
+                "UPDATE users SET min_key_version = GREATEST(min_key_version,
+                    COALESCE((SELECT MAX(version) FROM group_key_versions WHERE user_id = $1), 0) + 1)
+                 WHERE id = $1",
+            ).bind(user_id).execute(&mut *tx).await?;
+            sqlx::query("UPDATE group_key_versions SET rotation_due_at = NOW() WHERE user_id = $1 AND is_current")
+                .bind(user_id).execute(&mut *tx).await?;
+        }
         let result = sqlx::query("DELETE FROM devices WHERE id = $1 AND user_id = $2")
             .bind(device_id)
             .bind(user_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         if result.rows_affected() == 0 {
             return Err(sqlx::Error::RowNotFound);
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -450,12 +485,19 @@ impl Db {
         offset: i64,
     ) -> Result<Vec<ClipboardEntryWithDevice>, sqlx::Error> {
         sqlx::query_as::<_, ClipboardEntryWithDevice>(
-            "SELECT e.id, e.user_id, e.device_id, d.name as device_name, e.content_type, e.encrypted_data, e.metadata, e.created_at, e.key_version
+            "WITH page AS (
+                 SELECT id, created_at, OCTET_LENGTH(encrypted_data) + COALESCE(OCTET_LENGTH(metadata), 0) AS size
+                 FROM clipboard_entries WHERE user_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3
+             ), bounded AS (
+                 SELECT id, ROW_NUMBER() OVER (ORDER BY created_at DESC, id DESC) AS n,
+                     SUM(size) OVER (ORDER BY created_at DESC, id DESC) AS bytes FROM page
+             )
+             SELECT e.id, e.user_id, e.device_id, d.name as device_name, e.content_type, e.encrypted_data, e.metadata, e.created_at, e.key_version
              FROM clipboard_entries e
              JOIN devices d ON d.id = e.device_id
-             WHERE e.user_id = $1
-             ORDER BY e.created_at DESC
-             LIMIT $2 OFFSET $3"
+             JOIN bounded b ON b.id = e.id
+             WHERE b.bytes <= 33554432 OR b.n = 1
+             ORDER BY e.created_at DESC, e.id DESC"
         )
         .bind(user_id)
         .bind(limit)
@@ -693,9 +735,16 @@ impl Db {
         &self,
         device_id: uuid::Uuid,
         since_version: i32,
-    ) -> Result<Vec<DeviceGroupKey>, sqlx::Error> {
-        sqlx::query_as::<_, DeviceGroupKey>(
-            "SELECT * FROM device_group_keys WHERE device_id = $1 AND version > $2 ORDER BY version"
+    ) -> Result<Vec<DeviceGroupKeyWithSender>, sqlx::Error> {
+        sqlx::query_as::<_, DeviceGroupKeyWithSender>(
+            "SELECT k.version, k.encrypted_key, k.from_device_id,
+                    COALESCE(k.from_public_key, d.public_key) AS from_public_key,
+                    COALESCE(k.from_public_key_sig, d.public_key_sig) AS from_public_key_sig,
+                    v.membership
+             FROM device_group_keys k LEFT JOIN devices d ON d.id = k.from_device_id
+             JOIN devices recipient ON recipient.id = k.device_id
+             LEFT JOIN group_key_versions v ON v.user_id = recipient.user_id AND v.version = k.version
+             WHERE k.device_id = $1 AND k.version > $2 ORDER BY k.version LIMIT 100",
         )
         .bind(device_id)
         .bind(since_version)
@@ -715,61 +764,24 @@ impl Db {
         wrapped_keys: &[(uuid::Uuid, Vec<u8>)],
         rotation_interval_hours: i64,
     ) -> Result<bool, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
-
-        // CAS check: verify current version matches expectation
-        let current: Option<(i32,)> = sqlx::query_as(
-            "SELECT version FROM group_key_versions WHERE user_id = $1 AND is_current = TRUE FOR UPDATE"
-        )
-        .bind(user_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        let actual_version = current.map(|(v,)| v).unwrap_or(0);
-        if actual_version != expected_current_version {
-            tx.rollback().await?;
-            return Ok(false); // CAS failure
-        }
-
-        // Mark old version as not current
-        if actual_version > 0 {
-            sqlx::query("UPDATE group_key_versions SET is_current = FALSE WHERE user_id = $1 AND version = $2")
-                .bind(user_id)
-                .bind(actual_version)
-                .execute(&mut *tx)
-                .await?;
-        }
-
-        // Create new version
-        let rotation_due = chrono::Utc::now() + chrono::Duration::hours(rotation_interval_hours);
-        sqlx::query(
-            "INSERT INTO group_key_versions (user_id, version, created_by_device_id, rotation_due_at, is_current)
-             VALUES ($1, $2, $3, $4, TRUE)"
-        )
-        .bind(user_id)
-        .bind(new_version)
-        .bind(from_device_id)
-        .bind(rotation_due)
-        .execute(&mut *tx)
-        .await?;
-
-        // Store wrapped keys for each device
-        for (device_id, encrypted_key) in wrapped_keys {
-            sqlx::query(
-                "INSERT INTO device_group_keys (device_id, version, encrypted_key, from_device_id, updated_at)
-                 VALUES ($1, $2, $3, $4, NOW())
-                 ON CONFLICT (device_id, version) DO UPDATE SET encrypted_key = EXCLUDED.encrypted_key, from_device_id = EXCLUDED.from_device_id, updated_at = NOW()"
-            )
-            .bind(device_id)
-            .bind(new_version)
-            .bind(encrypted_key)
-            .bind(from_device_id)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        tx.commit().await?;
-        Ok(true) // CAS success
+        let keys: Vec<_> = wrapped_keys
+            .iter()
+            .map(|(id, key)| cpmesh_proto::models::StoreGroupKeyEntry {
+                device_id: id.to_string(),
+                encrypted_key: key.clone(),
+                membership: None,
+            })
+            .collect();
+        self.commit_key_rotation(KeyRotation {
+            user_id,
+            from_device_id,
+            expected_current_version,
+            new_version,
+            wrapped_keys: &keys,
+            rotation_interval_hours,
+            approval: None,
+        })
+        .await
     }
 
     /// Check if rotation is due for a user.
@@ -824,7 +836,7 @@ impl Db {
         )
         .bind(params.name)
         .bind(params.description)
-        .bind(sqlx::types::Decimal::try_from(params.price).unwrap_or_default())
+        .bind(params.price)
         .bind(params.currency)
         .bind(params.billing_period)
         .bind(params.max_devices)
@@ -851,7 +863,7 @@ impl Db {
         )
         .bind(params.name)
         .bind(params.description)
-        .bind(sqlx::types::Decimal::try_from(params.price).unwrap_or_default())
+        .bind(params.price)
         .bind(params.currency)
         .bind(params.billing_period)
         .bind(params.max_devices)
@@ -888,24 +900,32 @@ impl Db {
         Ok(())
     }
 
+    /// Fails with `RowNotFound` when the user does not exist.
     pub async fn assign_user_subscription(
         &self,
         user_id: uuid::Uuid,
         plan_id: uuid::Uuid,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE users SET subscription_plan_id = $1 WHERE id = $2")
+        let result = sqlx::query("UPDATE users SET subscription_plan_id = $1 WHERE id = $2")
             .bind(plan_id)
             .bind(user_id)
             .execute(&self.pool)
             .await?;
+        if result.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
         Ok(())
     }
 
+    /// Fails with `RowNotFound` when the user does not exist.
     pub async fn remove_user_subscription(&self, user_id: uuid::Uuid) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE users SET subscription_plan_id = NULL WHERE id = $1")
+        let result = sqlx::query("UPDATE users SET subscription_plan_id = NULL WHERE id = $1")
             .bind(user_id)
             .execute(&self.pool)
             .await?;
+        if result.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
         Ok(())
     }
 
@@ -1088,14 +1108,18 @@ impl Db {
         &self,
         params: &AppReleaseParams<'_>,
     ) -> Result<AppRelease, sqlx::Error> {
-        // If marking as current, unset others for same platform+arch
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("LOCK TABLE app_releases IN SHARE ROW EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await?;
+        // Serialize the switch even when there is no previous release to lock.
         if params.is_current {
             sqlx::query("UPDATE app_releases SET is_current = FALSE, updated_at = NOW() WHERE platform = $1 AND arch = $2")
                 .bind(params.platform).bind(params.arch)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
         }
-        sqlx::query_as::<_, AppRelease>(
+        let release = sqlx::query_as::<_, AppRelease>(
             "INSERT INTO app_releases (version, platform, arch, download_url, release_notes, is_current)
              VALUES ($1, $2, $3, $4, $5, $6) RETURNING *"
         )
@@ -1105,8 +1129,10 @@ impl Db {
         .bind(params.download_url)
         .bind(params.release_notes)
         .bind(params.is_current)
-        .fetch_one(&self.pool)
-        .await
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(release)
     }
 
     pub async fn update_app_release(
@@ -1114,13 +1140,17 @@ impl Db {
         id: uuid::Uuid,
         params: &AppReleaseParams<'_>,
     ) -> Result<AppRelease, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("LOCK TABLE app_releases IN SHARE ROW EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await?;
         if params.is_current {
             sqlx::query("UPDATE app_releases SET is_current = FALSE, updated_at = NOW() WHERE platform = $1 AND arch = $2 AND id != $3")
                 .bind(params.platform).bind(params.arch).bind(id)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
         }
-        sqlx::query_as::<_, AppRelease>(
+        let release = sqlx::query_as::<_, AppRelease>(
             "UPDATE app_releases SET version=$1, platform=$2, arch=$3, download_url=$4, release_notes=$5, is_current=$6, updated_at=NOW()
              WHERE id=$7 RETURNING *"
         )
@@ -1131,8 +1161,10 @@ impl Db {
         .bind(params.release_notes)
         .bind(params.is_current)
         .bind(id)
-        .fetch_one(&self.pool)
-        .await
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(release)
     }
 
     pub async fn delete_app_release(&self, id: uuid::Uuid) -> Result<(), sqlx::Error> {
@@ -1147,74 +1179,6 @@ impl Db {
     }
 
     // === Admin operations ===
-
-    pub async fn admin_list_users(
-        &self,
-        pii: Option<&PiiService>,
-    ) -> Result<Vec<AdminUserRow>, sqlx::Error> {
-        let rows = sqlx::query_as::<_, (uuid::Uuid, String, Option<String>, Option<String>, bool, String, bool, DateTime<Utc>, i32, Option<uuid::Uuid>, Option<String>)>(
-            "SELECT u.id, u.username, u.email, u.full_name, u.email_verified, COALESCE(u.auth_provider,'local'),
-                    u.is_admin, u.created_at, COUNT(d.id)::int AS device_count,
-                    u.subscription_plan_id, sp.name AS plan_name
-             FROM users u
-             LEFT JOIN devices d ON d.user_id = u.id
-             LEFT JOIN subscription_plans sp ON sp.id = u.subscription_plan_id
-             GROUP BY u.id, sp.name
-             ORDER BY u.created_at"
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut users = Vec::new();
-        for (
-            id,
-            username,
-            enc_email,
-            enc_full_name,
-            email_verified,
-            auth_provider,
-            is_admin,
-            created_at,
-            device_count,
-            sub_plan_id,
-            plan_name,
-        ) in rows
-        {
-            let email = decrypt_optional_field(enc_email.as_deref(), pii);
-            let full_name = decrypt_optional_field(enc_full_name.as_deref(), pii);
-            users.push(AdminUserRow {
-                id,
-                username,
-                email,
-                full_name,
-                email_verified,
-                auth_provider,
-                is_admin,
-                created_at,
-                device_count,
-                subscription_plan_id: sub_plan_id,
-                subscription_plan_name: plan_name,
-            });
-        }
-        Ok(users)
-    }
-
-    pub async fn admin_get_stats(&self) -> Result<AdminStats, sqlx::Error> {
-        let row: (i64, i64, i64) = sqlx::query_as(
-            "SELECT
-                (SELECT COUNT(*) FROM users),
-                (SELECT COUNT(*) FROM devices),
-                (SELECT COUNT(*) FROM clipboard_entries)",
-        )
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(AdminStats {
-            total_users: row.0,
-            total_devices: row.1,
-            total_entries: row.2,
-            active_connections: 0,
-        })
-    }
 
     pub async fn admin_delete_user(&self, user_id: uuid::Uuid) -> Result<(), sqlx::Error> {
         let result = sqlx::query("DELETE FROM users WHERE id = $1")
@@ -1325,7 +1289,7 @@ impl Db {
         user_id: uuid::Uuid,
         now_epoch: u64,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE users SET tokens_revoked_before = $1 WHERE id = $2")
+        sqlx::query("UPDATE users SET tokens_revoked_before = GREATEST(COALESCE(tokens_revoked_before, 0), $1) WHERE id = $2")
             .bind(now_epoch as i64)
             .bind(user_id)
             .execute(&self.pool)
@@ -1757,6 +1721,142 @@ CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action, created_a
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS fingerprint VARCHAR(64);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_user_fingerprint
     ON devices(user_id, fingerprint) WHERE fingerprint IS NOT NULL;
+
+-- Roles: 'user' for members; viewer, support, admin and owner are staff (see rbac.rs).
+-- Admins from before roles existed become owners; is_admin mirrors "is staff".
+ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) NOT NULL DEFAULT 'user';
+UPDATE users SET role = 'owner' WHERE is_admin = TRUE AND role = 'user';
+UPDATE users SET is_admin = (role <> 'user') WHERE is_admin IS DISTINCT FROM (role <> 'user');
+ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended_at TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended_reason TEXT;
+CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at);
+
+-- Two-factor authentication: authenticator app (TOTP) state and lockout
+CREATE TABLE IF NOT EXISTS user_mfa (
+    user_id             UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    totp_secret         TEXT,
+    totp_pending_secret TEXT,
+    totp_enabled_at     TIMESTAMPTZ,
+    totp_last_step      BIGINT NOT NULL DEFAULT 0,
+    failed_attempts     INT NOT NULL DEFAULT 0,
+    locked_until        TIMESTAMPTZ,
+    updated_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS mfa_recovery_codes (
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    code_hash   VARCHAR(64) NOT NULL,
+    used_at     TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_mfa_recovery_codes_user ON mfa_recovery_codes(user_id);
+
+-- Passkeys (WebAuthn credentials)
+CREATE TABLE IF NOT EXISTS webauthn_credentials (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    credential_id   BYTEA NOT NULL UNIQUE,
+    public_key      BYTEA NOT NULL,
+    algorithm       INT NOT NULL,
+    sign_count      BIGINT NOT NULL DEFAULT 0,
+    transports      JSONB NOT NULL DEFAULT '[]'::jsonb,
+    name            VARCHAR(100) NOT NULL,
+    backup_eligible BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    last_used_at    TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_webauthn_credentials_user ON webauthn_credentials(user_id);
+
+-- Codes emailed to confirm an account before it sets up two-factor authentication
+CREATE TABLE IF NOT EXISTS mfa_email_codes (
+    user_id     UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    code_hash   VARCHAR(64) NOT NULL,
+    attempts    INT NOT NULL DEFAULT 0,
+    expires_at  TIMESTAMPTZ NOT NULL,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- API tokens for automation such as the release workflow (only a hash is stored)
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id           UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name         VARCHAR(100) NOT NULL,
+    token_hash   VARCHAR(64) NOT NULL UNIQUE,
+    token_prefix VARCHAR(16) NOT NULL,
+    scopes       JSONB NOT NULL DEFAULT '[]'::jsonb,
+    expires_at   TIMESTAMPTZ,
+    last_used_at TIMESTAMPTZ,
+    revoked_at   TIMESTAMPTZ,
+    created_at   TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Settings changed from the admin console; they override environment defaults
+CREATE TABLE IF NOT EXISTS app_settings (
+    key         VARCHAR(100) PRIMARY KEY,
+    value       JSONB NOT NULL,
+    updated_by  UUID REFERENCES users(id) ON DELETE SET NULL,
+    updated_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- One row per user per day with activity, for active-user statistics
+CREATE TABLE IF NOT EXISTS user_daily_activity (
+    day      DATE NOT NULL,
+    user_id  UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    PRIMARY KEY (day, user_id)
+);
+
+-- Admin actions name the account they affected
+ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS target_user_id UUID REFERENCES users(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_audit_logs_target ON audit_logs(target_user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_clipboard_entries_created ON clipboard_entries(created_at);
+
+-- Checksums of installers uploaded to this server
+ALTER TABLE download_links ADD COLUMN IF NOT EXISTS sha256 VARCHAR(64);
+ALTER TABLE download_links ADD COLUMN IF NOT EXISTS size_bytes BIGINT;
+
+-- Revocation stops writes until a new key excludes the removed device.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS min_key_version INT NOT NULL DEFAULT 1;
+ALTER TABLE clipboard_entries ADD COLUMN IF NOT EXISTS request_id UUID;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_device_request
+    ON clipboard_entries(device_id, request_id);
+CREATE TABLE IF NOT EXISTS clipboard_requests (
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    device_id UUID NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    request_id UUID NOT NULL,
+    entry_id UUID NOT NULL,
+    payload_hash BYTEA NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (device_id, request_id)
+);
+CREATE INDEX IF NOT EXISTS idx_clipboard_requests_created ON clipboard_requests(created_at);
+
+-- Preserve the sender identity with each wrap, including after the sender is removed.
+ALTER TABLE device_group_keys ADD COLUMN IF NOT EXISTS from_public_key BYTEA;
+ALTER TABLE device_group_keys ADD COLUMN IF NOT EXISTS from_public_key_sig BYTEA;
+ALTER TABLE group_key_versions ADD COLUMN IF NOT EXISTS membership JSONB;
+UPDATE device_group_keys k SET from_public_key = d.public_key, from_public_key_sig = d.public_key_sig
+    FROM devices d WHERE d.id = k.from_device_id AND k.from_public_key IS NULL;
+ALTER TABLE device_group_keys DROP CONSTRAINT IF EXISTS device_group_keys_from_device_id_fkey;
+
+-- Repair pre-constraint duplicates deterministically before enforcing uniqueness.
+WITH ranked AS (
+    SELECT user_id, version, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY version DESC) AS n
+    FROM group_key_versions WHERE is_current
+)
+UPDATE group_key_versions v SET is_current = FALSE FROM ranked r
+    WHERE v.user_id = r.user_id AND v.version = r.version AND r.n > 1;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_one_current_group_key
+    ON group_key_versions(user_id) WHERE is_current;
+
+WITH ranked AS (
+    SELECT id, ROW_NUMBER() OVER (PARTITION BY platform, arch ORDER BY updated_at DESC, id DESC) AS n
+    FROM app_releases WHERE is_current
+)
+UPDATE app_releases a SET is_current = FALSE FROM ranked r WHERE a.id = r.id AND r.n > 1;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_one_current_release
+    ON app_releases(platform, arch) WHERE is_current;
 "#;
 
 #[cfg(test)]
@@ -1866,6 +1966,13 @@ mod tests {
             "device_approval_sessions",
             "group_key_versions",
             "device_group_keys",
+            "user_mfa",
+            "mfa_recovery_codes",
+            "webauthn_credentials",
+            "mfa_email_codes",
+            "api_tokens",
+            "app_settings",
+            "user_daily_activity",
         ] {
             assert!(
                 SCHEMA.contains(&format!("CREATE TABLE IF NOT EXISTS {table}")),

@@ -3,11 +3,14 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager, State};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::api::client::ApiClient;
+use crate::api::client::{
+    ApiClient, ApiError, LoginOutcome, MfaChallenge, MfaMethod, MfaStage, MfaVerified,
+};
 use crate::config::{AppConfig, TokenStore};
 use crate::crypto::exchange::KeyExchange;
 use crate::crypto::keys::{KeyPair, derive_approval_code};
@@ -46,6 +49,28 @@ pub(crate) fn restore_api_client(
 const SESSION_EXPIRED: &str =
     "Your session has expired. Sign out, then sign in again to resume syncing.";
 
+/// How long the server accepts the ticket for a sign-in's second factor.
+const MFA_TICKET_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// Shown when the second factor arrives after the sign-in ended.
+const MFA_SIGN_IN_EXPIRED: &str = "Your sign-in expired. Sign in again.";
+
+/// A password sign-in waiting for its second factor. The ticket is kept in memory
+/// only: it is used once and expires after [`MFA_TICKET_TTL`].
+struct PendingMfaLogin {
+    server_url: String,
+    device_name: String,
+    mfa_token: String,
+    /// Taken before the password was sent, so it never outlives the server's ticket.
+    started: Instant,
+}
+
+impl PendingMfaLogin {
+    fn is_expired(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.started) >= MFA_TICKET_TTL
+    }
+}
+
 /// Shared application state managed by Tauri.
 pub struct AppContext {
     pub config: RwLock<AppConfig>,
@@ -60,6 +85,25 @@ pub struct AppContext {
     pub skip_clipboard: Arc<AtomicBool>,
     /// Hash of the last content written to clipboard (prevents echo duplicates).
     pub last_clipboard_hash: Arc<tokio::sync::Mutex<[u8; 32]>>,
+    /// The sign-in `complete_mfa_login` finishes. Lock after `api` when holding both.
+    pending_mfa: Mutex<Option<PendingMfaLogin>>,
+    pairing: Mutex<std::collections::HashMap<String, PairingCandidate>>,
+    lifecycle: Mutex<()>,
+    connect_cancel: Mutex<tokio_util::sync::CancellationToken>,
+    generation: AtomicU64,
+    tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    history_sync: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    pending_push: Mutex<Option<PendingPush>>,
+    key_operations: Mutex<()>,
+    rotation_pending: AtomicBool,
+}
+
+#[derive(Clone)]
+struct PairingCandidate {
+    peer: DeviceIdentity,
+    fingerprint: String,
+    started: Instant,
+    incoming: bool,
 }
 
 impl AppContext {
@@ -85,11 +129,136 @@ impl AppContext {
             devices: RwLock::new(vec![]),
             skip_clipboard: Arc::new(AtomicBool::new(false)),
             last_clipboard_hash: Arc::new(tokio::sync::Mutex::new([0u8; 32])),
+            pending_mfa: Mutex::new(None),
+            pairing: Mutex::new(std::collections::HashMap::new()),
+            lifecycle: Mutex::new(()),
+            connect_cancel: Mutex::new(tokio_util::sync::CancellationToken::new()),
+            generation: AtomicU64::new(0),
+            tasks: Mutex::new(Vec::new()),
+            history_sync: Mutex::new(None),
+            pending_push: Mutex::new(None),
+            key_operations: Mutex::new(()),
+            rotation_pending: AtomicBool::new(false),
         }
+    }
+
+    /// Takes the sign-in waiting for its second factor, unless it has expired.
+    async fn take_pending_mfa(&self, now: Instant) -> Option<PendingMfaLogin> {
+        self.pending_mfa
+            .lock()
+            .await
+            .take()
+            .filter(|pending| !pending.is_expired(now))
     }
 }
 
 // === Serializable types for frontend ===
+
+/// What `setup_and_login` led to.
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum LoginStep {
+    /// Signed in, and this device is set up.
+    SignedIn,
+    VerificationSent,
+    /// The password was right; a second factor comes next.
+    MfaRequired(MfaPrompt),
+}
+
+/// What the sign-in screen asks for next. The ticket itself stays in the backend.
+#[derive(Debug, PartialEq, Serialize)]
+pub struct MfaPrompt {
+    pub stage: MfaStage,
+    /// Verify: the methods the account has. Enroll: the methods it can set up.
+    pub methods: Vec<String>,
+    pub email_code_required: bool,
+    pub email_hint: Option<String>,
+    pub passkeys_available: bool,
+    /// The server's explanation.
+    pub message: String,
+}
+
+impl From<&MfaChallenge> for MfaPrompt {
+    fn from(challenge: &MfaChallenge) -> Self {
+        MfaPrompt {
+            stage: challenge.stage,
+            methods: challenge.methods.clone(),
+            email_code_required: challenge.email_code_required,
+            email_hint: challenge.email_hint.clone(),
+            passkeys_available: challenge.passkeys_available,
+            message: challenge.message.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct MfaLoginDone {
+    /// Set when a recovery code was used: how many unused ones are left.
+    pub recovery_codes_remaining: Option<u32>,
+}
+
+/// Why the second factor did not finish the sign-in.
+#[derive(Debug, PartialEq, Serialize)]
+pub struct MfaLoginError {
+    pub message: String,
+    /// The sign-in cannot continue (expired, locked, suspended, or the device setup
+    /// after the code failed): start again with the password.
+    pub restart: bool,
+}
+
+impl MfaLoginError {
+    fn restart(message: impl Into<String>) -> Self {
+        MfaLoginError {
+            message: message.into(),
+            restart: true,
+        }
+    }
+
+    /// Explains a rejected second factor. A locked (for longer than the ticket lives) or
+    /// suspended account ends the sign-in; anything else, usually a mistyped code, can
+    /// be retried with the same ticket.
+    fn from_api(e: &ApiError) -> Self {
+        let (message, restart) = match e {
+            ApiError::Server {
+                code: Some(code),
+                message,
+                ..
+            } => (
+                sentence_case(message),
+                matches!(code.as_str(), "mfa_locked" | "account_suspended"),
+            ),
+            ApiError::Server { status, .. } if *status >= 500 => (
+                format!("The server could not check the code (HTTP {status}). Try again."),
+                false,
+            ),
+            ApiError::Server { message, .. } => (sentence_case(message), false),
+            ApiError::Http(e) => (format!("Could not reach the server: {e}"), false),
+        };
+        MfaLoginError { message, restart }
+    }
+}
+
+/// `message` with its first letter capitalized, to show a server error on its own.
+fn sentence_case(message: &str) -> String {
+    let mut chars = message.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// Structured server errors carry a message written for people; other errors keep
+/// their status for troubleshooting.
+fn describe_api_error(e: &ApiError) -> String {
+    match e {
+        ApiError::Server {
+            code: Some(_),
+            message,
+            ..
+        } => message.clone(),
+        other => other.to_string(),
+    }
+}
 
 #[derive(Serialize)]
 pub struct StatusInfo {
@@ -150,6 +319,18 @@ fn truncate_preview(text: &str, max_chars: usize) -> String {
     }
 }
 
+fn notification_body(entry: &PlainEntry) -> String {
+    match entry.content_type {
+        ContentType::Text => truncate_preview(&String::from_utf8_lossy(&entry.data), 80),
+        ContentType::Image => "Image copied".into(),
+        ContentType::File => entry
+            .metadata
+            .filename
+            .clone()
+            .unwrap_or_else(|| "File received".into()),
+    }
+}
+
 // === Tauri Commands ===
 
 #[tauri::command]
@@ -186,7 +367,7 @@ pub async fn setup_and_login(
     password_confirm: Option<String>,
     country: Option<String>,
     mobile: Option<String>,
-) -> Result<(), String> {
+) -> Result<LoginStep, String> {
     // Validate server URL scheme
     if !server_url.starts_with("https://") && !server_url.starts_with("http://") {
         return Err("Server URL must start with https:// or http://".into());
@@ -194,6 +375,8 @@ pub async fn setup_and_login(
 
     let mut api = ctx.api.lock().await;
     *api = api_client(&server_url, &ctx.config_dir);
+    // A new sign-in replaces one that was waiting for its second factor
+    ctx.pending_mfa.lock().await.take();
 
     // Register or login
     if is_register {
@@ -211,42 +394,137 @@ pub async fn setup_and_login(
         })
         .await
         .map_err(|e| format!("Registration failed: {e}"))?;
+        return Ok(LoginStep::VerificationSent);
     }
 
     let device_name = crate::fingerprint::auto_device_name();
 
-    let auth_resp = api
+    let started = Instant::now();
+    let outcome = api
         .login(&username, &password, &device_name)
         .await
-        .map_err(|e| format!("Login failed: {e}"))?;
+        .map_err(|e| format!("Login failed: {}", describe_api_error(&e)))?;
+    let auth_resp = match outcome {
+        LoginOutcome::SignedIn(auth) => auth,
+        LoginOutcome::SecondFactor(challenge) => {
+            let prompt = MfaPrompt::from(&challenge);
+            // Only codes can be confirmed in the app; setting up a second factor needs
+            // the web dashboard
+            if challenge.stage == MfaStage::Verify {
+                *ctx.pending_mfa.lock().await = Some(PendingMfaLogin {
+                    server_url,
+                    device_name,
+                    mfa_token: challenge.mfa_token,
+                    started,
+                });
+            }
+            return Ok(LoginStep::MfaRequired(prompt));
+        }
+    };
 
-    // Generate stable device fingerprint using user_id from auth response
-    let user_id = auth_resp.user_id.clone().unwrap_or_default();
+    let user_id = auth_resp.user_id.unwrap_or_default();
+    finish_sign_in(&ctx, &mut api, server_url, user_id, device_name).await?;
+    Ok(LoginStep::SignedIn)
+}
+
+/// Finishes the sign-in `setup_and_login` paused for a second factor, then sets up
+/// this device like a sign-in without one.
+#[tauri::command]
+pub async fn complete_mfa_login(
+    ctx: State<'_, AppContext>,
+    method: MfaMethod,
+    code: String,
+) -> Result<MfaLoginDone, MfaLoginError> {
+    let mut api = ctx.api.lock().await;
+    let (pending, verified) = verify_pending_mfa(&ctx, &mut api, method, code.trim()).await?;
+
+    // The ticket is used up, so a failure from here on needs a new sign-in
+    let user = api
+        .get_me()
+        .await
+        .map_err(|e| MfaLoginError::restart(format!("Failed to get user info: {e}")))?;
+    finish_sign_in(
+        &ctx,
+        &mut api,
+        pending.server_url,
+        user.id,
+        pending.device_name,
+    )
+    .await
+    .map_err(MfaLoginError::restart)?;
+
+    Ok(MfaLoginDone {
+        recovery_codes_remaining: verified.recovery_codes_remaining,
+    })
+}
+
+/// Forgets a sign-in waiting for its second factor.
+#[tauri::command]
+pub async fn cancel_mfa_login(ctx: State<'_, AppContext>) -> Result<(), String> {
+    ctx.pending_mfa.lock().await.take();
+    Ok(())
+}
+
+/// Sends the second factor of the paused sign-in. A ticket rejected because of a
+/// mistyped code stays pending for another try; otherwise it is used up.
+async fn verify_pending_mfa(
+    ctx: &AppContext,
+    api: &mut ApiClient,
+    method: MfaMethod,
+    code: &str,
+) -> Result<(PendingMfaLogin, MfaVerified), MfaLoginError> {
+    let pending = ctx
+        .take_pending_mfa(Instant::now())
+        .await
+        .ok_or_else(|| MfaLoginError::restart(MFA_SIGN_IN_EXPIRED))?;
+
+    *api = api_client(&pending.server_url, &ctx.config_dir);
+    match api.verify_mfa(&pending.mfa_token, method, code).await {
+        Ok(verified) => Ok((pending, verified)),
+        Err(e) => {
+            let error = MfaLoginError::from_api(&e);
+            if !error.restart {
+                *ctx.pending_mfa.lock().await = Some(pending);
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Registers this device for a freshly signed-in session and saves the account: the
+/// device key pair, the group key (once the device is approved), the tokens in secure
+/// storage and the config.
+async fn finish_sign_in(
+    ctx: &AppContext,
+    api: &mut ApiClient,
+    server_url: String,
+    user_id: String,
+    device_name: String,
+) -> Result<(), String> {
+    crate::key_sync::bind_account(
+        &ctx.config_dir,
+        &server_url,
+        &user_id,
+        &*ctx.config.read().await,
+    )?;
+    // Generate stable device fingerprint using the account's user_id
     let fingerprint = crate::fingerprint::generate_device_fingerprint(&user_id).ok();
 
     // Generate device key pair
     let key_path = AppConfig::key_path(&ctx.config_dir);
     let kp =
         KeyPair::load_or_generate(&key_path).map_err(|e| format!("Key generation failed: {e}"))?;
-    let pub_bytes = kp.public_key_bytes();
-    let sig = kp.sign_public_key();
-
     // Register device with fingerprint
     let reg_resp = api
-        .register_device(&device_name, pub_bytes, Some(sig), fingerprint)
+        .register_device(&device_name, &kp, fingerprint)
         .await
         .map_err(|e| format!("Device registration failed: {e}"))?;
 
     let device_id = reg_resp.device.id.clone();
     let device_status = reg_resp.device.status.to_string();
 
-    // Setup group key (only if device is approved — first device auto-approves)
-    let mut exchange = KeyExchange::new(kp);
-    if device_status == "approved" {
-        setup_group_key(&mut exchange, &api, &device_id, &ctx.config_dir)
-            .await
-            .map_err(|e| format!("Key exchange failed: {e}"))?;
-    }
+    // Restore first; connect() is the sole network key-initialization path.
+    let exchange = crate::key_sync::restore(kp, &ctx.config_dir)?;
 
     // Save tokens to secure storage
     let token_store = TokenStore::new(&ctx.config_dir);
@@ -267,6 +545,7 @@ pub async fn setup_and_login(
     config
         .save(&ctx.config_dir)
         .map_err(|e| format!("Config save failed: {e}"))?;
+    drop(config);
 
     // Update state
     *ctx.state.write().await = AppState::Disconnected;
@@ -274,120 +553,8 @@ pub async fn setup_and_login(
 
     // Initialize history
     let db_path = ctx.config_dir.join("history.db");
-    if let Ok(h) = History::open(&db_path, 1000) {
-        *ctx.history.lock().await = Some(h);
-    }
+    *ctx.history.lock().await = Some(History::open(&db_path, 1000).map_err(|e| e.to_string())?);
 
-    Ok(())
-}
-
-async fn setup_group_key(
-    exchange: &mut KeyExchange,
-    api: &ApiClient,
-    device_id: &str,
-    config_dir: &std::path::Path,
-) -> Result<(), String> {
-    let mut verifier = crate::crypto::verify::KeyVerifier::new(config_dir)
-        .map_err(|e| format!("Key verifier init failed: {e}"))?;
-
-    // Try to get existing group key
-    match api.get_group_key().await.map_err(|e| e.to_string())? {
-        Some(gk_resp) => {
-            let peer_pub =
-                KeyPair::parse_public_key(&gk_resp.from_public_key).map_err(|e| e.to_string())?;
-
-            // Verify ECDSA signature on sender's public key
-            if let Some(sig) = &gk_resp.from_public_key_sig {
-                KeyPair::verify_public_key_signature(&peer_pub, sig).map_err(|e| {
-                    format!("SECURITY: Sender key signature invalid (possible MITM): {e}")
-                })?;
-                info!(
-                    "Verified sender key signature (device {})",
-                    gk_resp.from_device_id
-                );
-            } else {
-                info!("WARNING: Sender device has no key signature (legacy device)");
-            }
-
-            // Migrate legacy TOFU pin or verify existing pin
-            verifier.migrate_legacy(&gk_resp.from_device_id, &peer_pub)
-                .map_err(|e| match e {
-                    crate::crypto::verify::VerifyError::KeyChanged =>
-                        format!("SECURITY: Sender device {} public key has CHANGED. \
-                            This could indicate a man-in-the-middle attack. \
-                            If the device was legitimately re-created, delete pinned_keys.json and retry.",
-                            gk_resp.from_device_id),
-                    other => format!("Key verification failed: {other}"),
-                })?;
-
-            let version = gk_resp.version;
-            exchange
-                .decrypt_from_device(&gk_resp.encrypted_key, &peer_pub, version)
-                .map_err(|e| e.to_string())?;
-            info!(
-                "Received group key v{} from device {} (fingerprint: {})",
-                version,
-                gk_resp.from_device_id,
-                KeyPair::short_fingerprint(&peer_pub)
-            );
-
-            // Save keyring
-            let keyring_path = AppConfig::keyring_path(config_dir);
-            let _ = exchange.save_keyring(&keyring_path);
-        }
-        None => {
-            // First device — generate group key and distribute
-            exchange.init_group_key();
-            info!("Generated new group key (first device)");
-
-            let keys_resp = api.get_device_keys().await.map_err(|e| e.to_string())?;
-            let mut store_keys = vec![];
-            for dev in &keys_resp.devices {
-                if dev.id == device_id {
-                    continue;
-                }
-                if dev.status != DeviceStatus::Approved {
-                    continue;
-                }
-                if let Some(pk_bytes) = &dev.public_key
-                    && let Ok(peer_pub) = KeyPair::parse_public_key(pk_bytes)
-                {
-                    if let Some(sig) = &dev.public_key_sig
-                        && let Err(e) = KeyPair::verify_public_key_signature(&peer_pub, sig)
-                    {
-                        info!(
-                            "SECURITY: Device {} ({}) has invalid key signature, skipping: {e}",
-                            dev.name, dev.id
-                        );
-                        continue;
-                    }
-
-                    // Pin approved peer's key
-                    let _ = verifier.migrate_legacy(&dev.id, &peer_pub);
-
-                    if let Ok(encrypted) = exchange.encrypt_for_device(&peer_pub) {
-                        store_keys.push(StoreGroupKeyEntry {
-                            device_id: dev.id.clone(),
-                            encrypted_key: encrypted,
-                        });
-                        info!(
-                            "Encrypted group key for device {} (fingerprint: {})",
-                            dev.name,
-                            KeyPair::short_fingerprint(&peer_pub)
-                        );
-                    }
-                }
-            }
-            // Always hit the endpoint to record version 1 in the DB, even if store_keys is empty
-            api.store_group_keys(&store_keys)
-                .await
-                .map_err(|e| e.to_string())?;
-
-            // Save keyring
-            let keyring_path = AppConfig::keyring_path(config_dir);
-            let _ = exchange.save_keyring(&keyring_path);
-        }
-    }
     Ok(())
 }
 
@@ -396,6 +563,20 @@ pub async fn connect(
     app_handle: tauri::AppHandle,
     ctx: State<'_, AppContext>,
 ) -> Result<(), String> {
+    let _lifecycle = ctx.lifecycle.lock().await;
+    if ctx
+        .ws
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|ws| !ws.is_closed())
+    {
+        return Ok(());
+    }
+    stop_connection_tasks(&ctx).await;
+    let generation = ctx.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    *ctx.connect_cancel.lock().await = cancel.clone();
     let config = ctx.config.read().await.clone();
     if !config.is_configured() {
         return Err("App not configured".into());
@@ -404,57 +585,16 @@ pub async fn connect(
         return Err(SESSION_EXPIRED.into());
     }
 
-    // Ensure exchange is ready and has group keys.
-    // For newly approved devices, the exchange exists but has no keys
-    // (it was created empty during setup_and_login while device was pending).
-    {
-        let needs_setup = {
-            let guard = ctx.exchange.lock().await;
-            match guard.as_ref() {
-                None => true,
-                Some(ex) => !ex.has_group_key(),
-            }
-        };
-
-        if needs_setup {
-            let key_path = AppConfig::key_path(&ctx.config_dir);
-            let kp = KeyPair::load_or_generate(&key_path).map_err(|e| e.to_string())?;
-            let mut exchange = KeyExchange::new(kp);
-
-            // Try loading cached keyring from disk first
-            let keyring_path = AppConfig::keyring_path(&ctx.config_dir);
-            if keyring_path.exists()
-                && let Err(e) = exchange.load_keyring(&keyring_path)
-            {
-                info!("Could not load cached keyring, will fetch from server: {e}");
-            }
-
-            // If keyring didn't have keys, fetch from server
-            if !exchange.has_group_key() {
-                let api = ctx.api.lock().await;
-                setup_group_key(&mut exchange, &api, &config.device_id, &ctx.config_dir)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-
-            *ctx.exchange.lock().await = Some(exchange);
-
-            // Update device_status to approved now that we have keys
-            // (handles pending→approved transition)
-            let mut cfg = ctx.config.write().await;
-            if cfg.device_status != "approved" {
-                cfg.device_status = "approved".to_string();
-                let _ = cfg.save(&ctx.config_dir);
-            }
-        }
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err("Connection cancelled".into()),
+        result = prepare_connection(&ctx, &config) => result?,
     }
 
     // Ensure history is ready
     if ctx.history.lock().await.is_none() {
         let db_path = ctx.config_dir.join("history.db");
-        if let Ok(h) = History::open(&db_path, 1000) {
-            *ctx.history.lock().await = Some(h);
-        }
+        *ctx.history.lock().await = Some(History::open(&db_path, 1000).map_err(|e| e.to_string())?);
     }
 
     *ctx.state.write().await = AppState::Connecting;
@@ -480,17 +620,46 @@ pub async fn connect(
 
     // Start connection in background
     let ws_clone = ws_conn.clone();
-    tokio::spawn(async move {
+    let connection_task = tokio::spawn(async move {
         ws_clone.connect_with_reconnect().await;
     });
 
     // Event handler task
     let handle = app_handle.clone();
-    tokio::spawn(async move {
+    let event_task = tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
+            let ctx = handle.state::<AppContext>();
+            if ctx.generation.load(Ordering::SeqCst) != generation {
+                break;
+            }
+            if ctx
+                .ws
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|ws| ws.is_closed())
+            {
+                *ctx.state.write().await = AppState::Disconnected;
+                let _ = handle.emit("connection-state-changed", AppState::Disconnected);
+                let _ = handle.emit(
+                    "sync-error",
+                    "Connection stopped; reconnect to resume from history",
+                );
+                break;
+            }
             match event {
                 WsEvent::Connected => {
                     let ctx: tauri::State<'_, AppContext> = handle.state::<AppContext>();
+                    if let Err(error) = refresh_keys(&ctx).await {
+                        if let Some(ws) = ctx.ws.lock().await.as_ref() {
+                            ws.close();
+                        }
+                        let _ = handle.emit("sync-error", error);
+                        continue;
+                    }
+                    if ctx.generation.load(Ordering::SeqCst) != generation {
+                        break;
+                    }
                     *ctx.state.write().await = AppState::Connected;
                     let _ = handle.emit("connection-state-changed", AppState::Connected);
 
@@ -501,11 +670,31 @@ pub async fn connect(
                             *ctx.devices.write().await = devices;
                         }
                     };
+                    let mut previous = ctx.history_sync.lock().await;
+                    if let Some(task) = previous.take() {
+                        task.abort();
+                        let _ = task.await;
+                    }
+                    if ctx.generation.load(Ordering::SeqCst) == generation {
+                        let history_handle = handle.clone();
+                        *previous = Some(tokio::spawn(async move {
+                            if let Err(error) = sync_history(history_handle.state()).await {
+                                error!("History catch-up failed: {error}");
+                                let _ = history_handle.emit("sync-error", error);
+                            } else {
+                                let _ = history_handle.emit("history-synced", ());
+                            }
+                        }));
+                    }
                 }
                 WsEvent::Disconnected => {
                     let ctx: tauri::State<'_, AppContext> = handle.state::<AppContext>();
                     let current = ctx.state.read().await.clone();
-                    if current != AppState::Disconnected {
+                    let closed = ctx.ws.lock().await.as_ref().is_none_or(|ws| ws.is_closed());
+                    if closed {
+                        *ctx.state.write().await = AppState::Disconnected;
+                        let _ = handle.emit("connection-state-changed", AppState::Disconnected);
+                    } else if current != AppState::Disconnected {
                         *ctx.state.write().await = AppState::Connecting;
                         let _ = handle.emit("connection-state-changed", AppState::Connecting);
                     }
@@ -624,22 +813,7 @@ pub async fn connect(
                                 let config = ctx.config.read().await;
                                 if config.notifications_enabled {
                                     let title = format!("Clipboard from {}", plain.device_name);
-                                    let body = match plain.content_type {
-                                        ContentType::Text => {
-                                            let text = String::from_utf8_lossy(&plain.data);
-                                            if text.len() > 80 {
-                                                format!("{}...", &text[..80])
-                                            } else {
-                                                text.to_string()
-                                            }
-                                        }
-                                        ContentType::Image => "Image copied".into(),
-                                        ContentType::File => plain
-                                            .metadata
-                                            .filename
-                                            .clone()
-                                            .unwrap_or_else(|| "File received".into()),
-                                    };
+                                    let body = notification_body(&plain);
                                     use tauri_plugin_notification::NotificationExt;
                                     let _ = handle
                                         .notification()
@@ -664,71 +838,13 @@ pub async fn connect(
                     }
                     let _ = handle.emit("device-status-changed", &payload);
                 }
-                WsEvent::GroupKeyUpdated => {
-                    info!("Group key updated, re-fetching...");
-                    let ctx: tauri::State<'_, AppContext> = handle.state::<AppContext>();
-                    let api = ctx.api.lock().await;
-                    match api.get_group_key().await {
-                        Ok(Some(gk_resp)) => {
-                            let key_path = AppConfig::key_path(&ctx.config_dir);
-                            if let Ok(kp) = KeyPair::load_or_generate(&key_path) {
-                                let peer_pub = KeyPair::parse_public_key(&gk_resp.from_public_key);
-                                if let Ok(peer_pub) = peer_pub {
-                                    // Verify signature
-                                    if let Some(sig) = &gk_resp.from_public_key_sig
-                                        && let Err(e) =
-                                            KeyPair::verify_public_key_signature(&peer_pub, sig)
-                                    {
-                                        error!("SECURITY: Group key sender signature invalid: {e}");
-                                        continue;
-                                    }
-                                    // TOFU check
-                                    if let Ok(mut verifier) =
-                                        crate::crypto::verify::KeyVerifier::new(&ctx.config_dir)
-                                        && let Err(e) = verifier
-                                            .migrate_legacy(&gk_resp.from_device_id, &peer_pub)
-                                    {
-                                        error!(
-                                            "SECURITY: Group key sender key verification failed: {e}"
-                                        );
-                                        continue;
-                                    }
-
-                                    let mut new_exchange = KeyExchange::new(kp);
-                                    let version = gk_resp.version;
-                                    if new_exchange
-                                        .decrypt_from_device(
-                                            &gk_resp.encrypted_key,
-                                            &peer_pub,
-                                            version,
-                                        )
-                                        .is_ok()
-                                    {
-                                        // Preserve old key versions from existing exchange
-                                        if let Some(old_exch) = ctx.exchange.lock().await.as_ref() {
-                                            for (&v, k) in &old_exch.keys_by_version {
-                                                if v != version {
-                                                    new_exchange.add_key_version(v, k.clone());
-                                                }
-                                            }
-                                        }
-                                        *ctx.exchange.lock().await = Some(new_exchange);
-                                        info!(
-                                            "Group key refreshed successfully from device {} (v{})",
-                                            gk_resp.from_device_id, version
-                                        );
-                                    } else {
-                                        error!("Failed to decrypt new group key");
-                                    }
-                                }
-                            }
+                WsEvent::GroupKeyUpdated | WsEvent::RotationNeeded => {
+                    if let Err(error) = refresh_keys(&ctx).await {
+                        if let Some(ws) = ctx.ws.lock().await.as_ref() {
+                            ws.close();
                         }
-                        Ok(None) => {
-                            info!("No group key available after update notification");
-                        }
-                        Err(e) => {
-                            error!("Failed to re-fetch group key: {e}");
-                        }
+                        error!("Key synchronization failed: {error}");
+                        let _ = handle.emit("sync-error", error);
                     }
                 }
                 WsEvent::SessionExpired => {
@@ -748,34 +864,106 @@ pub async fn connect(
                 }
                 WsEvent::Error(msg) => {
                     error!("WS error: {msg}");
+                    let _ = handle.emit("sync-error", msg);
                 }
             }
         }
     });
 
     // Clipboard monitor — polls local clipboard and sends changes to server
-    #[cfg(desktop)]
-    {
+    let monitor_task = {
         let monitor_handle = app_handle.clone();
         let monitor_ws = ws_conn.clone();
         tokio::spawn(async move {
+            #[cfg(desktop)]
             clipboard_monitor(monitor_handle, monitor_ws).await;
-        });
-    }
-
-    #[cfg(not(desktop))]
-    {
-        let monitor_handle = app_handle.clone();
-        let monitor_ws = ws_conn.clone();
-        tokio::spawn(async move {
+            #[cfg(not(desktop))]
             mobile_clipboard_monitor(monitor_handle, monitor_ws).await;
-        });
-    }
+        })
+    };
+    *ctx.tasks.lock().await = vec![connection_task, event_task, monitor_task];
 
     Ok(())
 }
 
 // === Image clipboard helpers (desktop only) ===
+
+async fn prepare_connection(ctx: &AppContext, config: &AppConfig) -> Result<(), String> {
+    crate::key_sync::bind_account(&ctx.config_dir, &config.server_url, &config.user_id, config)?;
+    let path = AppConfig::key_path(&ctx.config_dir);
+    if !path.exists() {
+        return Err("Device key is missing; restore it or pair a replacement device".into());
+    }
+    let pair = KeyPair::load_or_generate(&path).map_err(|e| e.to_string())?;
+    {
+        let mut api = ctx.api.lock().await;
+        api.connection_token(false).await.ok_or(SESSION_EXPIRED)?;
+        if !api.is_device_bound(&config.device_id) {
+            let registration = api
+                .register_device(
+                    &config.device_name,
+                    &pair,
+                    crate::fingerprint::generate_device_fingerprint(&config.user_id).ok(),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            if registration.device.id != config.device_id {
+                return Err(
+                    "Device registration changed; sign out and pair this device again".into(),
+                );
+            }
+        }
+    }
+    if ctx.exchange.lock().await.is_none() {
+        *ctx.exchange.lock().await = Some(crate::key_sync::restore(pair, &ctx.config_dir)?);
+    }
+    refresh_keys(ctx).await?;
+    let mut config = ctx.config.write().await;
+    config.device_status = "approved".into();
+    config.save(&ctx.config_dir).map_err(|e| e.to_string())
+}
+
+async fn refresh_keys(ctx: &AppContext) -> Result<(), String> {
+    let _operation = ctx.key_operations.lock().await;
+    let own_id = ctx.config.read().await.device_id.clone();
+    let api = ctx.api.lock().await;
+    let mut exchange = ctx.exchange.lock().await;
+    if exchange.is_none() {
+        let path = AppConfig::key_path(&ctx.config_dir);
+        if !path.exists() {
+            return Err("Device key is missing".into());
+        }
+        let pair = KeyPair::load_or_generate(&path).map_err(|e| e.to_string())?;
+        *exchange = Some(crate::key_sync::restore(pair, &ctx.config_dir)?);
+    }
+    let exchange = exchange.as_mut().expect("keyring restored");
+    let due = crate::key_sync::synchronize(exchange, &api, &own_id, &ctx.config_dir).await?;
+    if due {
+        crate::key_sync::rotate(exchange, &api, &own_id, &ctx.config_dir).await?;
+    }
+    ctx.rotation_pending.store(false, Ordering::SeqCst);
+    Ok(())
+}
+
+async fn stop_connection_tasks(ctx: &AppContext) {
+    if let Some(ws) = ctx.ws.lock().await.take() {
+        ws.close();
+    }
+    if let Some(task) = ctx.history_sync.lock().await.take() {
+        task.abort();
+        let _ = task.await;
+    }
+    let tasks = std::mem::take(&mut *ctx.tasks.lock().await);
+    for mut task in tasks {
+        if tokio::time::timeout(Duration::from_secs(2), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
 
 #[cfg(desktop)]
 enum ClipboardContent {
@@ -784,8 +972,95 @@ enum ClipboardContent {
         rgba: Vec<u8>,
         width: usize,
         height: usize,
+        fingerprint: [u8; 32],
     },
+    UnchangedImage,
     Empty,
+}
+
+#[cfg(desktop)]
+static CLIPBOARD_WORKER: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
+
+#[cfg(desktop)]
+struct EncodedImage {
+    fingerprint: [u8; 32],
+    data: Vec<u8>,
+    metadata: Metadata,
+    hash: [u8; 32],
+}
+
+#[cfg(desktop)]
+fn image_fingerprint(rgba: &[u8], width: usize, height: usize) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update((width as u64).to_be_bytes());
+    hash.update((height as u64).to_be_bytes());
+    hash.update(rgba);
+    hash.finalize().into()
+}
+
+struct PendingPush {
+    hash: [u8; 32],
+    payload: ClipboardPushPayload,
+}
+
+async fn send_local_clipboard(
+    ctx: &AppContext,
+    ws: &WsConnection,
+    content_type: &ContentType,
+    data: &[u8],
+    metadata: &Metadata,
+) -> Result<crate::ws::connection::ClipboardReceipt, String> {
+    if ctx.rotation_pending.load(Ordering::SeqCst) {
+        return Err("Revocation is pending; clipboard encryption is paused".into());
+    }
+    if data.len() > content_size_limit(content_type) {
+        return Err("Clipboard exceeds the content size limit".into());
+    }
+    let hash = Sha256::digest(data).into();
+    let mut pending = ctx.pending_push.lock().await;
+    if pending.as_ref().is_none_or(|p| p.hash != hash) {
+        let guard = ctx.exchange.lock().await;
+        let exchange = guard.as_ref().ok_or("Encryption not initialized")?;
+        let (encrypted_data, key_version) =
+            exchange.encrypt_payload(data).map_err(|e| e.to_string())?;
+        let metadata = serde_json::to_vec(metadata).map_err(|e| e.to_string())?;
+        let (metadata, _) = exchange
+            .encrypt_payload(&metadata)
+            .map_err(|e| e.to_string())?;
+        *pending = Some(PendingPush {
+            hash,
+            payload: ClipboardPushPayload {
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
+                content_type: content_type.clone(),
+                encrypted_data,
+                metadata: Some(base64::engine::general_purpose::STANDARD.encode(metadata)),
+                key_version,
+            },
+        });
+    }
+    let result = ws
+        .send_clipboard(
+            pending
+                .as_ref()
+                .expect("pending clipboard prepared")
+                .payload
+                .clone(),
+        )
+        .await;
+    if result.is_ok() {
+        *pending = None;
+    } else if result
+        .as_ref()
+        .err()
+        .is_some_and(|e| e.starts_with("rotation_required:"))
+    {
+        // A correlated rejection is definitive. Unknown outcomes retain the exact
+        // ciphertext and request ID so retries cannot duplicate a committed entry.
+        *pending = None;
+        refresh_keys(ctx).await?;
+    }
+    result
 }
 
 /// Encode raw RGBA bytes to PNG.
@@ -830,10 +1105,14 @@ async fn clipboard_monitor(handle: tauri::AppHandle, ws: Arc<WsConnection>) {
     use std::time::Duration;
 
     let mut last_hash: [u8; 32] = [0u8; 32];
+    let mut encoded_image: Option<EncodedImage> = None;
     let mut interval = tokio::time::interval(Duration::from_millis(250));
 
     loop {
         interval.tick().await;
+        if ws.is_closed() {
+            break;
+        }
 
         let ctx: tauri::State<'_, AppContext> = handle.state::<AppContext>();
 
@@ -849,12 +1128,20 @@ async fn clipboard_monitor(handle: tauri::AppHandle, ws: Arc<WsConnection>) {
         }
 
         // Skip if we just wrote an incoming entry to clipboard
-        if ctx.skip_clipboard.load(Ordering::SeqCst) {
+        if ctx.skip_clipboard.load(Ordering::SeqCst) || ctx.rotation_pending.load(Ordering::SeqCst)
+        {
             continue;
         }
 
         // Read current clipboard content (blocking — run in spawn_blocking)
-        let clip_content = tokio::task::spawn_blocking(|| {
+        let previous_image = encoded_image.as_ref().map(|image| image.fingerprint);
+        let permit = CLIPBOARD_WORKER
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("clipboard worker stays open");
+        let read = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let mut c = match arboard::Clipboard::new() {
                 Ok(c) => c,
                 Err(_) => return ClipboardContent::Empty,
@@ -867,18 +1154,32 @@ async fn clipboard_monitor(handle: tauri::AppHandle, ws: Arc<WsConnection>) {
             }
             // Try image
             if let Ok(img) = c.get_image() {
+                let fingerprint = image_fingerprint(&img.bytes, img.width, img.height);
+                if previous_image == Some(fingerprint) {
+                    return ClipboardContent::UnchangedImage;
+                }
                 return ClipboardContent::Image {
                     rgba: img.bytes.into_owned(),
                     width: img.width,
                     height: img.height,
+                    fingerprint,
                 };
             }
             ClipboardContent::Empty
         })
-        .await
-        .unwrap_or(ClipboardContent::Empty);
+        .await;
+        let clip_content = match read {
+            Ok(content) => content,
+            Err(error) => {
+                error!("Clipboard worker failed: {error}");
+                continue;
+            }
+        };
+        if ws.is_closed() {
+            break;
+        }
 
-        let (content_type, data, meta) = match clip_content {
+        let (content_type, data, meta, hash) = match clip_content {
             ClipboardContent::Text(text) => {
                 let bytes = text.as_bytes().to_vec();
                 let meta = Metadata {
@@ -886,17 +1187,33 @@ async fn clipboard_monitor(handle: tauri::AppHandle, ws: Arc<WsConnection>) {
                     mime_type: Some("text/plain".into()),
                     ..Default::default()
                 };
-                (ContentType::Text, bytes, meta)
+                let hash = Sha256::digest(&bytes).into();
+                (ContentType::Text, bytes, meta, hash)
             }
             ClipboardContent::Image {
                 rgba,
                 width,
                 height,
+                fingerprint,
             } => {
-                // Encode RGBA to PNG
-                let png_bytes = match encode_rgba_to_png(&rgba, width as u32, height as u32) {
-                    Some(b) => b,
-                    None => continue,
+                let permit = CLIPBOARD_WORKER
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("clipboard worker stays open");
+                let encoded = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    let bytes = encode_rgba_to_png(&rgba, width as u32, height as u32)?;
+                    let hash: [u8; 32] = Sha256::digest(&bytes).into();
+                    Some((bytes, hash))
+                })
+                .await;
+                let (png_bytes, hash) = match encoded {
+                    Ok(Some(result)) => result,
+                    other => {
+                        error!("Clipboard image encoding failed: {:?}", other.err());
+                        continue;
+                    }
                 };
                 let meta = Metadata {
                     size: png_bytes.len() as i64,
@@ -905,13 +1222,31 @@ async fn clipboard_monitor(handle: tauri::AppHandle, ws: Arc<WsConnection>) {
                     height: Some(height as i32),
                     ..Default::default()
                 };
-                (ContentType::Image, png_bytes, meta)
+                encoded_image = Some(EncodedImage {
+                    fingerprint,
+                    data: png_bytes.clone(),
+                    metadata: meta.clone(),
+                    hash,
+                });
+                (ContentType::Image, png_bytes, meta, hash)
+            }
+            ClipboardContent::UnchangedImage => {
+                let image = encoded_image
+                    .as_ref()
+                    .expect("unchanged image has cached encoding");
+                if image.hash == last_hash {
+                    continue;
+                }
+                (
+                    ContentType::Image,
+                    image.data.clone(),
+                    image.metadata.clone(),
+                    image.hash,
+                )
             }
             ClipboardContent::Empty => continue,
         };
 
-        // Hash to detect changes
-        let hash: [u8; 32] = Sha256::digest(&data).into();
         if hash == last_hash {
             continue;
         }
@@ -920,59 +1255,28 @@ async fn clipboard_monitor(handle: tauri::AppHandle, ws: Arc<WsConnection>) {
             last_hash = hash;
             continue;
         }
-        last_hash = hash;
-
-        // Encrypt and send
-        let exchange_guard = ctx.exchange.lock().await;
-        let exchange = match exchange_guard.as_ref() {
-            Some(e) => e,
-            None => continue,
-        };
-
-        let (encrypted, key_version) = match exchange.encrypt_payload(&data) {
-            Ok(result) => result,
+        let receipt = match send_local_clipboard(&ctx, &ws, &content_type, &data, &meta).await {
+            Ok(receipt) => receipt,
             Err(e) => {
-                error!("Clipboard encrypt failed: {e}");
+                error!("Clipboard persistence failed: {e}");
+                let _ = handle.emit("sync-error", e);
                 continue;
             }
         };
-
-        let meta_json = serde_json::to_vec(&meta).unwrap_or_default();
-        let enc_meta_bytes = exchange
-            .encrypt_payload(&meta_json)
-            .map(|(d, _)| d)
-            .unwrap_or_default();
-
-        // Must drop exchange lock before other operations
-        drop(exchange_guard);
-
-        // Metadata is sent as base64 since the field is a String
-        let enc_meta_b64 = base64::engine::general_purpose::STANDARD.encode(&enc_meta_bytes);
-
-        let payload = ClipboardPushPayload {
-            content_type: content_type.clone(),
-            encrypted_data: encrypted,
-            metadata: Some(enc_meta_b64),
-            key_version,
-        };
-
-        if let Err(e) = ws.send_clipboard(payload) {
-            error!("Failed to send clipboard: {e}");
-            continue;
-        }
+        last_hash = hash;
 
         debug!("Sent clipboard {:?} ({} bytes)", content_type, data.len());
 
         // Also store in local history
         let config = ctx.config.read().await;
         let plain = PlainEntry {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: receipt.id,
             device_id: config.device_id.clone(),
             device_name: config.device_name.clone(),
             content_type,
             data,
             metadata: meta,
-            created_at: chrono::Utc::now(),
+            created_at: receipt.created_at,
         };
         drop(config);
 
@@ -998,6 +1302,9 @@ async fn mobile_clipboard_monitor(handle: tauri::AppHandle, ws: Arc<WsConnection
 
     loop {
         interval.tick().await;
+        if ws.is_closed() {
+            break;
+        }
 
         let ctx: tauri::State<'_, AppContext> = handle.state::<AppContext>();
 
@@ -1010,7 +1317,8 @@ async fn mobile_clipboard_monitor(handle: tauri::AppHandle, ws: Arc<WsConnection
             continue;
         }
 
-        if ctx.skip_clipboard.load(Ordering::SeqCst) {
+        if ctx.skip_clipboard.load(Ordering::SeqCst) || ctx.rotation_pending.load(Ordering::SeqCst)
+        {
             continue;
         }
 
@@ -1033,61 +1341,34 @@ async fn mobile_clipboard_monitor(handle: tauri::AppHandle, ws: Arc<WsConnection
             last_hash = hash;
             continue;
         }
-        last_hash = hash;
-
-        // Encrypt and send
-        let exchange_guard = ctx.exchange.lock().await;
-        let exchange = match exchange_guard.as_ref() {
-            Some(e) => e,
-            None => continue,
-        };
-
-        let (encrypted, key_version) = match exchange.encrypt_payload(&data) {
-            Ok(result) => result,
-            Err(e) => {
-                error!("Mobile clipboard encrypt failed: {e}");
-                continue;
-            }
-        };
-
         let meta = Metadata {
             size: data.len() as i64,
             mime_type: Some("text/plain".into()),
             ..Default::default()
         };
-        let meta_json = serde_json::to_vec(&meta).unwrap_or_default();
-        let enc_meta_bytes = exchange
-            .encrypt_payload(&meta_json)
-            .map(|(d, _)| d)
-            .unwrap_or_default();
-        drop(exchange_guard);
-
-        let enc_meta_b64 = base64::engine::general_purpose::STANDARD.encode(&enc_meta_bytes);
-
-        let payload = ClipboardPushPayload {
-            content_type: ContentType::Text,
-            encrypted_data: encrypted,
-            metadata: Some(enc_meta_b64),
-            key_version,
+        let receipt = match send_local_clipboard(&ctx, &ws, &ContentType::Text, &data, &meta).await
+        {
+            Ok(receipt) => receipt,
+            Err(e) => {
+                error!("Clipboard persistence failed: {e}");
+                let _ = handle.emit("sync-error", e);
+                continue;
+            }
         };
-
-        if let Err(e) = ws.send_clipboard(payload) {
-            error!("Failed to send mobile clipboard: {e}");
-            continue;
-        }
+        last_hash = hash;
 
         debug!("Sent mobile clipboard text ({} bytes)", data.len());
 
         // Store in local history
         let config = ctx.config.read().await;
         let plain = PlainEntry {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: receipt.id,
             device_id: config.device_id.clone(),
             device_name: config.device_name.clone(),
             content_type: ContentType::Text,
             data,
             metadata: meta,
-            created_at: chrono::Utc::now(),
+            created_at: receipt.created_at,
         };
         drop(config);
 
@@ -1105,9 +1386,10 @@ pub async fn disconnect(
     app_handle: tauri::AppHandle,
     ctx: State<'_, AppContext>,
 ) -> Result<(), String> {
-    if let Some(ws) = ctx.ws.lock().await.take() {
-        ws.close();
-    }
+    ctx.connect_cancel.lock().await.cancel();
+    ctx.generation.fetch_add(1, Ordering::SeqCst);
+    let _lifecycle = ctx.lifecycle.lock().await;
+    stop_connection_tasks(&ctx).await;
     *ctx.state.write().await = AppState::Disconnected;
     let _ = app_handle.emit("connection-state-changed", AppState::Disconnected);
     Ok(())
@@ -1123,11 +1405,25 @@ pub async fn get_devices(ctx: State<'_, AppContext>) -> Result<Vec<DeviceInfo>, 
 
 #[tauri::command]
 pub async fn remove_device(ctx: State<'_, AppContext>, device_id: String) -> Result<(), String> {
-    let api = ctx.api.lock().await;
-    api.delete_device(&device_id)
-        .await
-        .map_err(|e| e.to_string())?;
+    uuid::Uuid::parse_str(&device_id).map_err(|_| "Invalid device ID")?;
+    let deleted = {
+        let _operation = ctx.key_operations.lock().await;
+        ctx.rotation_pending.store(true, Ordering::SeqCst);
+        let mut verifier =
+            crate::crypto::verify::KeyVerifier::new(&ctx.config_dir).map_err(|e| e.to_string())?;
+        verifier.remove_pin(&device_id).map_err(|e| e.to_string())?;
+        ctx.api.lock().await.delete_device(&device_id).await
+    };
+    if let Err(error) = deleted {
+        if let Some(ws) = ctx.ws.lock().await.as_ref() {
+            ws.close();
+        }
+        return Err(format!("Removal not confirmed; syncing is paused: {error}"));
+    }
     ctx.devices.write().await.retain(|d| d.id != device_id);
+    if device_id != ctx.config.read().await.device_id {
+        refresh_keys(&ctx).await?;
+    }
     Ok(())
 }
 
@@ -1152,6 +1448,7 @@ pub struct MyApprovalStatusInfo {
     pub status: String,
     pub approval_code: Option<String>,
     pub session_id: Option<String>,
+    pub locally_verified: bool,
 }
 
 #[tauri::command]
@@ -1184,8 +1481,13 @@ pub async fn begin_device_approval(
             .await
             .map_err(|e| e.to_string())?
     };
+    if session.pairing_version != 2 || session.pending_device_id != pending_device_id {
+        return Err(
+            "Update both clients and the server before using full-fingerprint pairing".into(),
+        );
+    }
 
-    // Derive 8-digit verification code from ECDH between our key and the pending device's key
+    // Cache exactly the identity displayed to the user, not a later relay lookup.
     let key_path = AppConfig::key_path(&ctx.config_dir);
     let kp =
         KeyPair::load_or_generate(&key_path).map_err(|e| format!("Failed to load key: {e}"))?;
@@ -1195,6 +1497,18 @@ pub async fn begin_device_approval(
 
     let code = derive_approval_code(&kp.private, &pending_pub, &kp.public)
         .map_err(|e| format!("Failed to derive approval code: {e}"))?;
+    ctx.pairing.lock().await.insert(
+        session.session_id.clone(),
+        PairingCandidate {
+            peer: DeviceIdentity {
+                id: pending_device_id,
+                public_key: session.pending_public_key,
+            },
+            fingerprint: code.clone(),
+            started: Instant::now(),
+            incoming: false,
+        },
+    );
 
     Ok(ApprovalSessionInfo {
         session_id: session.session_id,
@@ -1208,82 +1522,53 @@ pub async fn confirm_device_approval(
     ctx: State<'_, AppContext>,
     pending_device_id: String,
     session_id: String,
+    fingerprint: String,
 ) -> Result<(), String> {
-    // Fetch device info with API lock, then release it
-    let (all_devices, pending_devices) = {
-        let api = ctx.api.lock().await;
-        let all = api.get_device_keys().await.map_err(|e| e.to_string())?;
-        let pending = api.get_pending_devices().await.map_err(|e| e.to_string())?;
-        (all, pending)
-    };
-
-    let pending_dev = pending_devices
-        .iter()
-        .find(|d| d.id == pending_device_id)
-        .ok_or("Pending device not found")?;
-
-    // Build list of all device public keys: approved devices + the pending device
-    let mut peer_devices: Vec<(String, p256::PublicKey)> = Vec::new();
-
-    for dev in &all_devices.devices {
-        if dev.status != DeviceStatus::Approved {
-            continue;
-        }
-        if let Some(pk_bytes) = &dev.public_key
-            && let Ok(pub_key) = KeyPair::parse_public_key(pk_bytes)
-        {
-            peer_devices.push((dev.id.clone(), pub_key));
-        }
-    }
-
-    // Add the pending device
-    let pending_pub = KeyPair::parse_public_key(&pending_dev.public_key)
-        .map_err(|e| format!("Invalid pending device key: {e}"))?;
-    peer_devices.push((pending_device_id.clone(), pending_pub));
-
-    // Generate next group key version (exchange lock only)
-    let req = {
-        let mut exchange_guard = ctx.exchange.lock().await;
-        let exchange = exchange_guard
-            .as_mut()
-            .ok_or("Encryption not initialized")?;
-
-        let (new_version, wrapped) = exchange
-            .generate_next_version(&peer_devices)
-            .map_err(|e| format!("Key rotation failed: {e}"))?;
-
-        let wrapped_keys: Vec<StoreGroupKeyEntry> = wrapped
-            .into_iter()
-            .map(|(device_id, encrypted_key)| StoreGroupKeyEntry {
-                device_id,
-                encrypted_key,
-            })
-            .collect();
-
-        // Save keyring while we have the lock
-        let keyring_path = AppConfig::keyring_path(&ctx.config_dir);
-        let _ = exchange.save_keyring(&keyring_path);
-
-        ApproveDeviceRequest {
-            session_id,
-            expected_current_version: new_version - 1,
-            new_version,
-            wrapped_keys,
-        }
-    };
-
-    // Send approval with API lock (exchange is released)
+    let candidate = ctx
+        .pairing
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned()
+        .ok_or("Start pairing again")?;
+    if candidate.incoming
+        || candidate.peer.id != pending_device_id
+        || candidate.fingerprint != normalize_fingerprint(&fingerprint)
+        || candidate.started.elapsed() > MFA_TICKET_TTL
     {
-        let api = ctx.api.lock().await;
-        api.approve_device(&pending_device_id, &req)
-            .await
-            .map_err(|e| e.to_string())?;
+        return Err("Pairing fingerprint or session changed; start again".into());
     }
-
-    info!(
-        "Device {} approved, group key rotated to v{}",
-        pending_device_id, req.new_version
-    );
+    let _operation = ctx.key_operations.lock().await;
+    let own_id = ctx.config.read().await.device_id.clone();
+    let api = ctx.api.lock().await;
+    let mut guard = ctx.exchange.lock().await;
+    let exchange = guard.as_mut().ok_or("Encryption not initialized")?;
+    crate::key_sync::synchronize(exchange, &api, &own_id, &ctx.config_dir).await?;
+    let mut members =
+        crate::key_sync::trusted_members(exchange, &api, &own_id, &ctx.config_dir).await?;
+    members.push(candidate.peer);
+    let (new_version, wrapped_keys) =
+        crate::crypto::membership::stage_rotation(exchange, &own_id, &members)?;
+    let result = api
+        .approve_device(
+            &pending_device_id,
+            &ApproveDeviceRequest {
+                session_id: session_id.clone(),
+                expected_current_version: exchange.current_version,
+                new_version,
+                wrapped_keys,
+            },
+        )
+        .await;
+    // Recover the accepted self-wrap even when the approval response was lost.
+    crate::key_sync::synchronize(exchange, &api, &own_id, &ctx.config_dir).await?;
+    let verifier =
+        crate::crypto::verify::KeyVerifier::new(&ctx.config_dir).map_err(|e| e.to_string())?;
+    if exchange.current_version < new_version || !verifier.is_pinned(&pending_device_id) {
+        result.map_err(|e| e.to_string())?;
+        return Err("Approval was not confirmed; keys were not activated".into());
+    }
+    ctx.pairing.lock().await.remove(&session_id);
     Ok(())
 }
 
@@ -1313,25 +1598,153 @@ pub async fn get_my_approval_status(
             .map_err(|e| e.to_string())?
     };
 
-    // If there's an active approval session, derive the verification code
-    let approval_code = if let (Some(_session_id), Some(approver_pub_bytes)) =
-        (&resp.session_id, &resp.approver_public_key)
-    {
-        let key_path = AppConfig::key_path(&ctx.config_dir);
-        let kp =
-            KeyPair::load_or_generate(&key_path).map_err(|e| format!("Failed to load key: {e}"))?;
-        let approver_pub = KeyPair::parse_public_key(approver_pub_bytes)
-            .map_err(|e| format!("Invalid approver public key: {e}"))?;
-        derive_approval_code(&kp.private, &approver_pub, &kp.public).ok()
+    if let (Some(session_id), Some(approver_pub_bytes), Some(approver_id)) = (
+        &resp.session_id,
+        &resp.approver_public_key,
+        &resp.approver_device_id,
+    ) {
+        if resp.pairing_version != 2 {
+            return Err("Update the approving client and server".into());
+        }
+        let kp = KeyPair::load_or_generate(&AppConfig::key_path(&ctx.config_dir))
+            .map_err(|e| e.to_string())?;
+        let peer = KeyPair::parse_public_key(approver_pub_bytes).map_err(|e| e.to_string())?;
+        let fingerprint =
+            derive_approval_code(&kp.private, &peer, &kp.public).map_err(|e| e.to_string())?;
+        let mut candidates = ctx.pairing.lock().await;
+        if candidates.get(session_id).is_some_and(|old| {
+            old.peer.public_key != *approver_pub_bytes || old.peer.id != *approver_id
+        }) {
+            return Err("Pairing identity changed; do not approve this session".into());
+        }
+        candidates
+            .entry(session_id.clone())
+            .or_insert(PairingCandidate {
+                peer: DeviceIdentity {
+                    id: approver_id.clone(),
+                    public_key: approver_pub_bytes.clone(),
+                },
+                fingerprint,
+                started: Instant::now(),
+                incoming: true,
+            });
+    }
+    let candidates = ctx.pairing.lock().await;
+    let candidate = resp
+        .session_id
+        .as_ref()
+        .and_then(|id| candidates.get_key_value(id))
+        .or_else(|| {
+            candidates
+                .iter()
+                .filter(|(_, c)| c.incoming)
+                .max_by_key(|(_, c)| c.started)
+        });
+    let own_id = ctx.config.read().await.device_id.clone();
+    let verifier =
+        crate::crypto::verify::KeyVerifier::new(&ctx.config_dir).map_err(|e| e.to_string())?;
+    let locally_verified = if let Some((_, candidate)) = candidate {
+        let key =
+            KeyPair::parse_public_key(&candidate.peer.public_key).map_err(|e| e.to_string())?;
+        verifier.verify_pinned(&candidate.peer.id, &key).is_ok()
     } else {
-        None
+        verifier.has_peer(&own_id)
     };
-
+    let approval_code = candidate.map(|(_, c)| c.fingerprint.clone());
+    let session_id = candidate.map(|(id, _)| id.clone());
     Ok(MyApprovalStatusInfo {
         status: resp.status.to_string(),
         approval_code,
-        session_id: resp.session_id,
+        session_id,
+        locally_verified,
     })
+}
+
+fn normalize_fingerprint(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace() && *c != ':' && *c != '-')
+        .flat_map(char::to_uppercase)
+        .collect()
+}
+
+#[tauri::command]
+pub async fn confirm_pairing(
+    ctx: State<'_, AppContext>,
+    session_id: String,
+    fingerprint: String,
+) -> Result<(), String> {
+    let _operation = ctx.key_operations.lock().await;
+    let candidates = ctx.pairing.lock().await;
+    let candidate = candidates
+        .get(&session_id)
+        .ok_or("Pairing session is missing; start again")?;
+    if !candidate.incoming
+        || candidate.fingerprint != normalize_fingerprint(&fingerprint)
+        || candidate.started.elapsed() > MFA_TICKET_TTL
+    {
+        return Err("Pairing fingerprint or session expired; start again".into());
+    }
+    let key = KeyPair::parse_public_key(&candidate.peer.public_key).map_err(|e| e.to_string())?;
+    let mut verifier =
+        crate::crypto::verify::KeyVerifier::new(&ctx.config_dir).map_err(|e| e.to_string())?;
+    verifier
+        .pin_after_approval(&candidate.peer.id, &key)
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+pub struct OwnIdentity {
+    device_id: String,
+    fingerprint: String,
+}
+
+#[tauri::command]
+pub async fn get_own_identity(ctx: State<'_, AppContext>) -> Result<OwnIdentity, String> {
+    let pair = KeyPair::load_or_generate(&AppConfig::key_path(&ctx.config_dir))
+        .map_err(|e| e.to_string())?;
+    Ok(OwnIdentity {
+        device_id: ctx.config.read().await.device_id.clone(),
+        fingerprint: KeyPair::fingerprint(&pair.public),
+    })
+}
+
+/// Explicit recovery/migration only: the expected FULL fingerprint must come from
+/// the other device itself, not a value copied from the relay's device listing.
+#[tauri::command]
+pub async fn verify_device_identity(
+    ctx: State<'_, AppContext>,
+    device_id: String,
+    fingerprint: String,
+) -> Result<(), String> {
+    let generation = ctx.generation.load(Ordering::SeqCst);
+    let devices = ctx
+        .api
+        .lock()
+        .await
+        .get_device_keys()
+        .await
+        .map_err(|e| e.to_string())?;
+    let peer = devices
+        .devices
+        .iter()
+        .find(|d| d.id == device_id && d.status == DeviceStatus::Approved)
+        .ok_or("Approved device not found")?;
+    let key = KeyPair::parse_public_key(peer.public_key.as_deref().ok_or("Device key missing")?)
+        .map_err(|e| e.to_string())?;
+    let expected = normalize_fingerprint(&fingerprint);
+    if expected.len() != 64 || expected != normalize_fingerprint(&KeyPair::fingerprint(&key)) {
+        return Err("Full fingerprint does not match. Do not trust this device.".into());
+    }
+    let _operation = ctx.key_operations.lock().await;
+    if generation != ctx.generation.load(Ordering::SeqCst) {
+        return Err("Session changed; verify again".into());
+    }
+    let mut verifier =
+        crate::crypto::verify::KeyVerifier::new(&ctx.config_dir).map_err(|e| e.to_string())?;
+    verifier
+        .pin_after_approval(&device_id, &key)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1515,19 +1928,19 @@ pub async fn sync_history(ctx: State<'_, AppContext>) -> Result<usize, String> {
         // Store entries — hold history lock only for insertion
         {
             let history = ctx.history.lock().await;
-            if let Some(h) = history.as_ref() {
-                for plain in &plain_entries {
-                    if h.add(plain).is_ok() {
-                        total_synced += 1;
-                    }
-                }
+            let history = history.as_ref().ok_or("History not initialized")?;
+            for plain in &plain_entries {
+                history
+                    .add(plain)
+                    .map_err(|e| format!("Failed to store synchronized history: {e}"))?;
+                total_synced += 1;
             }
         }
 
         if !resp.has_more || resp.entries.is_empty() {
             break;
         }
-        offset += PAGE_SIZE;
+        offset += resp.entries.len() as u32;
     }
 
     info!("Synced {total_synced} entries from server");
@@ -1587,14 +2000,18 @@ pub async fn update_config(
 
 #[tauri::command]
 pub async fn change_password(
+    app_handle: tauri::AppHandle,
     ctx: State<'_, AppContext>,
     current_password: String,
     new_password: String,
 ) -> Result<(), String> {
-    let api = ctx.api.lock().await;
-    api.change_password(&current_password, &new_password)
-        .await
-        .map_err(|e| e.to_string())
+    {
+        let api = ctx.api.lock().await;
+        api.change_password(&current_password, &new_password)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    logout(app_handle, ctx).await
 }
 
 #[tauri::command]
@@ -1602,17 +2019,31 @@ pub async fn logout(
     app_handle: tauri::AppHandle,
     ctx: State<'_, AppContext>,
 ) -> Result<(), String> {
-    // Disconnect WebSocket if connected
-    if let Some(ws) = ctx.ws.lock().await.take() {
-        ws.close();
+    ctx.connect_cancel.lock().await.cancel();
+    ctx.generation.fetch_add(1, Ordering::SeqCst);
+    let _lifecycle = ctx.lifecycle.lock().await;
+    stop_connection_tasks(&ctx).await;
+    {
+        let config = ctx.config.read().await;
+        if !config.user_id.is_empty() {
+            crate::key_sync::bind_account(
+                &ctx.config_dir,
+                &config.server_url,
+                &config.user_id,
+                &config,
+            )?;
+        }
     }
 
     // Forget the session in memory first, so no refresh can write it back to storage
     *ctx.api.lock().await = ApiClient::new(&AppConfig::default().server_url);
+    ctx.pending_mfa.lock().await.take();
+    ctx.pairing.lock().await.clear();
+    ctx.pending_push.lock().await.take();
 
     // Clear tokens from secure storage
     let token_store = TokenStore::new(&ctx.config_dir);
-    let _ = token_store.clear();
+    token_store.clear().map_err(|e| e.to_string())?;
 
     // Reset config to defaults
     let mut config = ctx.config.write().await;
@@ -1846,7 +2277,33 @@ pub async fn check_social_status(server_url: String) -> Result<SocialStatus, Str
     })
 }
 
-/// Complete device setup using tokens obtained from OAuth (via PKCE exchange).
+/// Whether the server's web dashboard can hand a sign-in to the app ("Sign in with
+/// browser"). Servers with two-factor authentication publish public settings; older
+/// ones answer `/api/settings` with the dashboard's page.
+#[tauri::command]
+pub async fn check_browser_sign_in(server_url: String) -> Result<bool, String> {
+    let url = format!("{}/api/settings", server_url.trim_end_matches('/'));
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to reach server: {e}"))?;
+    if !resp.status().is_success() {
+        return Ok(false);
+    }
+    let body = resp.text().await.unwrap_or_default();
+    Ok(supports_browser_sign_in(&body))
+}
+
+/// Recognizes the public settings of a server with two-factor authentication.
+fn supports_browser_sign_in(settings: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(settings)
+        .is_ok_and(|v| v.get("mfa_required").is_some_and(|r| r.is_boolean()))
+}
+
+/// Complete device setup using tokens obtained from OAuth (via PKCE exchange), or from
+/// a sign-in on the web dashboard ("Sign in with browser").
 /// Reuses the device registration + group key flow from setup_and_login.
 #[tauri::command]
 pub async fn setup_with_oauth_tokens(
@@ -1863,72 +2320,17 @@ pub async fn setup_with_oauth_tokens(
     let mut api = ctx.api.lock().await;
     *api = api_client(&server_url, &ctx.config_dir);
     api.set_tokens(access_token, refresh_token);
+    // The browser finished the sign-in instead of the second-factor prompt
+    ctx.pending_mfa.lock().await.take();
 
     // Get user info to obtain user_id for fingerprinting
     let user_info = api
         .get_me()
         .await
         .map_err(|e| format!("Failed to get user info: {e}"))?;
-    let user_id = user_info.id.clone();
 
     let device_name = crate::fingerprint::auto_device_name();
-    let fingerprint = crate::fingerprint::generate_device_fingerprint(&user_id).ok();
-
-    // Generate device key pair
-    let key_path = AppConfig::key_path(&ctx.config_dir);
-    let kp =
-        KeyPair::load_or_generate(&key_path).map_err(|e| format!("Key generation failed: {e}"))?;
-    let pub_bytes = kp.public_key_bytes();
-    let sig = kp.sign_public_key();
-
-    // Register device with fingerprint
-    let reg_resp = api
-        .register_device(&device_name, pub_bytes, Some(sig), fingerprint)
-        .await
-        .map_err(|e| format!("Device registration failed: {e}"))?;
-
-    let device_id = reg_resp.device.id.clone();
-    let device_status = reg_resp.device.status.to_string();
-
-    // Setup group key (only if approved)
-    let mut exchange = KeyExchange::new(kp);
-    if device_status == "approved" {
-        setup_group_key(&mut exchange, &api, &device_id, &ctx.config_dir)
-            .await
-            .map_err(|e| format!("Key exchange failed: {e}"))?;
-    }
-
-    // Save tokens to secure storage
-    let token_store = TokenStore::new(&ctx.config_dir);
-    token_store
-        .save_tokens(
-            &api.access_token().unwrap_or_default(),
-            &api.refresh_token().unwrap_or_default(),
-        )
-        .map_err(|e| format!("Token save failed: {e}"))?;
-
-    // Save config
-    let mut config = ctx.config.write().await;
-    config.server_url = server_url;
-    config.user_id = user_id;
-    config.device_id = device_id;
-    config.device_name = device_name;
-    config.device_status = device_status;
-    config
-        .save(&ctx.config_dir)
-        .map_err(|e| format!("Config save failed: {e}"))?;
-
-    // Update state
-    *ctx.state.write().await = AppState::Disconnected;
-    *ctx.exchange.lock().await = Some(exchange);
-
-    // Initialize history
-    let db_path = ctx.config_dir.join("history.db");
-    if let Ok(h) = History::open(&db_path, 1000) {
-        *ctx.history.lock().await = Some(h);
-    }
-
-    Ok(())
+    finish_sign_in(&ctx, &mut api, server_url, user_info.id, device_name).await
 }
 
 #[derive(Serialize, serde::Deserialize)]
@@ -2004,6 +2406,24 @@ pub async fn exchange_oauth_code(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unicode_notifications_do_not_interrupt_later_entries() {
+        let mut entry = PlainEntry {
+            id: "notification".into(),
+            device_id: "device".into(),
+            device_name: "Sender".into(),
+            content_type: ContentType::Text,
+            data: "€".repeat(27).into_bytes(),
+            metadata: Metadata::default(),
+            created_at: chrono::Utc::now(),
+        };
+        assert_eq!(notification_body(&entry), "€".repeat(27));
+        entry.data = "€".repeat(81).into_bytes();
+        assert_eq!(notification_body(&entry), format!("{}...", "€".repeat(80)));
+        entry.data = b"the next event still works".to_vec();
+        assert_eq!(notification_body(&entry), "the next event still works");
+    }
 
     #[test]
     fn update_urls_resolve_against_the_server_and_must_be_http() {
@@ -2184,5 +2604,276 @@ mod tests {
     #[test]
     fn encode_rgba_to_png_rejects_mismatched_buffer() {
         assert!(encode_rgba_to_png(&[0u8; 3], 2, 2).is_none());
+    }
+
+    // ---- two-factor sign-in ----------------------------------------------------
+
+    use crate::api::client::tests::serve;
+
+    fn context() -> (tempfile::TempDir, AppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(dir.path().to_path_buf());
+        (dir, ctx)
+    }
+
+    fn pending_login(server_url: &str, started: Instant) -> PendingMfaLogin {
+        PendingMfaLogin {
+            server_url: server_url.to_string(),
+            device_name: "Laptop".into(),
+            mfa_token: "ticket-1".into(),
+            started,
+        }
+    }
+
+    fn server_error(status: u16, code: Option<&str>, message: &str) -> ApiError {
+        ApiError::Server {
+            status,
+            code: code.map(str::to_string),
+            message: message.into(),
+        }
+    }
+
+    /// Why `verify_pending_mfa` turned down `code`.
+    async fn rejected(ctx: &AppContext, api: &mut ApiClient, code: &str) -> MfaLoginError {
+        match verify_pending_mfa(ctx, api, MfaMethod::Totp, code).await {
+            Ok(_) => panic!("{code} was accepted"),
+            Err(e) => e,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_paused_sign_in_is_used_once_and_expires_after_ten_minutes() {
+        let (_dir, ctx) = context();
+        let started = Instant::now();
+        let almost_expired = started + MFA_TICKET_TTL - Duration::from_secs(1);
+
+        *ctx.pending_mfa.lock().await = Some(pending_login("https://s", started));
+        assert!(ctx.take_pending_mfa(almost_expired).await.is_some());
+        assert!(
+            ctx.take_pending_mfa(almost_expired).await.is_none(),
+            "used once"
+        );
+
+        *ctx.pending_mfa.lock().await = Some(pending_login("https://s", started));
+        assert!(
+            ctx.take_pending_mfa(started + MFA_TICKET_TTL)
+                .await
+                .is_none()
+        );
+        assert!(
+            ctx.pending_mfa.lock().await.is_none(),
+            "an expired ticket is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mistyped_code_can_be_retried_but_a_lockout_ends_the_sign_in() {
+        let (base_url, log) = serve(vec![
+            (401, r#"{"error":"invalid authentication code"}"#),
+            (
+                429,
+                r#"{"error":"Too many failed attempts. Try again in 15 minutes.","code":"mfa_locked"}"#,
+            ),
+        ])
+        .await;
+        let (_dir, ctx) = context();
+        *ctx.pending_mfa.lock().await = Some(pending_login(&base_url, Instant::now()));
+        let mut api = ApiClient::new(&base_url);
+
+        let err = rejected(&ctx, &mut api, "000000").await;
+        assert_eq!(
+            err,
+            MfaLoginError {
+                message: "Invalid authentication code".into(),
+                restart: false,
+            }
+        );
+        assert!(
+            ctx.pending_mfa.lock().await.is_some(),
+            "kept for another try"
+        );
+
+        let err = rejected(&ctx, &mut api, "111111").await;
+        assert_eq!(
+            err,
+            MfaLoginError {
+                message: "Too many failed attempts. Try again in 15 minutes.".into(),
+                restart: true,
+            }
+        );
+        assert!(ctx.pending_mfa.lock().await.is_none());
+
+        // Nothing is left to send
+        let err = rejected(&ctx, &mut api, "222222").await;
+        assert_eq!(err, MfaLoginError::restart(MFA_SIGN_IN_EXPIRED));
+        assert_eq!(log.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_accepted_code_uses_up_the_ticket() {
+        let (base_url, log) = serve(vec![(
+            200,
+            r#"{"access_token":"access-1","refresh_token":"refresh-1","recovery_codes_remaining":9}"#,
+        )])
+        .await;
+        let (_dir, ctx) = context();
+        *ctx.pending_mfa.lock().await = Some(pending_login(&base_url, Instant::now()));
+        let mut api = ApiClient::new("https://elsewhere.example");
+
+        let (pending, verified) =
+            verify_pending_mfa(&ctx, &mut api, MfaMethod::Recovery, "abcd-efgh-ijkl-mnop")
+                .await
+                .unwrap();
+        assert_eq!(pending.server_url, base_url);
+        assert_eq!(pending.device_name, "Laptop");
+        assert_eq!(verified.recovery_codes_remaining, Some(9));
+        // The client now talks to the sign-in's server, with the new session
+        assert_eq!(api.access_token().as_deref(), Some("access-1"));
+        assert!(ctx.pending_mfa.lock().await.is_none());
+        assert_eq!(log.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_mfa_prompt_leaves_the_ticket_in_the_backend() {
+        let challenge = MfaChallenge {
+            message: "Two-factor authentication is required.".into(),
+            mfa_token: "ticket-1".into(),
+            stage: MfaStage::Verify,
+            methods: vec!["totp".into(), "recovery".into()],
+            email_code_required: false,
+            email_hint: None,
+            passkeys_available: true,
+        };
+        assert_eq!(
+            serde_json::to_value(LoginStep::MfaRequired(MfaPrompt::from(&challenge))).unwrap(),
+            serde_json::json!({
+                "status": "mfa_required",
+                "stage": "verify",
+                "methods": ["totp", "recovery"],
+                "email_code_required": false,
+                "email_hint": null,
+                "passkeys_available": true,
+                "message": "Two-factor authentication is required.",
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(LoginStep::SignedIn).unwrap(),
+            serde_json::json!({ "status": "signed_in" })
+        );
+
+        let enroll = MfaChallenge {
+            stage: MfaStage::Enroll,
+            email_code_required: true,
+            email_hint: Some("a***@example.com".into()),
+            ..challenge
+        };
+        let prompt = serde_json::to_value(MfaPrompt::from(&enroll)).unwrap();
+        assert_eq!(prompt["stage"], "enroll");
+        assert_eq!(prompt["email_code_required"], true);
+        assert_eq!(prompt["email_hint"], "a***@example.com");
+    }
+
+    #[test]
+    fn the_app_sends_codes_but_not_passkeys() {
+        assert_eq!(
+            serde_json::from_str::<MfaMethod>(r#""totp""#).unwrap(),
+            MfaMethod::Totp
+        );
+        assert_eq!(
+            serde_json::from_str::<MfaMethod>(r#""recovery""#).unwrap(),
+            MfaMethod::Recovery
+        );
+        assert!(serde_json::from_str::<MfaMethod>(r#""webauthn""#).is_err());
+    }
+
+    #[test]
+    fn mfa_errors_say_whether_the_sign_in_can_continue() {
+        for (error, message, restart) in [
+            (
+                server_error(401, None, "invalid authentication code"),
+                "Invalid authentication code",
+                false,
+            ),
+            (
+                server_error(401, None, "invalid recovery code"),
+                "Invalid recovery code",
+                false,
+            ),
+            (
+                server_error(429, None, "too many requests, please try again later"),
+                "Too many requests, please try again later",
+                false,
+            ),
+            (
+                server_error(
+                    429,
+                    Some("mfa_locked"),
+                    "Too many failed attempts. Try again in 15 minutes.",
+                ),
+                "Too many failed attempts. Try again in 15 minutes.",
+                true,
+            ),
+            (
+                server_error(403, Some("account_suspended"), "this account is suspended"),
+                "This account is suspended",
+                true,
+            ),
+            (
+                server_error(502, None, "<html>Bad Gateway</html>"),
+                "The server could not check the code (HTTP 502). Try again.",
+                false,
+            ),
+        ] {
+            assert_eq!(
+                MfaLoginError::from_api(&error),
+                MfaLoginError {
+                    message: message.into(),
+                    restart,
+                },
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn login_errors_show_structured_messages_alone() {
+        assert_eq!(
+            describe_api_error(&server_error(
+                403,
+                Some("account_suspended"),
+                "This account is suspended. Contact your administrator."
+            )),
+            "This account is suspended. Contact your administrator."
+        );
+        assert_eq!(
+            describe_api_error(&server_error(401, None, "invalid credentials")),
+            "Server error (401): invalid credentials"
+        );
+    }
+
+    #[test]
+    fn sentence_case_capitalizes_the_first_letter_only() {
+        assert_eq!(sentence_case("invalid code"), "Invalid code");
+        assert_eq!(sentence_case("Already. fine"), "Already. fine");
+        assert_eq!(sentence_case("élan"), "Élan");
+        assert_eq!(sentence_case(""), "");
+    }
+
+    #[test]
+    fn recognizes_servers_whose_dashboard_hands_sign_ins_to_the_app() {
+        assert!(supports_browser_sign_in(
+            r#"{"registration_open":true,"banner":null,"passkeys_available":true,"mfa_required":true}"#
+        ));
+        assert!(supports_browser_sign_in(r#"{"mfa_required":false}"#));
+        // Older servers answer with the dashboard's page
+        for older in [
+            "<!doctype html><html></html>",
+            "",
+            "{}",
+            "[]",
+            r#"{"mfa_required":"yes"}"#,
+        ] {
+            assert!(!supports_browser_sign_in(older), "{older}");
+        }
     }
 }

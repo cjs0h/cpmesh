@@ -10,21 +10,151 @@ use tracing::warn;
 
 use crate::routes::middleware::AuthClaims;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct Claims {
     user_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     device_id: Option<String>,
     exp: u64,
     iat: u64,
+    /// Original session issuance, preserved by refresh and step-up. Unlike `iat`,
+    /// it cannot move past a password-change revocation while refresh is in flight.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    session_start: u64,
     jti: String,
+    /// Token type: "access", "refresh", "mfa" (sign-in ticket) or "passkey" (ceremony).
     #[serde(default = "default_token_type")]
-    tt: String, // "access" or "refresh"
+    tt: String,
+    /// The session was established with a second factor.
+    #[serde(default, skip_serializing_if = "is_false")]
+    mfa: bool,
+    /// When the user last signed in or confirmed a second factor, for actions that
+    /// need a recent sign-in. Zero on tokens issued before this claim existed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    auth_time: u64,
+    /// Sign-in ticket: "verify" or "enroll".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stage: Option<String>,
+    /// Sign-in ticket: "pwd" or "sso".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    amr: Option<String>,
+    /// Sign-in ticket: the emailed code was confirmed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    email_ok: bool,
+    /// Passkey ceremony: base64url challenge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chal: Option<String>,
+    /// Passkey ceremony: "register" or "authenticate".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    purpose: Option<String>,
 }
 
 fn default_token_type() -> String {
     "access".to_string()
 }
+
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
+/// What a session (access and refresh token pair) grants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionGrant {
+    pub user_id: uuid::Uuid,
+    pub device_id: Option<uuid::Uuid>,
+    pub mfa: bool,
+    pub auth_time: u64,
+    pub session_start: u64,
+}
+
+impl SessionGrant {
+    /// A session for a sign-in completed now.
+    pub fn signed_in(user_id: uuid::Uuid, mfa: bool) -> Self {
+        let now = now_secs();
+        SessionGrant {
+            user_id,
+            device_id: None,
+            mfa,
+            auth_time: now,
+            session_start: now,
+        }
+    }
+
+    /// The same session, as described by its claims.
+    pub fn from_claims(claims: &AuthClaims) -> Self {
+        SessionGrant {
+            user_id: claims.user_id,
+            device_id: claims.device_id,
+            mfa: claims.mfa,
+            auth_time: claims.auth_time,
+            session_start: claims.session_started_at(),
+        }
+    }
+
+    pub fn with_device(mut self, device_id: Option<uuid::Uuid>) -> Self {
+        self.device_id = device_id;
+        self
+    }
+}
+
+/// Which step a sign-in ticket allows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MfaStage {
+    /// The account has a second factor: confirm it.
+    Verify,
+    /// The account must set up a second factor before signing in.
+    Enroll,
+}
+
+/// How the first factor was satisfied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FirstFactor {
+    Password,
+    Sso,
+}
+
+/// A short-lived, single-use ticket proving the first factor of a sign-in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MfaTicket {
+    pub user_id: uuid::Uuid,
+    pub stage: MfaStage,
+    pub first_factor: FirstFactor,
+    pub email_ok: bool,
+    pub jti: String,
+    pub exp: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PasskeyPurpose {
+    Register,
+    Authenticate,
+}
+
+impl PasskeyPurpose {
+    fn as_str(self) -> &'static str {
+        match self {
+            PasskeyPurpose::Register => "register",
+            PasskeyPurpose::Authenticate => "authenticate",
+        }
+    }
+}
+
+/// A verified passkey challenge token.
+#[derive(Debug)]
+pub struct PasskeyChallenge {
+    pub challenge: Vec<u8>,
+    pub jti: String,
+    pub exp: u64,
+}
+
+/// How long a sign-in ticket can be used to finish signing in.
+pub const MFA_TICKET_TTL: Duration = Duration::from_secs(600);
+/// How long a passkey ceremony may take.
+pub const PASSKEY_CHALLENGE_TTL: Duration = Duration::from_secs(300);
 
 /// A parsed public key with its key ID.
 struct PublicKeyEntry {
@@ -133,44 +263,235 @@ impl AuthService {
             .is_ok()
     }
 
+    pub async fn hash_password_async(&self, password: &str) -> Result<String, String> {
+        let password = password.to_owned();
+        crate::blocking::run(crate::blocking::Work::Password, move || {
+            Argon2::default()
+                .hash_password(password.as_bytes())
+                .map(|hash| hash.to_string())
+                .map_err(|e| format!("hash password: {e}"))
+        })
+        .await
+    }
+
+    pub async fn check_password_async(&self, hash: &str, password: &str) -> Result<bool, String> {
+        let (hash, password) = (hash.to_owned(), password.to_owned());
+        crate::blocking::run(crate::blocking::Work::Password, move || {
+            let parsed = PasswordHash::new(&hash)
+                .map_err(|e| format!("invalid stored password hash: {e}"))?;
+            Ok(Argon2::default()
+                .verify_password(password.as_bytes(), &parsed)
+                .is_ok())
+        })
+        .await
+    }
+
+    /// Issues an access token for a session that did not use a second factor.
     pub fn generate_access_token(
         &self,
         user_id: uuid::Uuid,
         device_id: Option<uuid::Uuid>,
     ) -> Result<String, String> {
-        let now = now_secs();
-        let claims = Claims {
-            user_id: user_id.to_string(),
-            device_id: device_id.map(|d| d.to_string()),
-            exp: now + self.access_expiry.as_secs(),
-            iat: now,
-            jti: generate_jti(),
-            tt: "access".to_string(),
-        };
-        let mut header = Header::new(Algorithm::RS256);
-        header.kid = Some(self.active_kid.clone());
-        encode(&header, &claims, &self.encoding_key).map_err(|e| format!("encode token: {e}"))
+        self.issue_access(&SessionGrant::signed_in(user_id, false).with_device(device_id))
     }
 
-    /// Issues a refresh token. A device-bound token keeps every token refreshed
-    /// from it bound to the same device.
+    /// Issues a refresh token for a session that did not use a second factor. A
+    /// device-bound token keeps every token refreshed from it bound to the same device.
     pub fn generate_refresh_token(
         &self,
         user_id: uuid::Uuid,
         device_id: Option<uuid::Uuid>,
     ) -> Result<String, String> {
-        let now = now_secs();
-        let claims = Claims {
-            user_id: user_id.to_string(),
-            device_id: device_id.map(|d| d.to_string()),
-            exp: now + self.refresh_expiry.as_secs(),
-            iat: now,
-            jti: generate_jti(),
-            tt: "refresh".to_string(),
+        self.issue_refresh(&SessionGrant::signed_in(user_id, false).with_device(device_id))
+    }
+
+    pub fn issue_access(&self, grant: &SessionGrant) -> Result<String, String> {
+        self.sign(&self.session_claims(grant, "access", self.access_expiry))
+    }
+
+    pub fn issue_refresh(&self, grant: &SessionGrant) -> Result<String, String> {
+        self.sign(&self.session_claims(grant, "refresh", self.refresh_expiry))
+    }
+
+    /// Issues an access and refresh token pair.
+    pub fn issue_session(&self, grant: &SessionGrant) -> Result<(String, String), String> {
+        Ok((self.issue_access(grant)?, self.issue_refresh(grant)?))
+    }
+
+    pub fn issue_device_challenge(
+        &self,
+        user_id: uuid::Uuid,
+        access_token: &str,
+    ) -> Result<String, String> {
+        use sha2::{Digest, Sha256};
+        self.sign(&Claims {
+            chal: Some(crate::mfa::webauthn::b64url(&Sha256::digest(
+                access_token.as_bytes(),
+            ))),
+            ..base_claims(user_id, "device-proof", Duration::from_secs(120))
+        })
+    }
+
+    pub fn validate_device_challenge(
+        &self,
+        challenge: &str,
+        user_id: uuid::Uuid,
+        access_token: &str,
+    ) -> Result<(String, u64), String> {
+        use sha2::{Digest, Sha256};
+        let claims = self.decode_typed(challenge, "device-proof")?;
+        let session_hash = crate::mfa::webauthn::b64url(&Sha256::digest(access_token.as_bytes()));
+        if claims.user_id != user_id.to_string()
+            || claims.chal.as_deref() != Some(session_hash.as_str())
+        {
+            return Err("device challenge belongs to another session".into());
+        }
+        Ok((claims.jti, claims.exp))
+    }
+
+    fn session_claims(&self, grant: &SessionGrant, tt: &str, ttl: Duration) -> Claims {
+        Claims {
+            device_id: grant.device_id.map(|d| d.to_string()),
+            mfa: grant.mfa,
+            auth_time: grant.auth_time,
+            session_start: grant.session_start,
+            ..base_claims(grant.user_id, tt, ttl)
+        }
+    }
+
+    /// Issues a sign-in ticket for the second step of signing in.
+    pub fn issue_mfa_ticket(
+        &self,
+        user_id: uuid::Uuid,
+        stage: MfaStage,
+        first_factor: FirstFactor,
+        email_ok: bool,
+    ) -> Result<String, String> {
+        self.sign(&Claims {
+            stage: Some(
+                match stage {
+                    MfaStage::Verify => "verify",
+                    MfaStage::Enroll => "enroll",
+                }
+                .to_string(),
+            ),
+            amr: Some(
+                match first_factor {
+                    FirstFactor::Password => "pwd",
+                    FirstFactor::Sso => "sso",
+                }
+                .to_string(),
+            ),
+            email_ok,
+            ..base_claims(user_id, "mfa", MFA_TICKET_TTL)
+        })
+    }
+
+    /// Validates a sign-in ticket's signature, type and expiry. Single use is enforced
+    /// with [`Self::consume_once`] when the sign-in completes.
+    pub fn validate_mfa_ticket(&self, token: &str) -> Result<MfaTicket, String> {
+        let claims = self.decode_typed(token, "mfa")?;
+        let stage = match claims.stage.as_deref() {
+            Some("verify") => MfaStage::Verify,
+            Some("enroll") => MfaStage::Enroll,
+            _ => return Err("sign-in ticket has no stage".to_string()),
         };
+        let first_factor = match claims.amr.as_deref() {
+            Some("pwd") => FirstFactor::Password,
+            Some("sso") => FirstFactor::Sso,
+            _ => return Err("sign-in ticket has no first factor".to_string()),
+        };
+        if self.is_cached_as_used(&claims.jti) {
+            return Err("sign-in ticket has already been used".to_string());
+        }
+        Ok(MfaTicket {
+            user_id: parse_user_id(&claims.user_id)?,
+            stage,
+            first_factor,
+            email_ok: claims.email_ok,
+            jti: claims.jti,
+            exp: claims.exp,
+        })
+    }
+
+    /// Issues a token carrying a passkey ceremony's challenge, so the server keeps no
+    /// ceremony state. The token is single use (see [`Self::consume_once`]).
+    pub fn issue_passkey_challenge(
+        &self,
+        user_id: uuid::Uuid,
+        purpose: PasskeyPurpose,
+        challenge: &[u8],
+    ) -> Result<String, String> {
+        self.sign(&Claims {
+            chal: Some(crate::mfa::webauthn::b64url(challenge)),
+            purpose: Some(purpose.as_str().to_string()),
+            ..base_claims(user_id, "passkey", PASSKEY_CHALLENGE_TTL)
+        })
+    }
+
+    pub fn validate_passkey_challenge(
+        &self,
+        token: &str,
+        user_id: uuid::Uuid,
+        purpose: PasskeyPurpose,
+    ) -> Result<PasskeyChallenge, String> {
+        let claims = self.decode_typed(token, "passkey")?;
+        if parse_user_id(&claims.user_id)? != user_id {
+            return Err("passkey challenge belongs to another account".to_string());
+        }
+        if claims.purpose.as_deref() != Some(purpose.as_str()) {
+            return Err("passkey challenge is for another ceremony".to_string());
+        }
+        let challenge = claims
+            .chal
+            .as_deref()
+            .and_then(crate::mfa::webauthn::b64url_decode)
+            .filter(|c| !c.is_empty())
+            .ok_or("passkey challenge is missing")?;
+        Ok(PasskeyChallenge {
+            challenge,
+            jti: claims.jti,
+            exp: claims.exp,
+        })
+    }
+
+    /// Marks a single-use token as used. Returns `false` when it was used before.
+    pub async fn consume_once(
+        &self,
+        jti: &str,
+        user_id: uuid::Uuid,
+        expires_at: u64,
+    ) -> Result<bool, String> {
+        Ok(self.consume_refresh_token(jti, user_id, expires_at).await? == RefreshTokenUse::First)
+    }
+
+    fn is_cached_as_used(&self, jti: &str) -> bool {
+        self.revoked
+            .read()
+            .expect("revoked RwLock poisoned")
+            .contains_key(jti)
+    }
+
+    fn sign(&self, claims: &Claims) -> Result<String, String> {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(self.active_kid.clone());
-        encode(&header, &claims, &self.encoding_key).map_err(|e| format!("encode token: {e}"))
+        encode(&header, claims, &self.encoding_key).map_err(|e| format!("encode token: {e}"))
+    }
+
+    /// Verifies a token's signature and expiry and requires the token type `tt`.
+    fn decode_typed(&self, token: &str, tt: &str) -> Result<Claims, String> {
+        let decoding_key = self.decoding_key_for_token(token)?;
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.validate_exp = true;
+        let data = decode::<Claims>(token, decoding_key, &validation)
+            .map_err(|e| format!("validate token: {e}"))?;
+        if data.claims.tt != tt {
+            return Err(format!(
+                "expected a token of type {tt}, got {}",
+                data.claims.tt
+            ));
+        }
+        Ok(data.claims)
     }
 
     /// Select the decoding key matching the token's `kid` header claim.
@@ -194,80 +515,46 @@ impl AuthService {
             .ok_or_else(|| format!("unknown key ID: {kid}"))
     }
 
-    /// Validate an access token (rejects refresh tokens).
+    /// Validate an access token (rejects every other token type).
     pub fn validate_access_token(&self, token: &str) -> Result<AuthClaims, String> {
-        let decoding_key = self.decoding_key_for_token(token)?;
-        let mut validation = Validation::new(Algorithm::RS256);
-        validation.validate_exp = true;
+        let claims = self.decode_typed(token, "access")?;
 
-        let data = decode::<Claims>(token, decoding_key, &validation)
-            .map_err(|e| format!("validate token: {e}"))?;
-
-        // Reject refresh tokens used as access tokens
-        if data.claims.tt == "refresh" {
-            return Err("refresh token cannot be used as access token".to_string());
+        // Check in-memory revocation (the database is consulted by the middleware)
+        if !claims.jti.is_empty() && self.is_cached_as_used(&claims.jti) {
+            return Err("token has been revoked".to_string());
         }
-
-        // Check in-memory revocation
-        if !data.claims.jti.is_empty() {
-            let revoked = self.revoked.read().expect("revoked RwLock poisoned");
-            if revoked.contains_key(&data.claims.jti) {
-                return Err("token has been revoked".to_string());
-            }
-        }
-
-        // DB check is done in middleware via check_revoked_db_async
-        if !data.claims.jti.is_empty()
-            && let Some(ref pool) = self.pool
-        {
-            let _ = (data.claims.jti.clone(), pool.clone());
-        }
-
-        let user_id = uuid::Uuid::parse_str(&data.claims.user_id)
-            .map_err(|e| format!("invalid user_id in token: {e}"))?;
-        let device_id = data
-            .claims
-            .device_id
-            .and_then(|d| uuid::Uuid::parse_str(&d).ok());
 
         Ok(AuthClaims {
-            user_id,
-            device_id,
-            iat: data.claims.iat,
+            user_id: parse_user_id(&claims.user_id)?,
+            device_id: claims
+                .device_id
+                .and_then(|d| uuid::Uuid::parse_str(&d).ok()),
+            iat: claims.iat,
+            session_start: claims.session_start,
+            mfa: claims.mfa,
+            auth_time: claims.auth_time,
         })
     }
 
     /// Validate a refresh token's signature, expiry and type. Returns the claims, JTI,
     /// and expiry on success. Reuse is detected by [`Self::consume_refresh_token`].
     pub fn validate_refresh_token(&self, token: &str) -> RefreshResult {
-        let decoding_key = match self.decoding_key_for_token(token) {
-            Ok(k) => k,
+        // Legacy tokens without a tt field default to "access" and are refused here
+        let claims = match self.decode_typed(token, "refresh") {
+            Ok(c) => c,
             Err(e) => return RefreshResult::Invalid(e),
         };
-        let mut validation = Validation::new(Algorithm::RS256);
-        validation.validate_exp = true;
-
-        let data = match decode::<Claims>(token, decoding_key, &validation) {
-            Ok(d) => d,
-            Err(e) => return RefreshResult::Invalid(format!("validate token: {e}")),
-        };
-
-        // Must be a refresh token (legacy tokens without tt field default to "access")
-        if data.claims.tt != "refresh" {
-            return RefreshResult::Invalid("not a refresh token".to_string());
-        }
 
         // Single use is tracked by JTI, so a refresh token without one cannot be accepted
-        if data.claims.jti.is_empty() {
+        if claims.jti.is_empty() {
             return RefreshResult::Invalid("refresh token has no jti".to_string());
         }
 
-        let user_id = match uuid::Uuid::parse_str(&data.claims.user_id) {
+        let user_id = match parse_user_id(&claims.user_id) {
             Ok(uid) => uid,
-            Err(e) => return RefreshResult::Invalid(format!("invalid user_id: {e}")),
+            Err(e) => return RefreshResult::Invalid(e),
         };
-        let device_id = data
-            .claims
+        let device_id = claims
             .device_id
             .and_then(|d| uuid::Uuid::parse_str(&d).ok());
 
@@ -275,10 +562,13 @@ impl AuthService {
             AuthClaims {
                 user_id,
                 device_id,
-                iat: data.claims.iat,
+                iat: claims.iat,
+                session_start: claims.session_start,
+                mfa: claims.mfa,
+                auth_time: claims.auth_time,
             },
-            data.claims.jti,
-            data.claims.exp,
+            claims.jti,
+            claims.exp,
         )
     }
 
@@ -498,6 +788,22 @@ fn generate_jti() -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+fn base_claims(user_id: uuid::Uuid, tt: &str, ttl: Duration) -> Claims {
+    let now = now_secs();
+    Claims {
+        user_id: user_id.to_string(),
+        exp: now + ttl.as_secs(),
+        iat: now,
+        jti: generate_jti(),
+        tt: tt.to_string(),
+        ..Claims::default()
+    }
+}
+
+fn parse_user_id(value: &str) -> Result<uuid::Uuid, String> {
+    uuid::Uuid::parse_str(value).map_err(|e| format!("invalid user_id in token: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,12 +893,131 @@ mod tests {
         let access = svc.generate_access_token(user, None).unwrap();
 
         let err = svc.validate_access_token(&refresh).unwrap_err();
-        assert!(err.contains("refresh token cannot be used"), "{err}");
+        assert!(
+            err.contains("expected a token of type access, got refresh"),
+            "{err}"
+        );
 
         match svc.validate_refresh_token(&access) {
-            RefreshResult::Invalid(e) => assert!(e.contains("not a refresh token"), "{e}"),
+            RefreshResult::Invalid(e) => assert!(
+                e.contains("expected a token of type refresh, got access"),
+                "{e}"
+            ),
             _ => panic!("access token accepted as refresh token"),
         }
+    }
+
+    #[test]
+    fn session_grants_carry_mfa_and_auth_time_through_refresh() {
+        let svc = test_auth_service();
+        let grant = SessionGrant {
+            user_id: uid(),
+            device_id: Some(uid()),
+            mfa: true,
+            auth_time: 1_700_000_000,
+            session_start: 1_700_000_000,
+        };
+        let (access, refresh) = svc.issue_session(&grant).unwrap();
+        let claims = svc.validate_access_token(&access).unwrap();
+        assert!(claims.mfa);
+        assert_eq!(claims.auth_time, 1_700_000_000);
+        assert_eq!(SessionGrant::from_claims(&claims), grant);
+
+        let RefreshResult::Ok(refreshed, _, _) = svc.validate_refresh_token(&refresh) else {
+            panic!("refresh token rejected");
+        };
+        assert_eq!(SessionGrant::from_claims(&refreshed), grant);
+
+        // Plain sessions have neither
+        let claims = svc
+            .validate_access_token(&svc.generate_access_token(uid(), None).unwrap())
+            .unwrap();
+        assert!(!claims.mfa);
+        assert!(claims.auth_time > 0);
+    }
+
+    #[test]
+    fn mfa_tickets_round_trip_and_are_not_access_tokens() {
+        let svc = test_auth_service();
+        let user = uid();
+        let token = svc
+            .issue_mfa_ticket(user, MfaStage::Enroll, FirstFactor::Password, true)
+            .unwrap();
+        let ticket = svc.validate_mfa_ticket(&token).unwrap();
+        assert_eq!(ticket.user_id, user);
+        assert_eq!(ticket.stage, MfaStage::Enroll);
+        assert_eq!(ticket.first_factor, FirstFactor::Password);
+        assert!(ticket.email_ok);
+        assert!(ticket.exp > now_secs() + MFA_TICKET_TTL.as_secs() - 5);
+
+        let token = svc
+            .issue_mfa_ticket(user, MfaStage::Verify, FirstFactor::Sso, false)
+            .unwrap();
+        let ticket = svc.validate_mfa_ticket(&token).unwrap();
+        assert_eq!(ticket.stage, MfaStage::Verify);
+        assert_eq!(ticket.first_factor, FirstFactor::Sso);
+        assert!(!ticket.email_ok);
+
+        // A ticket proves only the first factor: it is not a session
+        assert!(svc.validate_access_token(&token).is_err());
+        assert!(matches!(
+            svc.validate_refresh_token(&token),
+            RefreshResult::Invalid(_)
+        ));
+        // ...and a session token is not a ticket
+        let access = svc.generate_access_token(user, None).unwrap();
+        assert!(svc.validate_mfa_ticket(&access).is_err());
+    }
+
+    #[tokio::test]
+    async fn mfa_tickets_are_single_use() {
+        let svc = test_auth_service();
+        let user = uid();
+        let token = svc
+            .issue_mfa_ticket(user, MfaStage::Verify, FirstFactor::Password, false)
+            .unwrap();
+        let ticket = svc.validate_mfa_ticket(&token).unwrap();
+        assert!(
+            svc.consume_once(&ticket.jti, user, ticket.exp)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !svc.consume_once(&ticket.jti, user, ticket.exp)
+                .await
+                .unwrap()
+        );
+        assert!(
+            svc.validate_mfa_ticket(&token)
+                .unwrap_err()
+                .contains("already been used")
+        );
+    }
+
+    #[test]
+    fn passkey_challenges_are_bound_to_user_and_purpose() {
+        let svc = test_auth_service();
+        let user = uid();
+        let token = svc
+            .issue_passkey_challenge(user, PasskeyPurpose::Register, b"random-challenge")
+            .unwrap();
+        let challenge = svc
+            .validate_passkey_challenge(&token, user, PasskeyPurpose::Register)
+            .unwrap();
+        assert_eq!(challenge.challenge, b"random-challenge");
+
+        assert!(
+            svc.validate_passkey_challenge(&token, uid(), PasskeyPurpose::Register)
+                .unwrap_err()
+                .contains("another account")
+        );
+        assert!(
+            svc.validate_passkey_challenge(&token, user, PasskeyPurpose::Authenticate)
+                .unwrap_err()
+                .contains("another ceremony")
+        );
+        assert!(svc.validate_access_token(&token).is_err());
+        assert!(svc.validate_mfa_ticket(&token).is_err());
     }
 
     #[test]
@@ -764,11 +1189,11 @@ mod tests {
         let keys = test_keys();
         let claims = Claims {
             user_id: uid().to_string(),
-            device_id: None,
             exp: now_secs() + 3600,
             iat: now_secs(),
             jti: generate_jti(),
             tt: "access".to_string(),
+            ..Claims::default()
         };
         let mut header = Header::new(Algorithm::HS256);
         header.kid = Some(TEST_KID.to_string());
@@ -792,11 +1217,11 @@ mod tests {
         let keys = test_keys();
         let claims = Claims {
             user_id: uid().to_string(),
-            device_id: None,
             exp: now_secs() - 120,
             iat: now_secs() - 3720,
             jti: generate_jti(),
             tt: "access".to_string(),
+            ..Claims::default()
         };
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(TEST_KID.to_string());
@@ -851,11 +1276,11 @@ mod tests {
         let keys = test_keys();
         let claims = Claims {
             user_id: "not-a-uuid".to_string(),
-            device_id: None,
             exp: now_secs() + 60,
             iat: now_secs(),
             jti: generate_jti(),
             tt: "refresh".to_string(),
+            ..Claims::default()
         };
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(TEST_KID.to_string());

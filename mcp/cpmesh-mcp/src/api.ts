@@ -9,18 +9,35 @@ import type {
   DeviceInfo,
   GroupKeyResponse,
   GroupKeysResponse,
+  MfaChallenge,
+  MfaVerifyResponse,
   RegisterDeviceRequest,
   RegisterDeviceResponse,
   StoreGroupKeyEntry,
   UserInfo,
 } from "./protocol.js";
+import { groupKeysSchema } from "./protocol.js";
 
 export class ApiError extends Error {
   constructor(
     readonly status: number,
     message: string,
+    /** Machine-readable error code (e.g. "mfa_locked"), when the server sent one. */
+    readonly code?: string,
+    /** The whole JSON error body. */
+    readonly body: Record<string, unknown> = {},
   ) {
     super(message);
+  }
+}
+
+/** The password was right; the sign-in continues with a second factor. */
+export class MfaRequiredError extends ApiError {
+  constructor(
+    error: ApiError,
+    readonly challenge: MfaChallenge,
+  ) {
+    super(error.status, error.message, error.code, error.body);
   }
 }
 
@@ -78,12 +95,14 @@ export class CpmeshApi {
       body?: unknown;
       auth?: boolean;
       refreshed?: boolean;
+      /** Sent instead of the session's access token, never refreshed (e.g. a sign-in ticket). */
+      token?: string;
     } = {},
   ): Promise<T> {
-    const { method = "GET", body, auth = true, refreshed = false } = opts;
+    const { method = "GET", body, auth = true, refreshed = false, token } = opts;
     const headers: Record<string, string> = {};
     if (body !== undefined) headers["Content-Type"] = "application/json";
-    const sentToken = auth ? this.accessToken : null;
+    const sentToken = token ?? (auth ? this.accessToken : null);
     if (sentToken) {
       headers.Authorization = `Bearer ${sentToken}`;
     }
@@ -92,16 +111,17 @@ export class CpmeshApi {
       method,
       headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(30_000),
     });
 
-    if (res.status === 401 && auth && !refreshed) {
+    if (res.status === 401 && auth && token === undefined && !refreshed) {
       const ok = await this.refreshSession(sentToken);
       if (ok) return this.request<T>(path, { ...opts, refreshed: true });
       throw new SessionExpiredError(SESSION_EXPIRED_MESSAGE);
     }
 
     if (!res.ok) {
-      throw new ApiError(res.status, await readErrorMessage(res));
+      throw await readError(res);
     }
 
     if (res.status === 204) return undefined as T;
@@ -142,6 +162,7 @@ export class CpmeshApi {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ refresh_token: this.refreshToken }),
+        signal: AbortSignal.timeout(30_000),
       });
       if (res.status === 409) {
         // Another process sharing this session used the token moments ago. Adopt the
@@ -182,29 +203,60 @@ export class CpmeshApi {
 
   // === Auth ===
 
+  /**
+   * Password sign-in. Throws {@link MfaRequiredError} when the account continues
+   * with a second factor (see {@link verifyMfa}).
+   */
   async login(
     username: string,
     password: string,
     deviceName: string,
   ): Promise<AuthResponse> {
-    return this.request<AuthResponse>("/api/auth/login", {
+    try {
+      return await this.request<AuthResponse>("/api/auth/login", {
+        method: "POST",
+        auth: false,
+        body: { username, password, device_name: deviceName },
+      });
+    } catch (e) {
+      const challenge =
+        e instanceof ApiError && e.code === "mfa_required" ? mfaChallenge(e.body) : null;
+      throw challenge ? new MfaRequiredError(e as ApiError, challenge) : e;
+    }
+  }
+
+  /** Finishes a sign-in with a second factor; `ticket` is the challenge's mfa_token. */
+  async verifyMfa(
+    ticket: string,
+    method: "totp" | "recovery",
+    code: string,
+  ): Promise<MfaVerifyResponse> {
+    return this.request<MfaVerifyResponse>("/api/mfa/verify", {
       method: "POST",
       auth: false,
-      body: { username, password, device_name: deviceName },
+      token: ticket,
+      body: { method, code },
     });
   }
 
   async registerDevice(
     req: RegisterDeviceRequest,
+    signChallenge: (challenge: string) => string,
     opts: { retryOnExpiry?: boolean } = {},
   ): Promise<RegisterDeviceResponse> {
+    const challenge = await this.request<{ challenge: string }>("/api/devices/challenge", {
+      method: "POST", refreshed: opts.retryOnExpiry === false,
+    });
+    if (typeof challenge.challenge !== "string") throw new Error("Invalid device challenge");
     const resp = await this.request<RegisterDeviceResponse>("/api/devices", {
       method: "POST",
-      body: req,
-      refreshed: opts.retryOnExpiry === false,
+      body: { ...req, proof: { challenge: challenge.challenge, signature: signChallenge(challenge.challenge) } },
+      // Never replay a single-use proof with a different bearer session.
+      refreshed: true,
     });
-    // The server returns a device-bound access token.
+    if (!resp.refresh_token || !resp.access_token) throw new Error("Server did not return a device-bound session; update the server");
     this.accessToken = resp.access_token;
+    this.refreshToken = resp.refresh_token;
     return resp;
   }
 
@@ -245,7 +297,13 @@ export class CpmeshApi {
   ): Promise<GroupKeysResponse> {
     const q =
       sinceVersion !== undefined ? `?since_version=${sinceVersion}` : "";
-    return this.request<GroupKeysResponse>(`/api/group-keys/current${q}`);
+    return groupKeysSchema.parse(await this.request<unknown>(`/api/group-keys/current${q}`));
+  }
+
+  async rotateGroupKey(expected: number, version: number, wrappedKeys: StoreGroupKeyEntry[]): Promise<void> {
+    await this.request("/api/group-keys/rotate", {
+      method: "POST", body: { expected_current_version: expected, new_version: version, wrapped_keys: wrappedKeys },
+    });
   }
 
   // === Approvals ===
@@ -278,11 +336,31 @@ export class CpmeshApi {
   }
 }
 
-async function readErrorMessage(res: Response): Promise<string> {
+async function readError(res: Response): Promise<ApiError> {
+  let body: Record<string, unknown> = {};
   try {
-    const body = (await res.json()) as { error?: string; message?: string };
-    return body.error ?? body.message ?? res.statusText;
+    const parsed: unknown = await res.json();
+    if (parsed && typeof parsed === "object") body = parsed as Record<string, unknown>;
   } catch {
-    return res.statusText;
+    // not JSON
   }
+  const text = (value: unknown) => (typeof value === "string" && value ? value : undefined);
+  return new ApiError(
+    res.status,
+    text(body.error) ?? text(body.message) ?? (res.statusText || `HTTP ${res.status}`),
+    text(body.code),
+    body,
+  );
+}
+
+function mfaChallenge(body: Record<string, unknown>): MfaChallenge | null {
+  if (typeof body.mfa_token !== "string" || !body.mfa_token) return null;
+  return {
+    mfa_token: body.mfa_token,
+    stage: body.stage === "enroll" ? "enroll" : "verify",
+    // The server always lists them; assume the usual ones if it did not
+    methods: Array.isArray(body.methods)
+      ? body.methods.filter((m): m is string => typeof m === "string")
+      : ["totp", "recovery"],
+  };
 }

@@ -17,7 +17,78 @@ pub enum ApiError {
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("Server error ({status}): {message}")]
-    Server { status: u16, message: String },
+    Server {
+        status: u16,
+        /// Machine-readable code of a structured error, e.g. `mfa_locked`.
+        code: Option<String>,
+        message: String,
+    },
+}
+
+/// How a sign-in continues after the password, when the account needs a second factor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MfaStage {
+    /// Confirm a second factor the account already has.
+    Verify,
+    /// Set up a second factor first, which needs the web dashboard.
+    Enroll,
+}
+
+/// Second factors the app can send itself. Passkeys belong to the server's website,
+/// so they only work in the browser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MfaMethod {
+    /// A code from an authenticator app.
+    Totp,
+    /// One of the account's single-use recovery codes.
+    Recovery,
+}
+
+/// The server's answer to a correct password when a second factor is needed
+/// (403 with `code: "mfa_required"`).
+#[derive(Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct MfaChallenge {
+    /// Readable explanation of the next step.
+    #[serde(rename = "error")]
+    pub message: String,
+    /// Sign-in ticket for `/api/mfa/*`: valid for 10 minutes, single use.
+    pub mfa_token: String,
+    pub stage: MfaStage,
+    /// Verify: the methods the account has. Enroll: the methods it can set up.
+    #[serde(default)]
+    pub methods: Vec<String>,
+    /// Enroll: a code emailed to the account must be confirmed first.
+    #[serde(default)]
+    pub email_code_required: bool,
+    #[serde(default)]
+    pub email_hint: Option<String>,
+    #[serde(default)]
+    pub passkeys_available: bool,
+}
+
+/// What a password sign-in led to.
+#[derive(Debug)]
+pub enum LoginOutcome {
+    SignedIn(AuthResponse),
+    SecondFactor(MfaChallenge),
+}
+
+/// Tokens for a sign-in finished with a second factor.
+#[derive(Debug, serde::Deserialize)]
+pub struct MfaVerified {
+    pub access_token: String,
+    pub refresh_token: String,
+    /// Set when a recovery code was used: how many unused ones are left.
+    #[serde(default)]
+    pub recovery_codes_remaining: Option<u32>,
+}
+
+#[derive(serde::Serialize)]
+struct MfaVerifyRequest<'a> {
+    method: MfaMethod,
+    code: &'a str,
 }
 
 /// Durable storage for the session's tokens, so rotated tokens survive restarts.
@@ -54,7 +125,10 @@ impl ApiClient {
     pub fn new(base_url: &str) -> Self {
         ApiClient {
             base_url: base_url.trim_end_matches('/').to_string(),
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("HTTP client"),
             session: Mutex::new(Session::default()),
             device_id: None,
             persistence: None,
@@ -92,6 +166,19 @@ impl ApiClient {
         self.session().refresh.is_some()
     }
 
+    pub fn is_device_bound(&self, device: &str) -> bool {
+        self.access_token()
+            .and_then(|token| {
+                let payload = token.split('.').nth(1)?;
+                let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(payload)
+                    .ok()?;
+                let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+                claims.get("device_id")?.as_str().map(|id| id == device)
+            })
+            .unwrap_or(false)
+    }
+
     fn session(&self) -> MutexGuard<'_, Session> {
         self.session.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -110,7 +197,9 @@ impl ApiClient {
             .post(format!("{}/api/auth/refresh", self.base_url))
             .json(&RefreshRequest {
                 refresh_token: &refresh,
-                device_id: self.device_id.as_deref(),
+                // The server preserves an existing binding. Legacy unbound sessions
+                // reconnect through a fresh device proof, never a refresh parameter.
+                device_id: None,
             })
             .send()
             .await?;
@@ -199,19 +288,24 @@ impl ApiClient {
             .send()
             .await?;
 
-        if resp.status() == StatusCode::CREATED {
+        // The server answers 200 with a generic message (it never reveals whether the
+        // account already existed)
+        if resp.status().is_success() {
             Ok(())
         } else {
             Err(read_error(resp).await)
         }
     }
 
+    /// Signs in with a password. When the account needs a second factor the server
+    /// answers with a [`MfaChallenge`] instead of tokens; finish it with
+    /// [`ApiClient::verify_mfa`].
     pub async fn login(
         &mut self,
         username: &str,
         password: &str,
         device_name: &str,
-    ) -> Result<AuthResponse, ApiError> {
+    ) -> Result<LoginOutcome, ApiError> {
         let resp = self
             .client
             .post(format!("{}/api/auth/login", self.base_url))
@@ -223,13 +317,57 @@ impl ApiClient {
             .send()
             .await?;
 
-        if resp.status() == StatusCode::OK {
+        let status = resp.status();
+        if status == StatusCode::OK {
             let auth: AuthResponse = resp.json().await?;
             self.set_tokens(auth.access_token.clone(), auth.refresh_token.clone());
-            Ok(auth)
+            return Ok(LoginOutcome::SignedIn(auth));
+        }
+        let body = resp.text().await.unwrap_or_default();
+        if status == StatusCode::FORBIDDEN
+            && let Some(challenge) = parse_mfa_challenge(&body)
+        {
+            return Ok(LoginOutcome::SecondFactor(challenge));
+        }
+        Err(parse_error_body(status.as_u16(), &body))
+    }
+
+    /// Finishes a sign-in that needed a second factor, with the ticket (`mfa_token`)
+    /// of its [`MfaChallenge`]. Stores the session's tokens like [`ApiClient::login`].
+    pub async fn verify_mfa(
+        &mut self,
+        mfa_token: &str,
+        method: MfaMethod,
+        code: &str,
+    ) -> Result<MfaVerified, ApiError> {
+        let request = self.mfa_verify_request(mfa_token, method, code)?;
+        let resp = self.client.execute(request).await?;
+
+        if resp.status() == StatusCode::OK {
+            let verified: MfaVerified = resp.json().await?;
+            self.set_tokens(
+                verified.access_token.clone(),
+                verified.refresh_token.clone(),
+            );
+            Ok(verified)
         } else {
             Err(read_error(resp).await)
         }
+    }
+
+    /// The ticket authorizes this request instead of the session's access token.
+    fn mfa_verify_request(
+        &self,
+        mfa_token: &str,
+        method: MfaMethod,
+        code: &str,
+    ) -> Result<reqwest::Request, ApiError> {
+        let mut request = self
+            .request(Method::POST, "/api/mfa/verify")
+            .json(&MfaVerifyRequest { method, code })
+            .build()?;
+        set_bearer(&mut request, mfa_token);
+        Ok(request)
     }
 
     // === Devices ===
@@ -237,25 +375,49 @@ impl ApiClient {
     pub async fn register_device(
         &mut self,
         name: &str,
-        public_key: Vec<u8>,
-        public_key_sig: Option<Vec<u8>>,
+        key_pair: &crate::crypto::keys::KeyPair,
         fingerprint: Option<String>,
     ) -> Result<RegisterDeviceResponse, ApiError> {
-        let resp =
-            self.send_authed(self.request(Method::POST, "/api/devices").json(
-                &RegisterDeviceRequest {
-                    name: name.to_string(),
-                    public_key,
-                    public_key_sig,
-                    fingerprint,
-                },
-            ))
+        let response = self
+            .send_authed(self.request(Method::POST, "/api/devices/challenge"))
             .await?;
+        if !response.status().is_success() {
+            return Err(read_error(response).await);
+        }
+        let challenge: DeviceChallengeResponse = response.json().await?;
+        let proof = DeviceSessionProof {
+            signature: key_pair.sign_message(&device_proof_transcript(&challenge.challenge)),
+            challenge: challenge.challenge,
+        };
+        // Do not retry this one-use proof with a different bearer session.
+        let mut request = self
+            .request(Method::POST, "/api/devices")
+            .json(&RegisterDeviceRequest {
+                name: name.to_string(),
+                public_key: key_pair.public_key_bytes(),
+                public_key_sig: Some(key_pair.sign_public_key()),
+                fingerprint,
+                proof: Some(proof),
+            })
+            .build()?;
+        self.authorize(&mut request);
+        let resp = self.client.execute(request).await?;
 
         let status = resp.status();
         if status == StatusCode::CREATED || status == StatusCode::OK {
             let result: RegisterDeviceResponse = resp.json().await?;
-            self.session().access = non_empty(result.access_token.clone());
+            if result.access_token.is_empty() || result.refresh_token.is_empty() {
+                return Err(ApiError::Server {
+                    status: 502,
+                    code: Some("protocol_upgrade_required".into()),
+                    message: "Server did not return a device-bound session; update the server"
+                        .into(),
+                });
+            }
+            self.set_tokens(result.access_token.clone(), result.refresh_token.clone());
+            if let Some(persistence) = &self.persistence {
+                persistence.save(&result.access_token, &result.refresh_token);
+            }
             self.set_device_id(Some(result.device.id.clone()));
             Ok(result)
         } else {
@@ -283,31 +445,6 @@ impl ApiClient {
         self.authed_get_json("/api/devices/keys").await
     }
 
-    // === Group Key ===
-
-    pub async fn get_group_key(&self) -> Result<Option<GroupKeyResponse>, ApiError> {
-        let resp = self
-            .send_authed(self.request(Method::GET, "/api/group-key"))
-            .await?;
-        match resp.status() {
-            StatusCode::OK => Ok(Some(resp.json().await?)),
-            StatusCode::NOT_FOUND => Ok(None),
-            _ => Err(read_error(resp).await),
-        }
-    }
-
-    pub async fn store_group_keys(&self, keys: &[StoreGroupKeyEntry]) -> Result<(), ApiError> {
-        let resp = self
-            .send_authed(self.request(Method::POST, "/api/group-key").json(keys))
-            .await?;
-
-        if resp.status() == StatusCode::OK {
-            Ok(())
-        } else {
-            Err(read_error(resp).await)
-        }
-    }
-
     // === Device Approval ===
 
     pub async fn get_my_approval_status(&self) -> Result<ApprovalStatusResponse, ApiError> {
@@ -323,10 +460,13 @@ impl ApiClient {
         pending_device_id: &str,
     ) -> Result<ApprovalSessionResponse, ApiError> {
         let resp = self
-            .send_authed(self.request(
-                Method::POST,
-                &format!("/api/device-approvals/{pending_device_id}/begin"),
-            ))
+            .send_authed(
+                self.request(
+                    Method::POST,
+                    &format!("/api/device-approvals/{pending_device_id}/begin"),
+                )
+                .header("X-Cpmesh-Pairing", "2"),
+            )
             .await?;
         if resp.status() == StatusCode::OK {
             Ok(resp.json().await?)
@@ -353,6 +493,7 @@ impl ApiClient {
             StatusCode::OK => Ok(resp.json().await?),
             StatusCode::CONFLICT => Err(ApiError::Server {
                 status: 409,
+                code: None,
                 message: "version conflict — retry".to_string(),
             }),
             _ => Err(read_error(resp).await),
@@ -389,6 +530,7 @@ impl ApiClient {
             StatusCode::OK => Ok(resp.json().await?),
             StatusCode::NOT_FOUND => Err(ApiError::Server {
                 status: 404,
+                code: None,
                 message: "no group keys".to_string(),
             }),
             _ => Err(read_error(resp).await),
@@ -410,6 +552,7 @@ impl ApiClient {
             StatusCode::OK => Ok(resp.json().await?),
             StatusCode::CONFLICT => Err(ApiError::Server {
                 status: 409,
+                code: None,
                 message: "version conflict — retry".to_string(),
             }),
             _ => Err(read_error(resp).await),
@@ -512,12 +655,8 @@ impl ApiClient {
     }
 
     fn authorize(&self, request: &mut reqwest::Request) {
-        let Some(token) = self.access_token() else {
-            return;
-        };
-        if let Ok(mut value) = HeaderValue::from_str(&format!("Bearer {token}")) {
-            value.set_sensitive(true);
-            request.headers_mut().insert(AUTHORIZATION, value);
+        if let Some(token) = self.access_token() {
+            set_bearer(request, &token);
         }
     }
 
@@ -528,6 +667,14 @@ impl ApiClient {
         } else {
             Err(read_error(resp).await)
         }
+    }
+}
+
+/// Sets `Authorization: Bearer <token>`, marked sensitive so it stays out of logs.
+fn set_bearer(request: &mut reqwest::Request, token: &str) {
+    if let Ok(mut value) = HeaderValue::from_str(&format!("Bearer {token}")) {
+        value.set_sensitive(true);
+        request.headers_mut().insert(AUTHORIZATION, value);
     }
 }
 
@@ -568,25 +715,55 @@ async fn read_error(resp: reqwest::Response) -> ApiError {
 }
 
 /// Builds an [`ApiError::Server`] from a response body, preferring the server's
-/// `{"error": "..."}` message and falling back to the raw body.
+/// `{"error": "..."}` message (and its `code`, if any) and falling back to the raw body.
 fn parse_error_body(status: u16, body: &str) -> ApiError {
     if let Ok(err_obj) = serde_json::from_str::<serde_json::Value>(body)
         && let Some(msg) = err_obj.get("error").and_then(|v| v.as_str())
     {
+        let code = err_obj
+            .get("code")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        // Older errors put a code in `error` and the readable text in `message`
+        // (e.g. {"error": "email_not_verified", "message": "Please verify..."})
+        if let Some(readable) = err_obj.get("message").and_then(|v| v.as_str())
+            && code.is_none()
+            && !msg.contains(char::is_whitespace)
+        {
+            return ApiError::Server {
+                status,
+                code: Some(msg.to_string()),
+                message: readable.to_string(),
+            };
+        }
         return ApiError::Server {
             status,
+            code,
             message: msg.to_string(),
         };
     }
 
     ApiError::Server {
         status,
+        code: None,
         message: body.to_string(),
     }
 }
 
+/// Reads the second-factor challenge a correct password is answered with when the
+/// account needs one. `None` for any other error.
+fn parse_mfa_challenge(body: &str) -> Option<MfaChallenge> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    if value.get("code").and_then(|v| v.as_str()) != Some("mfa_required") {
+        return None;
+    }
+    serde_json::from_value::<MfaChallenge>(value)
+        .ok()
+        .filter(|challenge| !challenge.mfa_token.is_empty())
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -678,7 +855,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[derive(Debug)]
-    struct Recorded {
+    pub(crate) struct Recorded {
         method: String,
         path: String,
         authorization: Option<String>,
@@ -686,7 +863,9 @@ mod tests {
     }
 
     /// Serves `responses` in order, one per connection, recording each request.
-    async fn serve(responses: Vec<(u16, &'static str)>) -> (String, Arc<Mutex<Vec<Recorded>>>) {
+    pub(crate) async fn serve(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (String, Arc<Mutex<Vec<Recorded>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let log = Arc::new(Mutex::new(Vec::new()));
@@ -794,9 +973,9 @@ mod tests {
         );
         let refresh_body: serde_json::Value = serde_json::from_str(&log[1].body).unwrap();
         assert_eq!(refresh_body["refresh_token"], "refresh-1");
-        assert_eq!(
-            refresh_body["device_id"], "device-1",
-            "refreshed tokens stay bound"
+        assert!(
+            refresh_body.get("device_id").is_none(),
+            "refresh cannot choose a device"
         );
         assert_eq!(log[2].authorization.as_deref(), Some("Bearer access-2"));
 
@@ -878,9 +1057,64 @@ mod tests {
     fn parse_error_body_prefers_json_error_field() {
         let err = parse_error_body(401, r#"{"error":"invalid credentials"}"#);
         match err {
-            ApiError::Server { status, message } => {
+            ApiError::Server {
+                status,
+                code,
+                message,
+            } => {
                 assert_eq!(status, 401);
+                assert_eq!(code, None);
                 assert_eq!(message, "invalid credentials");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_error_body_keeps_the_code_of_structured_errors() {
+        let err = parse_error_body(
+            429,
+            r#"{"error":"Too many failed attempts. Try again in 15 minutes.","code":"mfa_locked"}"#,
+        );
+        match err {
+            ApiError::Server {
+                status,
+                code,
+                message,
+            } => {
+                assert_eq!(status, 429);
+                assert_eq!(code.as_deref(), Some("mfa_locked"));
+                assert_eq!(
+                    message,
+                    "Too many failed attempts. Try again in 15 minutes."
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_error_body_shows_the_message_of_code_style_errors() {
+        let err = parse_error_body(
+            403,
+            r#"{"error":"email_not_verified","message":"Please verify your email address before logging in."}"#,
+        );
+        match err {
+            ApiError::Server { code, message, .. } => {
+                assert_eq!(code.as_deref(), Some("email_not_verified"));
+                assert_eq!(
+                    message,
+                    "Please verify your email address before logging in."
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        // A readable `error` stays the message even when `message` is present
+        let err = parse_error_body(400, r#"{"error":"bad input here","message":"detail"}"#);
+        match err {
+            ApiError::Server { code, message, .. } => {
+                assert_eq!(code, None);
+                assert_eq!(message, "bad input here");
             }
             other => panic!("unexpected error: {other:?}"),
         }
@@ -895,8 +1129,13 @@ mod tests {
             "{",
         ] {
             match parse_error_body(500, body) {
-                ApiError::Server { status, message } => {
+                ApiError::Server {
+                    status,
+                    code,
+                    message,
+                } => {
                     assert_eq!(status, 500);
+                    assert_eq!(code, None);
                     assert_eq!(message, body);
                 }
                 other => panic!("unexpected error: {other:?}"),
@@ -908,8 +1147,243 @@ mod tests {
     fn api_error_display_includes_status_and_message() {
         let err = ApiError::Server {
             status: 409,
+            code: None,
             message: "version conflict".into(),
         };
         assert_eq!(err.to_string(), "Server error (409): version conflict");
+    }
+
+    // ---- two-factor sign-in ----------------------------------------------------
+
+    const VERIFY_CHALLENGE: &str = r#"{
+        "error": "Two-factor authentication is required: enter the code from your authenticator app or use a passkey.",
+        "code": "mfa_required",
+        "mfa_token": "ticket-1",
+        "stage": "verify",
+        "methods": ["totp", "webauthn", "recovery"],
+        "email_code_required": false,
+        "email_hint": null,
+        "passkeys_available": true
+    }"#;
+
+    #[test]
+    fn parses_the_second_factor_challenge() {
+        assert_eq!(
+            parse_mfa_challenge(VERIFY_CHALLENGE),
+            Some(MfaChallenge {
+                message: "Two-factor authentication is required: enter the code from your \
+                          authenticator app or use a passkey."
+                    .into(),
+                mfa_token: "ticket-1".into(),
+                stage: MfaStage::Verify,
+                methods: vec!["totp".into(), "webauthn".into(), "recovery".into()],
+                email_code_required: false,
+                email_hint: None,
+                passkeys_available: true,
+            })
+        );
+
+        let enroll = parse_mfa_challenge(
+            r#"{"error":"Set it up on the web dashboard.","code":"mfa_required","mfa_token":"ticket-2",
+                "stage":"enroll","methods":["totp"],"email_code_required":true,
+                "email_hint":"a***@example.com","passkeys_available":false}"#,
+        )
+        .unwrap();
+        assert_eq!(enroll.stage, MfaStage::Enroll);
+        assert_eq!(enroll.methods, ["totp"]);
+        assert!(enroll.email_code_required);
+        assert_eq!(enroll.email_hint.as_deref(), Some("a***@example.com"));
+        assert!(!enroll.passkeys_available);
+
+        // The hints are optional
+        let minimal = parse_mfa_challenge(
+            r#"{"error":"2FA","code":"mfa_required","mfa_token":"t","stage":"verify"}"#,
+        )
+        .unwrap();
+        assert!(minimal.methods.is_empty());
+        assert!(!minimal.email_code_required);
+        assert_eq!(minimal.email_hint, None);
+    }
+
+    #[test]
+    fn other_sign_in_errors_are_not_challenges() {
+        for body in [
+            r#"{"error":"invalid credentials"}"#,
+            r#"{"error":"This account is suspended.","code":"account_suspended"}"#,
+            r#"{"error":"email_not_verified","message":"Please verify your email address."}"#,
+            // The admin API asks for a verified session without issuing a ticket
+            r#"{"error":"Two-factor authentication required","code":"mfa_required","enrolled":true}"#,
+            r#"{"error":"2FA","code":"mfa_required","mfa_token":"","stage":"verify"}"#,
+            r#"{"error":"2FA","code":"mfa_required","mfa_token":"t","stage":"sms"}"#,
+            "<html>Forbidden</html>",
+            "",
+        ] {
+            assert_eq!(parse_mfa_challenge(body), None, "{body}");
+        }
+    }
+
+    #[test]
+    fn verify_request_sends_the_ticket_instead_of_the_session() {
+        let mut client = ApiClient::new("https://cpmesh.example/");
+        client.set_tokens("session-access".into(), "session-refresh".into());
+
+        for (method, code, wire) in [
+            (MfaMethod::Totp, "123456", "totp"),
+            (MfaMethod::Recovery, "abcd-efgh-ijkl-mnop", "recovery"),
+        ] {
+            let req = client.mfa_verify_request("ticket-1", method, code).unwrap();
+            assert_eq!(req.method(), Method::POST);
+            assert_eq!(req.url().as_str(), "https://cpmesh.example/api/mfa/verify");
+            let auth = req.headers().get("authorization").unwrap();
+            assert_eq!(auth.to_str().unwrap(), "Bearer ticket-1");
+            assert!(auth.is_sensitive());
+            let body = req.body().and_then(|b| b.as_bytes()).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(body).unwrap(),
+                serde_json::json!({ "method": wire, "code": code })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn login_pauses_for_the_second_factor() {
+        let (base_url, log) = serve(vec![(403, VERIFY_CHALLENGE)]).await;
+        let mut client = ApiClient::new(&base_url);
+
+        let outcome = client.login("alice", "pw", "Laptop").await.unwrap();
+        let LoginOutcome::SecondFactor(challenge) = outcome else {
+            panic!("expected a challenge, got {outcome:?}");
+        };
+        assert_eq!(challenge.mfa_token, "ticket-1");
+        assert_eq!(challenge.stage, MfaStage::Verify);
+        assert!(!client.has_session(), "no session before the second factor");
+
+        let log = log.lock().unwrap();
+        assert_eq!(
+            (log[0].method.as_str(), log[0].path.as_str()),
+            ("POST", "/api/auth/login")
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&log[0].body).unwrap(),
+            serde_json::json!({ "username": "alice", "password": "pw", "device_name": "Laptop" })
+        );
+    }
+
+    #[tokio::test]
+    async fn login_without_a_second_factor_signs_in_directly() {
+        let (base_url, _log) = serve(vec![(
+            200,
+            r#"{"access_token":"access-1","refresh_token":"refresh-1","user_id":"u1"}"#,
+        )])
+        .await;
+        let mut client = ApiClient::new(&base_url);
+
+        let outcome = client.login("alice", "pw", "Laptop").await.unwrap();
+        let LoginOutcome::SignedIn(auth) = outcome else {
+            panic!("expected tokens, got {outcome:?}");
+        };
+        assert_eq!(auth.user_id.as_deref(), Some("u1"));
+        assert_eq!(client.access_token().as_deref(), Some("access-1"));
+        assert_eq!(client.refresh_token().as_deref(), Some("refresh-1"));
+    }
+
+    #[tokio::test]
+    async fn login_reports_structured_errors_with_their_code() {
+        let (base_url, _log) = serve(vec![
+            (
+                403,
+                r#"{"error":"This account is suspended. Contact your administrator.","code":"account_suspended"}"#,
+            ),
+            (401, r#"{"error":"invalid credentials"}"#),
+        ])
+        .await;
+        let mut client = ApiClient::new(&base_url);
+
+        match client.login("alice", "pw", "Laptop").await {
+            Err(ApiError::Server {
+                status: 403,
+                code,
+                message,
+            }) => {
+                assert_eq!(code.as_deref(), Some("account_suspended"));
+                assert_eq!(
+                    message,
+                    "This account is suspended. Contact your administrator."
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match client.login("alice", "wrong", "Laptop").await {
+            Err(ApiError::Server {
+                status: 401,
+                code: None,
+                message,
+            }) => assert_eq!(message, "invalid credentials"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_mfa_stores_the_new_session() {
+        let (base_url, log) = serve(vec![(
+            200,
+            r#"{"access_token":"access-2","refresh_token":"refresh-2","recovery_codes_remaining":7}"#,
+        )])
+        .await;
+        let mut client = ApiClient::new(&base_url);
+
+        let verified = client
+            .verify_mfa("ticket-1", MfaMethod::Recovery, "abcd-efgh-ijkl-mnop")
+            .await
+            .unwrap();
+        assert_eq!(verified.recovery_codes_remaining, Some(7));
+        assert_eq!(client.access_token().as_deref(), Some("access-2"));
+        assert_eq!(client.refresh_token().as_deref(), Some("refresh-2"));
+
+        let log = log.lock().unwrap();
+        assert_eq!(
+            (log[0].method.as_str(), log[0].path.as_str()),
+            ("POST", "/api/mfa/verify")
+        );
+        assert_eq!(log[0].authorization.as_deref(), Some("Bearer ticket-1"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&log[0].body).unwrap(),
+            serde_json::json!({ "method": "recovery", "code": "abcd-efgh-ijkl-mnop" })
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_codes_leave_the_client_signed_out() {
+        let (base_url, _log) = serve(vec![
+            (401, r#"{"error":"invalid authentication code"}"#),
+            (
+                429,
+                r#"{"error":"Too many failed attempts. Try again in 15 minutes.","code":"mfa_locked"}"#,
+            ),
+        ])
+        .await;
+        let mut client = ApiClient::new(&base_url);
+
+        match client
+            .verify_mfa("ticket-1", MfaMethod::Totp, "000000")
+            .await
+        {
+            Err(ApiError::Server {
+                status: 401,
+                code: None,
+                message,
+            }) => assert_eq!(message, "invalid authentication code"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match client
+            .verify_mfa("ticket-1", MfaMethod::Totp, "000000")
+            .await
+        {
+            Err(ApiError::Server {
+                status: 429, code, ..
+            }) => assert_eq!(code.as_deref(), Some("mfa_locked")),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(!client.has_session());
     }
 }

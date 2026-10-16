@@ -151,12 +151,21 @@
 
 	onMount(() => {
 		loadHistory();
-		let unlisten: UnlistenFn | undefined;
-		listen<HistoryEntry>('clipboard-new', () => {
-			page = 0;
-			loadHistory();
-		}).then((u) => { unlisten = u; });
-		return () => { unlisten?.(); };
+		let disposed = false;
+		const unlisteners: UnlistenFn[] = [];
+		for (const event of ['clipboard-new', 'history-synced']) {
+			listen(event, () => {
+				page = 0;
+				if (query.trim()) doSearch(); else loadHistory();
+			}).then((unlisten) => {
+				if (disposed) unlisten(); else unlisteners.push(unlisten);
+			}).catch((cause) => { error = `History notifications unavailable: ${cause}`; });
+		}
+		return () => {
+			disposed = true;
+			clearTimeout(searchTimeout);
+			unlisteners.forEach((unlisten) => unlisten());
+		};
 	});
 </script>
 

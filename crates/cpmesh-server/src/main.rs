@@ -8,6 +8,7 @@ use cpmesh_server::config::Config;
 use cpmesh_server::db::Db;
 use cpmesh_server::pii::PiiService;
 use cpmesh_server::routes::auth::PkceCodeStore;
+use cpmesh_server::settings::SettingsCache;
 use cpmesh_server::ws::Hub;
 use cpmesh_server::{AppState, RateLimiters, email, routes, ws};
 
@@ -164,6 +165,7 @@ async fn main() {
         login: routes::middleware::build_rate_limiter(5), // 5 per minute
         register: routes::middleware::build_rate_limiter(3), // 3 per minute
         refresh: routes::middleware::build_rate_limiter(10), // 10 per minute
+        mfa: routes::middleware::build_rate_limiter(10),  // 10 per minute
     };
 
     let state = Arc::new(AppState {
@@ -175,6 +177,7 @@ async fn main() {
         email: email_svc,
         pkce_store: PkceCodeStore::new(),
         rate_limiters,
+        settings: SettingsCache::new(),
     });
 
     // Start background cleanup tasks

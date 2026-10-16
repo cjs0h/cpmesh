@@ -7,7 +7,8 @@
  * (setup_and_login / setup_group_key / connect / sync_history).
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { hostname } from "node:os";
 import {
   ApiError,
@@ -19,16 +20,20 @@ import {
   KeyPair,
   Keyring,
   deriveApprovalCode,
-  shortFingerprint,
+  fingerprintOfPublicKey,
 } from "./crypto.js";
 import {
   loadPinnedKeys,
+  loadMembership,
   loadSession,
-  savePinnedKeys,
   saveSession,
   statePaths,
   updateSession,
   clearAllState,
+  loadPushes,
+  savePushes,
+  type SavedPush,
+  withStateLock,
   type Session,
 } from "./state.js";
 import type {
@@ -38,10 +43,15 @@ import type {
   DeviceInfo,
   PlainEntry,
   RegisterDeviceRequest,
+  ClipboardReceipt,
 } from "./protocol.js";
+import { SignInFlow, type Account } from "./signin.js";
 import { WsClient, WsError } from "./ws.js";
+import { pinVerified, revokeDevice, rotateKeys, synchronizeKeys, SecurityError } from "./membership.js";
+export { SecurityError } from "./membership.js";
 
 const FINGERPRINT_SALT = "cpnet-device-fp-v1";
+const PAIRING_NEXT_STEP = "Independently compare all 64 fingerprint characters on both devices. Use cpmesh_status for the pairing_session_id, obtain the confirmed fingerprint from the user, call cpmesh_confirm_pairing, then cpmesh_wait_for_approval.";
 
 export class DeviceNotReadyError extends Error {
   constructor(
@@ -51,8 +61,6 @@ export class DeviceNotReadyError extends Error {
     super(message);
   }
 }
-
-export class SecurityError extends Error {}
 
 export interface ReadyState {
   session: Session;
@@ -77,9 +85,31 @@ export interface ClipboardItem {
   decrypted: boolean;
 }
 
+export interface PushResult {
+  sent: boolean;
+  persisted: boolean;
+  delivery: "unconfirmed";
+  entry_id: string;
+  request_id: string;
+  key_version: number;
+  size: number;
+}
+
 export class CpmeshDevice {
   readonly ws = new WsClient();
   private cached: ReadyState | null = null;
+  /** Keeps a sign-in that waits for its two-factor code (in memory only). */
+  private readonly signIns = new SignInFlow();
+  private pairing = new Map<string, { peerId: string; publicKey: string; fingerprint: string; expires: number }>();
+  private keyWork: Promise<unknown> = Promise.resolve();
+  private loading: Promise<ReadyState> | null = null;
+  private closing = false;
+  private sessionGeneration = 0;
+  private pushes = new Map<string, SavedPush>();
+
+  constructor() {
+    this.ws.onKeyChange = async () => { await this.refreshGroupKeys(); };
+  }
 
   deviceName(): string {
     return `MCP Agent - ${hostname()}`;
@@ -115,13 +145,25 @@ export class CpmeshDevice {
 
   // === Onboarding ===
 
+  /** The account whose sign-in waits for a two-factor code (see {@link SignInFlow.waiting}). */
+  waitingSignIn(serverUrl?: string, username?: string): Account | null {
+    return this.signIns.waiting(serverUrl, username);
+  }
+
+  /**
+   * Signs in and registers this device. With two-factor authentication the first
+   * call (password, no code) resolves `mfa_required`; a later call with the code
+   * finishes the sign-in, with or without the password.
+   */
   async login(
     serverUrl: string,
     username: string,
-    password: string,
+    password?: string,
+    mfaCode?: string,
   ): Promise<{
     status: string;
     approval_code?: string;
+    methods?: string[];
     message: string;
   }> {
     if (!/^https?:\/\//i.test(serverUrl)) {
@@ -130,27 +172,43 @@ export class CpmeshDevice {
 
     const deviceName = this.deviceName();
     const api = new CpmeshApi(serverUrl);
-    const auth = await api.login(username, password, deviceName);
+    const signedIn = await this.signIns.signIn(api, {
+      serverUrl,
+      username,
+      password,
+      code: mfaCode,
+      deviceName,
+    });
+    if (signedIn.status === "mfa_required") {
+      return { status: "mfa_required", methods: signedIn.methods, message: signedIn.message };
+    }
+    const { auth } = signedIn;
     api.setTokens(auth.access_token, auth.refresh_token);
-    const userId = auth.user_id ?? "";
+    // Tokens from the second-factor step come without the user ID
+    const userId = auth.user_id ?? (await api.getMe()).id;
+    return withStateLock(async () => {
+    const previous = loadSession();
+    if (previous && (previous.user_id !== userId || previous.server_url.replace(/\/+$/, "") !== serverUrl.replace(/\/+$/, ""))) {
+      throw new Error("Log out before switching accounts; do not reuse another account's keyring");
+    }
+    this.sessionGeneration++;
+    this.ws.close();
     const fingerprint = this.fingerprintFor(userId);
+    const recoveryNote =
+      signedIn.recoveryCodesRemaining === undefined
+        ? ""
+        : `Signed in with a recovery code (${signedIn.recoveryCodesRemaining} left). `;
 
     const paths = statePaths();
     const keypair = KeyPair.loadOrGenerate(paths.deviceKey);
 
     const reg = await api.registerDevice(
       this.registrationFor(keypair, deviceName, fingerprint),
+      (challenge) => keypair.signDeviceChallenge(challenge),
     );
 
     const deviceId = reg.device.id;
     const deviceStatus = reg.device.status;
-    const keyring = new Keyring();
-
-    if (deviceStatus === "approved") {
-      // First device in the account is auto-approved; set up its group key.
-      await this.setupGroupKey(api, keyring, keypair, deviceId);
-    }
-
     const session: Session = {
       server_url: serverUrl,
       user_id: userId,
@@ -168,7 +226,7 @@ export class CpmeshDevice {
     if (deviceStatus === "approved") {
       return {
         status: "approved",
-        message: `Logged in and approved. Device "${deviceName}" is ready to sync.`,
+        message: `${recoveryNote}Logged in as "${deviceName}". Keys are restored and authenticated on the next clipboard call. Existing meshes may require cpmesh_verify_device.`,
       };
     }
 
@@ -179,30 +237,40 @@ export class CpmeshDevice {
       status: "pending",
       approval_code: code,
       message:
-        `Logged in. Device "${deviceName}" is PENDING approval. ` +
+        `${recoveryNote}Logged in. Device "${deviceName}" is PENDING approval. ` +
         (code
-          ? `Pairing code: ${code}. Ask the user to confirm this code on one of their approved cpmesh devices, then call cpmesh_wait_for_approval.`
+          ? `Pairing fingerprint: ${code}. ${PAIRING_NEXT_STEP}`
           : `Ask the user to start the approval for this device from an approved cpmesh device, then call cpmesh_wait_for_approval.`),
     };
+    });
   }
 
   private derivePairingCode(
     keypair: KeyPair,
     status: ApprovalStatusResponse,
   ): string | undefined {
-    if (status.session_id && status.approver_public_key) {
-      try {
+    if (status.session_id && status.approver_public_key && status.approver_device_id) {
+        if (status.pairing_version !== 2) throw new SecurityError("Update both clients and server before full-fingerprint pairing");
         const approverPub = new Uint8Array(
           Buffer.from(status.approver_public_key, "base64"),
         );
-        return deriveApprovalCode(
+        const fingerprint = deriveApprovalCode(
           keypair.privateKey,
           approverPub,
           keypair.publicKey,
         );
-      } catch {
-        return undefined;
-      }
+        const old = this.pairing.get(status.session_id);
+        if (old && (old.publicKey !== status.approver_public_key || old.peerId !== status.approver_device_id)) {
+          throw new SecurityError("Pairing identity changed; do not approve");
+        }
+        if (!old) {
+          this.pairing.clear();
+          this.pairing.set(status.session_id, {
+          peerId: status.approver_device_id, publicKey: status.approver_public_key,
+          fingerprint, expires: Date.now() + 600_000,
+          });
+        }
+        return fingerprint;
     }
     return undefined;
   }
@@ -221,13 +289,20 @@ export class CpmeshDevice {
     let lastCode: string | undefined;
 
     while (Date.now() < deadline) {
-      const status = await api.getMyApprovalStatus();
+      if (this.closing) throw new Error("MCP connection closed");
+      const status = await this.withSession(session, () => api.getMyApprovalStatus());
 
       if (status.status === "approved") {
-        const keyring = new Keyring();
-        await this.setupGroupKey(api, keyring, keypair, session.device_id);
-        updateSession({ device_status: "approved" });
+        const pins = loadPinnedKeys();
+        if (session.device_status !== "approved" && !Object.keys(pins).some((id) => id !== session.device_id)) {
+          return {
+            approved: false, status: "verification_required", approval_code: lastCode,
+            message: "The relay says approved, but local trust is missing. Obtain the full fingerprint independently from the user, then call cpmesh_confirm_pairing (or cpmesh_verify_device after a restart).",
+          };
+        }
+        await this.withSession(session, () => updateSession({ device_status: "approved" }));
         this.cached = null;
+        await this.ensureReady();
         return {
           approved: true,
           status: "approved",
@@ -254,11 +329,19 @@ export class CpmeshDevice {
       status: "pending",
       approval_code: lastCode,
       message:
-        "Still pending approval. Ask the user to confirm the pairing code on an approved device, then call cpmesh_wait_for_approval again.",
+        `Still pending approval. ${PAIRING_NEXT_STEP}`,
     };
   }
 
   // === Readiness ===
+
+  private twoFactorNextStep(): string | null {
+    const waiting = this.signIns.waiting();
+    return waiting
+      ? `The sign-in as "${waiting.username}" is waiting for its two-factor code: ask the user for the current ` +
+          "6-digit code from their authenticator app (or a recovery code) and call cpmesh_login with it."
+      : null;
+  }
 
   private async requireSession(): Promise<{
     api: CpmeshApi;
@@ -269,10 +352,11 @@ export class CpmeshDevice {
     if (!session) {
       throw new DeviceNotReadyError(
         "cpmesh is not logged in",
-        "Call cpmesh_login with the user's server URL and credentials (or set CPMESH_SERVER_URL / CPMESH_USERNAME / CPMESH_PASSWORD).",
+        this.twoFactorNextStep() ??
+          "Call cpmesh_login with the user's server URL and credentials (or set CPMESH_SERVER_URL / CPMESH_USERNAME / CPMESH_PASSWORD).",
       );
     }
-    const keypair = KeyPair.loadOrGenerate(statePaths().deviceKey);
+    const keypair = KeyPair.load(statePaths().deviceKey);
     const api = this.buildApi(session, keypair);
     return { api, keypair, session };
   }
@@ -302,6 +386,7 @@ export class CpmeshDevice {
     api.rebind = async (a) => {
       const reg = await a.registerDevice(
         this.registrationFor(keypair, session.device_name, this.fingerprintOf(session)),
+        (challenge) => keypair.signDeviceChallenge(challenge),
         { retryOnExpiry: false },
       );
       if (reg.device.id !== session.device_id) {
@@ -311,7 +396,16 @@ export class CpmeshDevice {
     return api;
   }
 
-  async ensureReady(): Promise<ReadyState> {
+  private async loadReady(): Promise<ReadyState> {
+    const stored = loadSession();
+    if (!stored) {
+      this.ws.close();
+      this.cached = null;
+    } else if (this.cached && (stored.device_id !== this.cached.session.device_id ||
+        stored.user_id !== this.cached.session.user_id || stored.server_url !== this.cached.session.server_url)) {
+      this.ws.close();
+      this.cached = null;
+    }
     if (this.cached) return this.cached;
     const { api, keypair, session } = await this.requireSession();
 
@@ -331,21 +425,14 @@ export class CpmeshDevice {
       throw new DeviceNotReadyError(
         `device "${session.device_name}" is ${deviceStatus}`,
         code
-          ? `Ask the user to confirm pairing code ${code} on an approved device, then call cpmesh_wait_for_approval.`
+          ? `Pairing fingerprint: ${code}. ${PAIRING_NEXT_STEP}`
           : "Ask the user to approve this device from an approved cpmesh device, then call cpmesh_wait_for_approval.",
       );
     }
 
     // Load (or bootstrap) the group-key keyring.
-    let keyring: Keyring;
-    try {
-      keyring = Keyring.load(statePaths().keyring, keypair.privateKey);
-    } catch {
-      keyring = new Keyring();
-    }
-    if (!keyring.hasGroupKey()) {
-      await this.setupGroupKey(api, keyring, keypair, session.device_id);
-    }
+    const keyring = existsSync(statePaths().keyring)
+      ? Keyring.load(statePaths().keyring, keypair.privateKey) : new Keyring();
 
     const fingerprint = this.fingerprintOf(session);
     this.cached = { session, api, keypair, keyring, fingerprint };
@@ -354,187 +441,176 @@ export class CpmeshDevice {
 
   // === Group key management ===
 
-  /**
-   * Establishes the group key: unwrap the existing one from another device,
-   * or (first device in the account) create v1 and distribute wrapped copies.
-   */
-  private async setupGroupKey(
-    api: CpmeshApi,
-    keyring: Keyring,
-    keypair: KeyPair,
-    deviceId: string,
-  ): Promise<void> {
-    const gk = await api.getGroupKey();
-
-    if (gk) {
-      const peerPub = new Uint8Array(Buffer.from(gk.from_public_key, "base64"));
-
-      if (gk.from_public_key_sig) {
-        const sig = new Uint8Array(Buffer.from(gk.from_public_key_sig, "base64"));
-        if (!KeyPair.verifyPublicKeySignature(peerPub, sig)) {
-          throw new SecurityError(
-            `SECURITY: sender device ${gk.from_device_id} key signature invalid (possible MITM). Aborting group key import.`,
-          );
-        }
-      }
-
-      this.verifyAndPin(gk.from_device_id, peerPub);
-
-      keyring.decryptFromDevice(
-        new Uint8Array(Buffer.from(gk.encrypted_key, "base64")),
-        keypair.privateKey,
-        peerPub,
-        gk.version,
-      );
-    } else {
-      // First device — generate group key v1 and wrap it for every other
-      // approved device (there are none on a fresh account, but handle it).
-      keyring.initGroupKey();
-      const keysResp = await api.getDeviceKeys();
-      const entries = [];
-      for (const dev of keysResp.devices) {
-        if (dev.id === deviceId || dev.status !== "approved" || !dev.public_key) {
-          continue;
-        }
-        const peerPub = new Uint8Array(Buffer.from(dev.public_key, "base64"));
-        if (dev.public_key_sig) {
-          const sig = new Uint8Array(Buffer.from(dev.public_key_sig, "base64"));
-          if (!KeyPair.verifyPublicKeySignature(peerPub, sig)) {
-            continue; // skip devices with invalid key signatures
-          }
-        }
-        this.verifyAndPin(dev.id, peerPub);
-        entries.push({
-          device_id: dev.id,
-          encrypted_key: Buffer.from(
-            keyring.encryptForDevice(keypair.privateKey, peerPub),
-          ).toString("base64"),
-        });
-      }
-      // Always store, so version 1 is recorded server-side.
-      await api.storeGroupKeys(entries);
+  private sequenceKeys<T>(operation: () => Promise<T> | T): Promise<T> {
+    if (this.closing) return Promise.reject(new Error("Signing out"));
+    const session = loadSession();
+    if (!session) {
+      this.ws.close();
+      this.cached = null;
+      return Promise.reject(new DeviceNotReadyError("cpmesh is not logged in", this.twoFactorNextStep() ?? "Call cpmesh_login."));
     }
-
-    keyring.save(statePaths().keyring, keypair.privateKey);
+    const generation = this.sessionGeneration;
+    const work = this.keyWork.then(() => withStateLock(async () => {
+      if (this.closing || generation !== this.sessionGeneration || !sameDeviceSession(loadSession(), session)) {
+        throw new Error("Session changed");
+      }
+      const result = await operation();
+      if (this.closing || generation !== this.sessionGeneration) throw new Error("Session changed");
+      return result;
+    }));
+    // Callers see failures; later key operations can still retry safely.
+    this.keyWork = work.catch(() => undefined);
+    return work;
   }
 
-  /** TOFU: verify a peer's pinned key, pin it if new, fail loudly on change. */
-  private verifyAndPin(deviceId: string, publicKey: Uint8Array): void {
-    const pins = loadPinnedKeys();
-    const b64 = Buffer.from(publicKey).toString("base64");
-    const pinned = pins[deviceId];
-    if (pinned && pinned !== b64) {
-      throw new SecurityError(
-        `SECURITY: device ${deviceId} public key has CHANGED (was ${shortFingerprint(
-          new Uint8Array(Buffer.from(pinned, "base64")),
-        )}, now ${shortFingerprint(publicKey)}). This could indicate a ` +
-          `man-in-the-middle attack. If the device was legitimately re-created, ` +
-          `delete pinned_keys.json in the cpmesh MCP state directory and retry.`,
-      );
-    }
-    if (!pinned) {
-      pins[deviceId] = b64;
-      savePinnedKeys(pins);
-    }
+  private withSession<T>(session: Session, operation: () => Promise<T> | T): Promise<T> {
+    return withStateLock(() => {
+      const current = loadSession();
+      if (this.closing || !sameDeviceSession(current, session)) {
+        throw new Error("Session changed");
+      }
+      return operation();
+    });
   }
 
-  /** Re-fetches and unwraps group keys (handles rotation by other devices). */
+  private syncReady(): Promise<ReadyState> {
+    return this.sequenceKeys(async () => {
+      this.loading ??= this.loadReady().finally(() => { this.loading = null; });
+      const state = await this.loading;
+      const { api, keypair, keyring, session } = state;
+      const due = await synchronizeKeys(api, keyring, keypair, session.device_id);
+      if (due) await rotateKeys(api, keyring, keypair, session.device_id);
+      return state;
+    });
+  }
+
+  async ensureReady(): Promise<ReadyState> { return this.syncReady(); }
+
   async refreshGroupKeys(): Promise<number> {
-    const { api, keypair, keyring } = await this.ensureReady();
-    const resp = await api.getCurrentGroupKeys();
-    for (const entry of resp.keys) {
-      const peerPub = new Uint8Array(Buffer.from(entry.from_public_key, "base64"));
-      if (entry.from_public_key_sig) {
-        const sig = new Uint8Array(Buffer.from(entry.from_public_key_sig, "base64"));
-        if (!KeyPair.verifyPublicKeySignature(peerPub, sig)) {
-          continue;
-        }
+    return (await this.syncReady()).keyring.currentVersion;
+  }
+
+  async confirmPairing(sessionId: string, fingerprint: string): Promise<string> {
+    return this.sequenceKeys(() => {
+      const candidate = this.pairing.get(sessionId);
+      if (!candidate || candidate.expires < Date.now() ||
+          candidate.fingerprint !== normalizeFingerprint(fingerprint)) {
+        throw new SecurityError("Pairing fingerprint/session does not match or has expired");
       }
-      this.verifyAndPin(entry.from_device_id, peerPub);
-      keyring.decryptFromDevice(
-        new Uint8Array(Buffer.from(entry.encrypted_key, "base64")),
-        keypair.privateKey,
-        peerPub,
-        entry.version,
-      );
+      pinVerified(candidate.peerId, candidate.publicKey);
+      return "Approver identity verified locally. Wait for approval on the other device.";
+    });
+  }
+
+  async verifyDevice(deviceId: string, fingerprint: string): Promise<string> {
+    const generation = this.sessionGeneration;
+    const { api, session } = await this.requireSession();
+    const peer = (await this.withSession(session, () => api.getDeviceKeys())).devices.find((d) => d.id === deviceId && d.status === "approved");
+    if (!peer?.public_key) throw new Error("Approved peer device not found");
+    const expected = normalizeFingerprint(fingerprint);
+    if (expected.length !== 64 ||
+        normalizeFingerprint(fingerprintOfPublicKey(Buffer.from(peer.public_key, "base64"))) !== expected) {
+      throw new SecurityError("Full fingerprint does not match. Do not trust this device.");
     }
-    keyring.save(statePaths().keyring, keypair.privateKey);
-    this.cached = null;
-    return resp.current_version;
+    const publicKey = peer.public_key;
+    if (generation !== this.sessionGeneration) throw new Error("Session changed");
+    return this.sequenceKeys(() => {
+      if (!sameDeviceSession(loadSession(), session)) throw new Error("Session changed");
+      pinVerified(deviceId, publicKey);
+      return "Device identity verified. Future keys must be authorized by authenticated membership.";
+    });
   }
 
   // === Clipboard ===
 
-  async pushText(text: string): Promise<{
-    sent: boolean;
-    key_version: number;
-    size: number;
-  }> {
+  async pushText(text: string, requestId: string = randomUUID()): Promise<PushResult> {
+    requestId = requestId.toLowerCase();
+    const generation = this.sessionGeneration;
     const state = await this.ensureReady();
-    const { keypair, keyring } = state;
-
-    const data = new TextEncoder().encode(text);
-    const { data: encrypted, keyVersion } = keyring.encryptPayload(data);
-
-    const meta = JSON.stringify({
-      mime_type: "text/plain",
-      size: data.length,
-    });
-    const metaEncrypted = keyring.encryptPayload(new TextEncoder().encode(meta)).data;
-
+    if (this.closing || generation !== this.sessionGeneration) throw new Error("Session changed");
     try {
-      await this.wsPush(state, {
-        content_type: "text",
-        encrypted_data: Buffer.from(encrypted).toString("base64"),
-        metadata: Buffer.from(metaEncrypted).toString("base64"),
-        key_version: keyVersion,
-      });
-    } catch (e) {
-      // If another device rotated the group key, our version may be stale.
-      const msg = e instanceof Error ? e.message : String(e);
-      if (/rotation|version/i.test(msg)) {
+      return await this.withSession(state.session, () => this.pushPrepared(state, text, requestId, generation));
+    } catch (error) {
+      if (error instanceof WsError && error.code === "rotation_required") {
         await this.refreshGroupKeys();
-        return this.pushTextAfterRotation(text, keypair);
+        throw new WsError(`Keys changed before acceptance; retry request_id ${requestId}`, "rotation_required");
       }
-      throw e;
+      throw error;
     }
-
-    return { sent: true, key_version: keyVersion, size: data.length };
   }
 
-  private async pushTextAfterRotation(
-    text: string,
-    _keypair: KeyPair,
-  ): Promise<{ sent: boolean; key_version: number; size: number }> {
-    const state = await this.ensureReady();
+  private async pushPrepared(state: ReadyState, text: string, requestId: string, generation: number): Promise<PushResult> {
+    const trust = loadMembership();
+    if (trust.rotation_required || trust.version > state.keyring.currentVersion) {
+      throw new WsError("Keys changed before encryption", "rotation_required");
+    }
+    this.pushes = loadPushes(state.session.device_id);
     const { keyring } = state;
     const data = new TextEncoder().encode(text);
-    const { data: encrypted, keyVersion } = keyring.encryptPayload(data);
-    const meta = JSON.stringify({ mime_type: "text/plain", size: data.length });
-    const metaEncrypted = keyring.encryptPayload(new TextEncoder().encode(meta)).data;
-    await this.wsPush(state, {
-      content_type: "text",
-      encrypted_data: Buffer.from(encrypted).toString("base64"),
-      metadata: Buffer.from(metaEncrypted).toString("base64"),
-      key_version: keyVersion,
-    });
-    return { sent: true, key_version: keyVersion, size: data.length };
+    if (data.length > 1024 * 1024) throw new Error("Text exceeds 1 MiB");
+    const hash = createHash("sha256").update(data).digest("hex");
+    let pending = this.pushes.get(requestId);
+    if (pending && pending.hash !== hash) throw new Error("request_id already belongs to different clipboard content");
+    if (!pending) {
+      if (this.pushes.size >= 32) {
+        const completed = [...this.pushes].find(([, p]) => p.receipt !== undefined);
+        if (!completed) throw new Error("Too many unacknowledged pushes; retry their request IDs first");
+        this.pushes.delete(completed[0]);
+      }
+      const { data: encrypted, keyVersion } = keyring.encryptPayload(data);
+      const metadata = keyring.encryptPayload(new TextEncoder().encode(JSON.stringify({ mime_type: "text/plain", size: data.length }))).data;
+      pending = { hash, payload: {
+        request_id: requestId,
+        content_type: "text",
+        encrypted_data: Buffer.from(encrypted).toString("base64"),
+        metadata: Buffer.from(metadata).toString("base64"),
+        key_version: keyVersion,
+      } };
+      this.pushes.set(requestId, pending);
+      savePushes(state.session.device_id, this.pushes);
+    }
+    if (!pending.receipt) {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        if (this.closing || generation !== this.sessionGeneration) throw new Error("Session changed");
+        try {
+          pending.receipt = await this.wsPush(state, pending.payload);
+          if (this.closing || generation !== this.sessionGeneration) throw new Error("Session changed");
+          savePushes(state.session.device_id, this.pushes);
+          break;
+        }
+        catch (error) {
+          if (this.closing || generation !== this.sessionGeneration) throw new Error("Session changed");
+          if (error instanceof WsError && error.code === "rotation_required") {
+            this.pushes.delete(requestId);
+            savePushes(state.session.device_id, this.pushes);
+            throw new WsError(`Keys rotated before acceptance; retry request_id ${requestId}`, "rotation_required");
+          }
+          if (!(error instanceof WsError && error.uncertain && attempt === 0)) throw error;
+        }
+      }
+    }
+    if (!pending.receipt) throw new Error(`Persistence is unknown; retry request_id ${requestId}`);
+    return {
+      sent: true, persisted: true, delivery: "unconfirmed",
+      entry_id: pending.receipt.entry_id, request_id: requestId,
+      key_version: pending.payload.key_version, size: data.length,
+    };
   }
 
   /**
    * Pushes over the WebSocket. An expired access token makes the server reject
    * the upgrade with 401, so refresh the session once and retry.
    */
-  private async wsPush(state: ReadyState, payload: ClipboardPushPayload): Promise<void> {
+  private async wsPush(state: ReadyState, payload: ClipboardPushPayload): Promise<ClipboardReceipt> {
     const { session, api, fingerprint } = state;
     try {
-      await this.ws.pushClipboard(session.server_url, api.access ?? "", fingerprint, payload);
+      return await this.ws.pushClipboard(session.server_url, api.access ?? "", fingerprint, payload);
     } catch (e) {
       if (!(e instanceof WsError) || !/\b401\b/.test(e.message)) throw e;
       if (!(await api.refreshSession(api.access))) {
         throw new SessionExpiredError(SESSION_EXPIRED_MESSAGE);
       }
-      await this.ws.pushClipboard(session.server_url, api.access ?? "", fingerprint, payload);
+      return await this.ws.pushClipboard(session.server_url, api.access ?? "", fingerprint, payload);
     }
   }
 
@@ -542,8 +618,8 @@ export class CpmeshDevice {
     limit = 20,
     offset = 0,
   ): Promise<{ items: ClipboardItem[]; has_more: boolean }> {
-    const { api, keyring } = await this.ensureReady();
-    const resp = await api.getClipboardHistory(limit, offset);
+    const { api, keyring, session } = await this.ensureReady();
+    const resp = await this.withSession(session, () => api.getClipboardHistory(limit, offset));
     const items = resp.entries.map((e) => this.decryptEntry(keyring, e));
     return { items, has_more: resp.has_more };
   }
@@ -575,7 +651,8 @@ export class CpmeshDevice {
         }
       }
       if (!has_more) break;
-      offset += pageSize;
+      if (items.length === 0) throw new Error("History pagination made no progress");
+      offset += items.length;
     }
     return matches;
   }
@@ -643,38 +720,59 @@ export class CpmeshDevice {
   // === Devices & account ===
 
   async listDevices(): Promise<DeviceInfo[]> {
-    const { api } = await this.ensureReady();
-    return api.getDevices();
+    const { api, session } = await this.requireSession();
+    return this.withSession(session, () => api.getDevices());
+  }
+
+  async deleteClipboardEntry(id: string): Promise<void> {
+    const { api, session } = await this.requireSession();
+    await this.withSession(session, () => api.deleteClipboardEntry(id));
   }
 
   async removeDevice(deviceId: string, force = false): Promise<string> {
-    const { session, api } = await this.ensureReady();
+    const generation = this.sessionGeneration;
+    const { session, api } = await this.requireSession();
     if (deviceId === session.device_id && !force) {
       throw new Error(
         "Refusing to remove this MCP device's own registration (that would log the agent out). " +
           "Pass force=true if you really mean it, or tell the user to use cpmesh_logout instead.",
       );
     }
-    await api.deleteDevice(deviceId);
+    if (generation !== this.sessionGeneration) throw new Error("Session changed");
+    await this.sequenceKeys(async () => {
+      revokeDevice(deviceId);
+      await api.deleteDevice(deviceId);
+      if (deviceId !== session.device_id) {
+        const state = await this.loadReady();
+        const due = await synchronizeKeys(state.api, state.keyring, state.keypair, session.device_id);
+        if (due) await rotateKeys(state.api, state.keyring, state.keypair, session.device_id);
+      }
+    });
+    if (deviceId === session.device_id) await this.logout();
     return `Device ${deviceId} removed.`;
   }
 
   async status(): Promise<Record<string, unknown>> {
     const session = loadSession();
     if (!session) {
+      this.ws.close();
+      this.cached = null;
+      const twoFactor = this.twoFactorNextStep();
       return {
         logged_in: false,
+        ...(twoFactor && { two_factor_code_needed: true }),
         next_step:
+          twoFactor ??
           "Call cpmesh_login with the user's server URL and credentials (or set CPMESH_SERVER_URL / CPMESH_USERNAME / CPMESH_PASSWORD environment variables).",
       };
     }
-    const keypair = KeyPair.loadOrGenerate(statePaths().deviceKey);
+    const keypair = KeyPair.load(statePaths().deviceKey);
     const api = this.buildApi(session, keypair);
     const paths = statePaths();
 
     let approval: ApprovalStatusResponse | string;
     try {
-      approval = await api.getMyApprovalStatus();
+      approval = await this.withSession(session, () => api.getMyApprovalStatus());
     } catch (e) {
       approval =
         e instanceof ApiError || e instanceof SessionExpiredError
@@ -692,15 +790,10 @@ export class CpmeshDevice {
       code = this.derivePairingCode(keypair, approval);
     }
 
-    let keyVersion = 0;
-    let keyringOk = false;
-    try {
-      const ring = Keyring.load(paths.keyring, keypair.privateKey);
-      keyVersion = ring.currentVersion;
-      keyringOk = ring.hasGroupKey();
-    } catch {
-      // no keyring yet
-    }
+    const ring = existsSync(paths.keyring) ? Keyring.load(paths.keyring, keypair.privateKey) : new Keyring();
+    const keyVersion = ring.currentVersion;
+    const keyringOk = ring.hasGroupKey();
+    const pairing = [...this.pairing.entries()].at(-1);
 
     return {
       logged_in: true,
@@ -710,7 +803,10 @@ export class CpmeshDevice {
       device_name: session.device_name,
       device_status:
         typeof approval === "string" ? session.device_status : approval.status,
-      approval_code: code,
+      approval_code: code ?? pairing?.[1].fingerprint,
+      pairing_session_id: typeof approval === "string" ? pairing?.[0] : approval.session_id ?? pairing?.[0],
+      own_fingerprint: fingerprintOfPublicKey(keypair.publicKeyBytes()),
+      key_sync_error: this.ws.keyError,
       group_key_version: keyVersion,
       group_key_available: keyringOk,
       state_dir: paths.root,
@@ -719,20 +815,46 @@ export class CpmeshDevice {
           ? "Session exists but the server could not be reached or the session expired — try cpmesh_login again."
         : approval.status !== "approved"
           ? (code
-              ? `Ask the user to confirm pairing code ${code} on an approved device, then call cpmesh_wait_for_approval.`
+              ? `Pairing fingerprint: ${code}. ${PAIRING_NEXT_STEP}`
               : "Ask the user to approve this device from an approved cpmesh device, then call cpmesh_wait_for_approval.")
-          : !keyringOk
-            ? "Approved but group key missing — it will be synced on the next tool call, or call cpmesh_wait_for_approval."
+          : !keyringOk || loadMembership().version < keyVersion || loadMembership().rotation_required
+            ? "Keys need authenticated synchronization. Complete any pending device removal; for an existing mesh, verify peers independently with cpmesh_verify_device, then retry."
             : "Ready — clipboard tools are usable.",
     };
   }
 
   async logout(): Promise<string> {
+    this.closing = true;
+    this.sessionGeneration++;
     this.ws.close();
+    await this.keyWork;
+    await withStateLock(() => {
     this.cached = null;
+    this.signIns.clear();
+    this.pairing.clear();
+    this.pushes.clear();
     clearAllState();
+    });
+    this.closing = false;
     return "Logged out. Local keys, keyring and session were wiped.";
   }
+
+  stop(): void {
+    if (this.closing) return;
+    this.closing = true;
+    this.sessionGeneration++;
+    this.ws.close();
+    this.signIns.clear();
+    this.cached = null;
+  }
+
+}
+
+function normalizeFingerprint(value: string): string { return value.replace(/[\s:-]/g, "").toUpperCase(); }
+
+function sameDeviceSession(current: Session | null, expected: Session): boolean {
+  return current !== null && current.device_id === expected.device_id &&
+    current.user_id === expected.user_id && current.server_url === expected.server_url;
 }
 
 export function toPlainEntrySnapshot(entry: PlainEntry): Record<string, unknown> {

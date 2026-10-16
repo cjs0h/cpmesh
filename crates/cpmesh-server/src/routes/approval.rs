@@ -1,7 +1,7 @@
 use axum::{
     extract::{ConnectInfo, Extension, Path, State},
     http::StatusCode,
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use serde_json::json;
 use std::net::SocketAddr;
@@ -84,6 +84,7 @@ pub async fn handle_my_approval_status(
     json_response(
         StatusCode::OK,
         proto::ApprovalStatusResponse {
+            pairing_version: 2,
             status: device.status.parse().unwrap(),
             approver_device_id,
             approver_public_key,
@@ -98,7 +99,18 @@ pub async fn handle_begin_approval(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<AuthClaims>,
     Path(pending_device_id): Path<uuid::Uuid>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
+    if headers
+        .get("x-cpmesh-pairing")
+        .and_then(|v| v.to_str().ok())
+        != Some("2")
+    {
+        return json_error(
+            "update your client: full-fingerprint pairing is required",
+            StatusCode::UPGRADE_REQUIRED,
+        );
+    }
     let approver_device_id = match claims.device_id {
         Some(d) => d,
         None => return json_error("device context required", StatusCode::BAD_REQUEST),
@@ -142,6 +154,7 @@ pub async fn handle_begin_approval(
     json_response(
         StatusCode::OK,
         proto::ApprovalSessionResponse {
+            pairing_version: 2,
             session_id: session.id.to_string(),
             pending_device_id: pending_device_id.to_string(),
             pending_public_key: pending_device.public_key,
@@ -204,7 +217,7 @@ pub async fn handle_approve_device(
     }
 
     // Validate wrapped_keys covers all approved devices + the new device
-    let approved_devices = match state.db.get_approved_devices_by_user(claims.user_id).await {
+    let mut approved_devices = match state.db.get_approved_devices_by_user(claims.user_id).await {
         Ok(d) => d,
         Err(_) => {
             return json_error(
@@ -231,29 +244,28 @@ pub async fn handle_approve_device(
         );
     }
 
-    // Parse wrapped keys
-    let mut keys = Vec::new();
-    for entry in &req.wrapped_keys {
-        let did = match uuid::Uuid::parse_str(&entry.device_id) {
-            Ok(d) => d,
-            Err(_) => {
-                return json_error("invalid device_id in wrapped_keys", StatusCode::BAD_REQUEST);
-            }
-        };
-        keys.push((did, entry.encrypted_key.clone()));
+    approved_devices.push(pending_device.clone());
+    if let Err(error) = super::devices::validate_memberships(
+        &approved_devices,
+        approver_device_id,
+        req.new_version,
+        &req.wrapped_keys,
+    ) {
+        return error.into_response();
     }
 
     // Atomically: rotate group key (CAS) + approve device
     let success = match state
         .db
-        .rotate_group_key(
-            claims.user_id,
-            approver_device_id,
-            req.expected_current_version,
-            req.new_version,
-            &keys,
-            state.config.group_key_rotation_interval_hours,
-        )
+        .commit_key_rotation(crate::db::KeyRotation {
+            user_id: claims.user_id,
+            from_device_id: approver_device_id,
+            expected_current_version: req.expected_current_version,
+            new_version: req.new_version,
+            wrapped_keys: &req.wrapped_keys,
+            rotation_interval_hours: state.config.group_key_rotation_interval_hours,
+            approval: Some((pending_device_id, session.id)),
+        })
         .await
     {
         Ok(s) => s,
@@ -271,26 +283,6 @@ pub async fn handle_approve_device(
             StatusCode::CONFLICT,
         );
     }
-
-    // Mark device as approved
-    if let Err(e) = state
-        .db
-        .update_device_status(
-            pending_device_id,
-            claims.user_id,
-            "approved",
-            Some(approver_device_id),
-        )
-        .await
-    {
-        return json_error(
-            &format!("failed to approve device: {e}"),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        );
-    }
-
-    // Complete the session
-    let _ = state.db.complete_approval_session(session.id).await;
 
     // Notify all devices about key update
     let msg = cpmesh_proto::models::WsMessage {
@@ -312,8 +304,7 @@ pub async fn handle_approve_device(
     let uid = claims.user_id;
     let ip_str = ip.to_string();
     let dev_name = pending_device.name.clone();
-    tokio::spawn(async move {
-        let _ = sqlx::query(
+    if let Err(error) = sqlx::query(
             "INSERT INTO audit_logs (user_id, action, ip_address, user_agent, details) VALUES ($1, $2, $3, $4, $5)"
         )
         .bind(Some(uid))
@@ -322,8 +313,7 @@ pub async fn handle_approve_device(
         .bind(ua.as_deref())
         .bind(json!({"pending_device_id": pending_device_id.to_string(), "device_name": dev_name, "new_key_version": req.new_version}))
         .execute(&pool)
-        .await;
-    });
+        .await { tracing::warn!("Failed to persist audit entry: {error}"); }
 
     json_response(
         StatusCode::OK,
@@ -368,8 +358,7 @@ pub async fn handle_reject_device(
     let pool = state.db.pool.clone();
     let uid = claims.user_id;
     let ip_str = ip.to_string();
-    tokio::spawn(async move {
-        let _ = sqlx::query(
+    if let Err(error) = sqlx::query(
             "INSERT INTO audit_logs (user_id, action, ip_address, user_agent, details) VALUES ($1, $2, $3, $4, $5)"
         )
         .bind(Some(uid))
@@ -378,8 +367,7 @@ pub async fn handle_reject_device(
         .bind(ua.as_deref())
         .bind(json!({"pending_device_id": pending_device_id.to_string()}))
         .execute(&pool)
-        .await;
-    });
+        .await { tracing::warn!("Failed to persist audit entry: {error}"); }
 
     json_response(StatusCode::OK, json!({"message": "device rejected"}))
 }
