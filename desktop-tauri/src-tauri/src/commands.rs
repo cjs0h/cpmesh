@@ -2209,8 +2209,14 @@ pub async fn reject_pending_device(
 pub async fn get_my_approval_status(
     ctx: State<'_, AppContext>,
 ) -> Result<MyApprovalStatusInfo, String> {
-    // A device that registered before protocol 3 has no encryption key on the
-    // relay yet; the approver needs it to wrap the group key for us.
+    my_approval_status(&ctx).await
+}
+
+/// Pending device: keeps our encryption key published, then advances the pairing
+/// exchange the approver started.
+async fn my_approval_status(ctx: &AppContext) -> Result<MyApprovalStatusInfo, String> {
+    // The approver wraps the group key to the encryption key the relay lists for us;
+    // a device that registered before protocol 3 has not published one yet.
     if !ctx.encryption_key_published.load(Ordering::SeqCst) {
         let api = ctx.api.lock().await;
         let exchange = ctx.exchange.lock().await;
@@ -2235,7 +2241,7 @@ pub async fn get_my_approval_status(
         if resp.pairing_version != PAIRING_VERSION {
             return Err("Update the approving client and server".into());
         }
-        let kp = device_keys(&ctx)?.identity;
+        let kp = device_keys(ctx)?.identity;
         let peer = KeyPair::parse_public_key(approver_pub_bytes).map_err(|e| e.to_string())?;
         let fingerprint = derive_approval_code(&kp.public, &peer);
         // Phase 1 (pairing lock only): record the session and the commitment as
@@ -4482,6 +4488,42 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<SignInAction>(json!({"action": "set_aside_keys"})).unwrap(),
             SignInAction::SetAsideKeys
+        );
+    }
+
+    // ---- device approval -----------------------------------------------------
+
+    use crate::key_sync::tests::{NOT_APPROVED, requests, signed_in};
+
+    #[tokio::test]
+    async fn a_pending_device_publishes_its_key_and_reaches_its_approval_status() {
+        const WAITING: &str = r#"{"pairing_version":3,"status":"pending"}"#;
+        let (base_url, log) = serve(vec![
+            (403, NOT_APPROVED),
+            (204, ""),
+            (200, WAITING),
+            (200, WAITING),
+        ])
+        .await;
+        let (_dir, ctx) = context();
+        *ctx.api.lock().await = signed_in(&base_url);
+        ctx.config.write().await.device_id = uuid::Uuid::new_v4().to_string();
+        *ctx.exchange.lock().await =
+            Some(KeyExchange::new(crate::crypto::keys::DeviceKeys::generate()));
+
+        let status = my_approval_status(&ctx).await.unwrap();
+        assert_eq!(status.status, "pending");
+        assert!(!status.locally_verified);
+        // Published once, not on every poll.
+        my_approval_status(&ctx).await.unwrap();
+        assert_eq!(
+            requests(&log),
+            [
+                "GET /api/devices/keys",
+                "PUT /api/devices/me/encryption-key",
+                "GET /api/device-approvals/me",
+                "GET /api/device-approvals/me",
+            ]
         );
     }
 }

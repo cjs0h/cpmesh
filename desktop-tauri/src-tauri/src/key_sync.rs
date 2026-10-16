@@ -121,14 +121,21 @@ pub async fn publish_encryption_key(
     api: &ApiClient,
     own_id: &str,
 ) -> Result<(), String> {
-    let devices = api.get_device_keys().await.map_err(|e| e.to_string())?;
-    let published = devices
-        .devices
-        .iter()
-        .find(|d| d.id == own_id)
-        .and_then(|d| d.encryption_key.as_deref());
-    if published == Some(exchange.keys().encryption.public_key_bytes().as_slice()) {
-        return Ok(());
+    match api.get_device_keys().await {
+        Ok(devices) => {
+            let published = devices
+                .devices
+                .iter()
+                .find(|d| d.id == own_id)
+                .and_then(|d| d.encryption_key.as_deref());
+            if published == Some(exchange.keys().encryption.public_key_bytes().as_slice()) {
+                return Ok(());
+            }
+        }
+        // The listing is for approved devices only. A pending device still has to
+        // publish: its approver wraps the group key to this key.
+        Err(ApiError::Server { status: 403, .. }) => {}
+        Err(e) => return Err(e.to_string()),
     }
     api.publish_encryption_key(exchange.keys())
         .await
@@ -444,7 +451,7 @@ pub async fn rotate(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -816,5 +823,137 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(relay.lock().unwrap().current, 3, "no new key was needed");
+    }
+
+    // ---- encryption-key publication against a scripted relay ------------------
+
+    use crate::api::client::tests::serve;
+
+    pub(crate) const NOT_APPROVED: &str = r#"{"error":"device is not approved (status: pending). Approval from another device is required."}"#;
+
+    pub(crate) fn signed_in(base_url: &str) -> ApiClient {
+        let mut api = ApiClient::new(base_url);
+        api.set_tokens("access".into(), "refresh".into());
+        api
+    }
+
+    /// A scripted response body; the scripted relay serves `'static` strings.
+    pub(crate) fn body(value: impl serde::Serialize) -> &'static str {
+        Box::leak(serde_json::to_string(&value).unwrap().into_boxed_str())
+    }
+
+    /// The relay's listing with this device publishing `encryption_key`.
+    fn listing(own_id: &str, encryption_key: Option<Vec<u8>>) -> &'static str {
+        body(DeviceKeysResponse {
+            devices: vec![DeviceInfo {
+                id: own_id.into(),
+                name: "Mac".into(),
+                public_key: None,
+                public_key_sig: None,
+                encryption_key,
+                encryption_key_sig: None,
+                last_seen: None,
+                online: false,
+                status: DeviceStatus::Approved,
+            }],
+        })
+    }
+
+    /// "METHOD /path" of every request the scripted relay received, in order.
+    pub(crate) fn requests(
+        log: &std::sync::Mutex<Vec<crate::api::client::tests::Recorded>>,
+    ) -> Vec<String> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.path))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn pending_device_publishes_its_key_although_the_listing_is_closed_to_it() {
+        let (base_url, log) = serve(vec![(403, NOT_APPROVED), (204, "")]).await;
+        let exchange = KeyExchange::new(DeviceKeys::generate());
+
+        publish_encryption_key(&exchange, &signed_in(&base_url), "own")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            requests(&log),
+            [
+                "GET /api/devices/keys",
+                "PUT /api/devices/me/encryption-key"
+            ]
+        );
+        let sent: PublishEncryptionKeyRequest =
+            serde_json::from_str(&log.lock().unwrap()[1].body).unwrap();
+        assert_eq!(
+            sent.encryption_key,
+            exchange.keys().encryption.public_key_bytes()
+        );
+        // Certified by the identity the approver compares, so it can be wrapped to.
+        crate::crypto::keys::verify_encryption_key(
+            &exchange.key_pair().public,
+            &sent.encryption_key,
+            &sent.encryption_key_sig,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn approved_device_publishes_only_when_the_relay_lists_another_key() {
+        let exchange = KeyExchange::new(DeviceKeys::generate());
+        let own_key = exchange.keys().encryption.public_key_bytes();
+
+        let (base_url, log) = serve(vec![(200, listing("own", Some(own_key)))]).await;
+        publish_encryption_key(&exchange, &signed_in(&base_url), "own")
+            .await
+            .unwrap();
+        assert_eq!(requests(&log), ["GET /api/devices/keys"]);
+
+        let stale = DeviceKeys::generate().encryption.public_key_bytes();
+        for listed in [None, Some(stale)] {
+            let (base_url, log) = serve(vec![(200, listing("own", listed)), (204, "")]).await;
+            publish_encryption_key(&exchange, &signed_in(&base_url), "own")
+                .await
+                .unwrap();
+            assert_eq!(
+                requests(&log),
+                [
+                    "GET /api/devices/keys",
+                    "PUT /api/devices/me/encryption-key"
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn other_listing_failures_are_reported_without_publishing() {
+        let (base_url, log) = serve(vec![(500, r#"{"error":"database unavailable"}"#)]).await;
+        let exchange = KeyExchange::new(DeviceKeys::generate());
+
+        let error = publish_encryption_key(&exchange, &signed_in(&base_url), "own")
+            .await
+            .unwrap_err();
+        assert!(error.contains("database unavailable"), "{error}");
+        assert_eq!(requests(&log), ["GET /api/devices/keys"]);
+
+        // A rejected publication is reported as such.
+        let (base_url, _log) = serve(vec![
+            (403, NOT_APPROVED),
+            (
+                400,
+                r#"{"error":"encryption_key_sig is not a valid certification by public_key"}"#,
+            ),
+        ])
+        .await;
+        let error = publish_encryption_key(&exchange, &signed_in(&base_url), "own")
+            .await
+            .unwrap_err();
+        assert!(
+            error.starts_with("Could not publish the device encryption key"),
+            "{error}"
+        );
     }
 }
