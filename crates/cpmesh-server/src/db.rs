@@ -6,11 +6,82 @@ use crate::pii::PiiService;
 
 mod console;
 mod mfa;
+mod oauth;
 mod relay;
 
 pub use console::{AuditFilter, RoleChange, UserListFilter};
 pub use mfa::{EmailCodeCheck, MfaSummary};
-pub use relay::{ClipboardWrite, KeyRotation};
+pub use oauth::{GrantBinding, RemovedDevice, RevokedGrant};
+pub use relay::{ClipboardWrite, KeyRotation, NewDevice};
+
+/// What removing a device did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceRemoval {
+    /// The device was approved, so the group key must be rotated without it.
+    pub was_approved: bool,
+    /// The agent grant that was bound to the device, revoked with it.
+    pub revoked_grant: Option<uuid::Uuid>,
+}
+
+/// Deletes a device of `user_id` in `tx`, which holds the user's row lock: revokes the
+/// agent grant bound to it and, when it was approved, refuses writes until the group
+/// key is rotated without it. `None` when the user has no such device.
+async fn delete_locked_device(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    device_id: uuid::Uuid,
+    user_id: uuid::Uuid,
+) -> Result<Option<DeviceRemoval>, sqlx::Error> {
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM devices WHERE id = $1 AND user_id = $2 FOR UPDATE")
+            .bind(device_id)
+            .bind(user_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let Some(status) = status else {
+        return Ok(None);
+    };
+    let was_approved = status == "approved";
+    if was_approved {
+        sqlx::query(
+            "UPDATE users SET min_key_version = GREATEST(min_key_version,
+                COALESCE((SELECT MAX(version) FROM group_key_versions WHERE user_id = $1), 0) + 1)
+             WHERE id = $1",
+        )
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            "UPDATE group_key_versions SET rotation_due_at = NOW() WHERE user_id = $1 AND is_current",
+        )
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+    let revoked_grant = revoke_device_grant(tx, device_id).await?;
+    sqlx::query("DELETE FROM devices WHERE id = $1 AND user_id = $2")
+        .bind(device_id)
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(Some(DeviceRemoval {
+        was_approved,
+        revoked_grant,
+    }))
+}
+
+/// Revokes the agent grant in force for a device, if there is one.
+async fn revoke_device_grant(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    device_id: uuid::Uuid,
+) -> Result<Option<uuid::Uuid>, sqlx::Error> {
+    sqlx::query_scalar(
+        "UPDATE oauth_grants SET revoked_at = NOW()
+         WHERE device_id = $1 AND revoked_at IS NULL RETURNING id",
+    )
+    .bind(device_id)
+    .fetch_optional(&mut **tx)
+    .await
+}
 
 pub struct CreateUserParams<'a> {
     pub username: &'a str,
@@ -406,42 +477,23 @@ impl Db {
             .await
     }
 
+    /// Removes a device. When it was approved, writes are refused until the group key
+    /// is rotated without it; an agent grant bound to it is revoked with it.
     pub async fn delete_device(
         &self,
         device_id: uuid::Uuid,
         user_id: uuid::Uuid,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<DeviceRemoval, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
             .bind(user_id)
             .fetch_one(&mut *tx)
             .await?;
-        let status: String = sqlx::query_scalar(
-            "SELECT status FROM devices WHERE id = $1 AND user_id = $2 FOR UPDATE",
-        )
-        .bind(device_id)
-        .bind(user_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if status == "approved" {
-            sqlx::query(
-                "UPDATE users SET min_key_version = GREATEST(min_key_version,
-                    COALESCE((SELECT MAX(version) FROM group_key_versions WHERE user_id = $1), 0) + 1)
-                 WHERE id = $1",
-            ).bind(user_id).execute(&mut *tx).await?;
-            sqlx::query("UPDATE group_key_versions SET rotation_due_at = NOW() WHERE user_id = $1 AND is_current")
-                .bind(user_id).execute(&mut *tx).await?;
-        }
-        let result = sqlx::query("DELETE FROM devices WHERE id = $1 AND user_id = $2")
-            .bind(device_id)
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await?;
-        if result.rows_affected() == 0 {
-            return Err(sqlx::Error::RowNotFound);
-        }
+        let removal = delete_locked_device(&mut tx, device_id, user_id)
+            .await?
+            .ok_or(sqlx::Error::RowNotFound)?;
         tx.commit().await?;
-        Ok(())
+        Ok(removal)
     }
 
     pub async fn update_device_last_seen(&self, device_id: uuid::Uuid) -> Result<(), sqlx::Error> {
@@ -629,18 +681,26 @@ impl Db {
         .await
     }
 
+    /// Sets a device's status. Rejecting or revoking a device also revokes the agent
+    /// grant bound to it, which is returned.
     pub async fn update_device_status(
         &self,
         device_id: uuid::Uuid,
         user_id: uuid::Uuid,
         status: &str,
         approved_by: Option<uuid::Uuid>,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<Option<uuid::Uuid>, sqlx::Error> {
         let approved_at = if status == "approved" {
             Some(chrono::Utc::now())
         } else {
             None
         };
+        let mut tx = self.pool.begin().await?;
+        // The user lock orders this with binding and revoking agent grants
+        sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await?;
         let result = sqlx::query(
             "UPDATE devices SET status = $1, approved_at = COALESCE($2, approved_at), approved_by_device_id = COALESCE($3, approved_by_device_id) WHERE id = $4 AND user_id = $5"
         )
@@ -649,12 +709,18 @@ impl Db {
         .bind(approved_by)
         .bind(device_id)
         .bind(user_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {
             return Err(sqlx::Error::RowNotFound);
         }
-        Ok(())
+        let revoked_grant = if matches!(status, "rejected" | "revoked") {
+            revoke_device_grant(&mut tx, device_id).await?
+        } else {
+            None
+        };
+        tx.commit().await?;
+        Ok(revoked_grant)
     }
 
     pub async fn create_approval_session(
@@ -1939,6 +2005,25 @@ ALTER TABLE clipboard_entries ADD COLUMN IF NOT EXISTS sender_signature BYTEA;
 ALTER TABLE device_approval_sessions ADD COLUMN IF NOT EXISTS approver_commit BYTEA;
 ALTER TABLE device_approval_sessions ADD COLUMN IF NOT EXISTS pending_nonce BYTEA;
 ALTER TABLE device_approval_sessions ADD COLUMN IF NOT EXISTS approver_nonce BYTEA;
+
+-- OAuth for agents: one grant per agent authorization, bound to the agent's device once
+-- it registers. Revoking a grant removes its device; removing the device revokes it.
+CREATE TABLE IF NOT EXISTS oauth_grants (
+    id           UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    client_id    TEXT NOT NULL,
+    scopes       JSONB NOT NULL DEFAULT '[]'::jsonb,
+    device_id    UUID REFERENCES devices(id) ON DELETE SET NULL,
+    agent_name   TEXT NOT NULL DEFAULT '',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_used_at TIMESTAMPTZ,
+    revoked_at   TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_oauth_grants_user ON oauth_grants(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_oauth_grants_device ON oauth_grants(device_id);
+-- At most one grant in force per device
+CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_grants_active_device
+    ON oauth_grants(device_id) WHERE device_id IS NOT NULL AND revoked_at IS NULL;
 "#;
 
 #[cfg(test)]
@@ -2055,6 +2140,7 @@ mod tests {
             "api_tokens",
             "app_settings",
             "user_daily_activity",
+            "oauth_grants",
         ] {
             assert!(
                 SCHEMA.contains(&format!("CREATE TABLE IF NOT EXISTS {table}")),

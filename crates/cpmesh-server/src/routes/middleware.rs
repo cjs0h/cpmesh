@@ -12,6 +12,8 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use crate::AppState;
+use crate::oauth::AgentClaims;
+use crate::oauth::policy::AgentAccess;
 use crate::rbac::{self, Permission, Role};
 
 pub type IpRateLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
@@ -32,6 +34,8 @@ pub struct AuthClaims {
     pub mfa: bool,
     /// When the user last signed in or confirmed a second factor (0 when unknown).
     pub auth_time: u64,
+    /// The agent (OAuth client) the session belongs to; `None` for first-party apps.
+    pub agent: Option<AgentClaims>,
 }
 
 impl AuthClaims {
@@ -59,6 +63,8 @@ pub struct ApiError {
     message: Cow<'static, str>,
     code: Option<&'static str>,
     extra: Option<Box<serde_json::Value>>,
+    /// RFC 6750 bearer challenge, sent as `WWW-Authenticate`.
+    challenge: Option<Box<str>>,
 }
 
 impl ApiError {
@@ -68,6 +74,7 @@ impl ApiError {
             message: message.into(),
             code: None,
             extra: None,
+            challenge: None,
         }
     }
 
@@ -89,6 +96,12 @@ impl ApiError {
         self
     }
 
+    /// Sends `challenge` in the `WWW-Authenticate` header (RFC 6750 bearer errors).
+    pub fn with_challenge(mut self, challenge: impl Into<Box<str>>) -> Self {
+        self.challenge = Some(challenge.into());
+        self
+    }
+
     /// An unexpected failure: logged, and reported without details.
     pub fn internal(error: impl std::fmt::Display) -> Self {
         tracing::warn!("request failed: {error}");
@@ -98,12 +111,16 @@ impl ApiError {
     pub fn status(&self) -> StatusCode {
         self.status
     }
+
+    pub fn code(&self) -> Option<&'static str> {
+        self.code
+    }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let extra = self.extra.map(|e| *e).unwrap_or_else(|| json!({}));
-        match self.code {
+        let mut response = match self.code {
             Some(code) => json_error_code(code, &self.message, self.status, extra),
             None => {
                 let mut body = json!({"error": self.message});
@@ -114,7 +131,15 @@ impl IntoResponse for ApiError {
                 }
                 (self.status, axum::Json(body)).into_response()
             }
+        };
+        if let Some(challenge) = self.challenge
+            && let Ok(value) = header::HeaderValue::from_str(&challenge)
+        {
+            response
+                .headers_mut()
+                .insert(header::WWW_AUTHENTICATE, value);
         }
+        response
     }
 }
 
@@ -152,34 +177,35 @@ pub(crate) async fn authenticate(
 }
 
 /// Confirms the user still exists, is not suspended, and has not revoked all sessions
-/// since `claims` were issued.
+/// since `claims` were issued; for an agent, also that its grant is still in force.
 pub(crate) async fn check_session(state: &AppState, claims: &AuthClaims) -> Result<(), Rejection> {
-    match state.db.get_user_by_id(claims.user_id).await {
-        Ok(user) => {
-            // Check if token was issued before bulk revocation
-            if let Some(revoked_before) = user.tokens_revoked_before
-                && revoked_before > 0
-                && (claims.session_started_at() as i64) < revoked_before
-            {
-                return Err(Rejection::new(
-                    StatusCode::UNAUTHORIZED,
-                    "session has been revoked, please log in again",
-                ));
-            }
-            if user.is_suspended() {
-                return Err(Rejection::coded(
-                    StatusCode::UNAUTHORIZED,
-                    "account_suspended",
-                    "this account is suspended",
-                ));
-            }
-            Ok(())
-        }
-        Err(_) => Err(Rejection::new(
+    let user = state.db.get_user_by_id(claims.user_id).await.map_err(|_| {
+        Rejection::new(
             StatusCode::UNAUTHORIZED,
             "user no longer exists, please re-register or log in again",
-        )),
+        )
+    })?;
+    // Check if token was issued before bulk revocation
+    if let Some(revoked_before) = user.tokens_revoked_before
+        && revoked_before > 0
+        && (claims.session_started_at() as i64) < revoked_before
+    {
+        return Err(Rejection::new(
+            StatusCode::UNAUTHORIZED,
+            "session has been revoked, please log in again",
+        ));
     }
+    if user.is_suspended() {
+        return Err(Rejection::coded(
+            StatusCode::UNAUTHORIZED,
+            "account_suspended",
+            "this account is suspended",
+        ));
+    }
+    if let Some(agent) = &claims.agent {
+        crate::oauth::grants::check_grant(state, claims, agent).await?;
+    }
+    Ok(())
 }
 
 /// Middleware that requires the device to be in "approved" status.
@@ -194,14 +220,18 @@ pub async fn approved_device_middleware(
         None => return json_error("unauthorized", StatusCode::UNAUTHORIZED),
     };
 
-    if let Err(rejection) = require_approved_device(&state, &claims).await {
+    // Agents may use their enrollment routes (such as /api/me) before approval
+    let enrolling = claims.agent.is_some()
+        && req.extensions().get::<AgentAccess>() == Some(&AgentAccess::Enrollment);
+    if !enrolling && let Err(rejection) = require_approved_device(&state, &claims).await {
         return rejection.into_response();
     }
 
     next.run(req).await
 }
 
-/// Sessions bound to a device may only proceed once that device is approved.
+/// Sessions bound to a device may only proceed once that device is approved. Agents
+/// always need an approved device of their own.
 pub(crate) async fn require_approved_device(
     state: &AppState,
     claims: &AuthClaims,
@@ -221,6 +251,8 @@ pub(crate) async fn require_approved_device(
                 return Err(Rejection::new(StatusCode::NOT_FOUND, "device not found"));
             }
         }
+    } else if claims.agent.is_some() {
+        return Err(crate::oauth::policy::device_required());
     }
     Ok(())
 }
@@ -301,6 +333,10 @@ pub async fn admin_middleware(
 }
 
 async fn staff_context(state: &AppState, claims: AuthClaims) -> Result<AdminContext, ApiError> {
+    // Agents never act as staff
+    if claims.agent.is_some() {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "forbidden"));
+    }
     let user = match state.db.get_user_by_id(claims.user_id).await {
         Ok(user) => user,
         Err(_) => return Err(ApiError::new(StatusCode::FORBIDDEN, "forbidden")),
@@ -450,6 +486,10 @@ pub async fn mfa_principal_middleware(
     };
 
     let principal = if let Ok(claims) = state.auth.validate_access_token(&token) {
+        // Agents never manage the account's second factors
+        if claims.agent.is_some() {
+            return crate::oauth::policy::insufficient_scope(None).into_response();
+        }
         if let Err(rejection) = check_session(&state, &claims).await {
             return rejection.into_response();
         }

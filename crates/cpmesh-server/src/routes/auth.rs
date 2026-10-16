@@ -16,6 +16,7 @@ use super::middleware::{
     AuthClaims, extract_client_ip, json_error, json_error_code, json_response,
 };
 use crate::AppState;
+use crate::audit::RequestMeta;
 use crate::mfa::SignInStep;
 use crate::models::*;
 
@@ -576,15 +577,145 @@ pub struct RefreshBody {
 
 pub async fn handle_refresh(
     State(state): State<Arc<AppState>>,
+    meta: RequestMeta,
     axum::Json(req): axum::Json<RefreshBody>,
 ) -> Response {
+    let refresher = Refresher::FirstParty {
+        device_id: req.device_id,
+    };
+    match rotate_refresh_token(&state, &req.refresh_token, refresher, &meta).await {
+        Ok(session) => json_response(
+            StatusCode::OK,
+            json!({
+                "access_token": session.access_token,
+                "refresh_token": session.refresh_token,
+            }),
+        ),
+        Err(error) => error.into_response(),
+    }
+}
+
+/// Who presents a refresh token.
+#[derive(Clone, Copy, Debug)]
+pub enum Refresher<'a> {
+    /// A first-party app at `/api/auth/refresh`. `device_id` may assert the token's
+    /// device binding; it never selects a device.
+    FirstParty { device_id: Option<uuid::Uuid> },
+    /// An agent at the OAuth token endpoint, as the client it identified as.
+    Agent { client_id: &'a str },
+}
+
+/// A session rotated by [`rotate_refresh_token`].
+#[derive(Debug)]
+pub struct RotatedSession {
+    pub access_token: String,
+    pub refresh_token: String,
+    /// What the new tokens grant: the same session as before.
+    pub grant: SessionGrant,
+}
+
+/// Why a refresh token was not exchanged. Converts to the `/api/auth/refresh` error
+/// responses; the OAuth token endpoint maps it to RFC 6749 errors instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefreshError {
+    /// Malformed, expired, of another type, or for a user that no longer exists.
+    InvalidToken,
+    /// An agent's token at `/api/auth/refresh`, or at the token endpoint a token of
+    /// another client or of a first-party app.
+    WrongClient,
+    /// The user signed out everywhere (or changed the password) since the session began.
+    SessionRevoked,
+    AccountSuspended,
+    /// `device_id` names another device than the token's.
+    DeviceMismatch,
+    /// A token without a device was presented with one: register the device instead.
+    DeviceProofRequired,
+    /// The token's device was removed, rejected or revoked.
+    DeviceGone,
+    /// The agent's grant was revoked.
+    GrantRevoked,
+    /// A concurrent request rotated this token moments ago.
+    AlreadyUsed,
+    /// The token was used before, which is treated as theft: a first-party user's
+    /// sessions, or the agent's grant and device, were revoked.
+    Reused,
+    /// The token's state could not be confirmed; retry.
+    Unavailable,
+    Internal,
+}
+
+impl IntoResponse for RefreshError {
+    fn into_response(self) -> Response {
+        let unauthorized = StatusCode::UNAUTHORIZED;
+        match self {
+            RefreshError::InvalidToken => json_error("invalid refresh token", unauthorized),
+            RefreshError::WrongClient => json_error_code(
+                "oauth_client",
+                "agent sessions refresh at the OAuth token endpoint",
+                unauthorized,
+                json!({}),
+            ),
+            RefreshError::SessionRevoked => json_error(
+                "session has been revoked, please log in again",
+                unauthorized,
+            ),
+            RefreshError::AccountSuspended => json_error_code(
+                "account_suspended",
+                "this account is suspended",
+                unauthorized,
+                json!({}),
+            ),
+            RefreshError::DeviceMismatch => {
+                json_error("refresh token is bound to another device", unauthorized)
+            }
+            RefreshError::DeviceProofRequired => json_error(
+                "device proof required; reconnect using device registration",
+                unauthorized,
+            ),
+            RefreshError::DeviceGone => json_error(
+                "device is no longer registered, please log in again",
+                unauthorized,
+            ),
+            RefreshError::GrantRevoked => crate::oauth::grants::grant_revoked().into_response(),
+            // Another request rotated this token moments ago; the caller should pick
+            // up the rotated tokens instead.
+            RefreshError::AlreadyUsed => {
+                json_error("refresh token already used", StatusCode::CONFLICT)
+            }
+            RefreshError::Reused => json_error(
+                "session compromised, all sessions revoked — please log in again",
+                unauthorized,
+            ),
+            RefreshError::Unavailable => json_error(
+                "temporarily unavailable, please retry",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            RefreshError::Internal => {
+                json_error("internal error", StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        }
+    }
+}
+
+/// Exchanges a refresh token for a new token pair; shared by `/api/auth/refresh` and
+/// the OAuth token endpoint. Refresh tokens are single use: a second use within a short
+/// grace window is a benign race ([`RefreshError::AlreadyUsed`]), later it is theft.
+pub async fn rotate_refresh_token(
+    state: &AppState,
+    refresh_token: &str,
+    refresher: Refresher<'_>,
+    meta: &RequestMeta,
+) -> Result<RotatedSession, RefreshError> {
     use crate::routes::auth_service::{RefreshResult, RefreshTokenUse};
 
-    let (claims, jti, exp) = match state.auth.validate_refresh_token(&req.refresh_token) {
-        RefreshResult::Ok(claims, jti, exp) => (claims, jti, exp),
-        RefreshResult::Invalid(_) => {
-            return json_error("invalid refresh token", StatusCode::UNAUTHORIZED);
-        }
+    let RefreshResult::Ok(claims, jti, exp) = state.auth.validate_refresh_token(refresh_token)
+    else {
+        return Err(RefreshError::InvalidToken);
+    };
+    let requested_device = match (refresher, claims.agent) {
+        (Refresher::FirstParty { device_id }, None) => device_id,
+        (Refresher::Agent { client_id }, Some(agent)) if agent.client_id == client_id => None,
+        _ => return Err(RefreshError::WrongClient),
     };
 
     // Check bulk revocation. If the database is unreachable, recording the token
@@ -595,42 +726,45 @@ pub async fn handle_refresh(
                 && revoked_before > 0
                 && (claims.session_started_at() as i64) < revoked_before
             {
-                return json_error(
-                    "session has been revoked, please log in again",
-                    StatusCode::UNAUTHORIZED,
-                );
+                return Err(RefreshError::SessionRevoked);
             }
             if user.is_suspended() {
-                return json_error_code(
-                    "account_suspended",
-                    "this account is suspended",
-                    StatusCode::UNAUTHORIZED,
-                    json!({}),
-                );
+                return Err(RefreshError::AccountSuspended);
             }
         }
-        Err(sqlx::Error::RowNotFound) => {
-            return json_error("invalid refresh token", StatusCode::UNAUTHORIZED);
-        }
+        Err(sqlx::Error::RowNotFound) => return Err(RefreshError::InvalidToken),
         Err(_) => {}
     }
 
-    let device_id = match (claims.device_id, req.device_id) {
+    let device_id = match (claims.device_id, requested_device) {
         (Some(bound), Some(requested)) if bound != requested => {
-            return json_error(
-                "refresh token is bound to another device",
-                StatusCode::UNAUTHORIZED,
-            );
+            return Err(RefreshError::DeviceMismatch);
         }
         (Some(bound), _) => Some(bound),
-        (None, Some(_)) => {
-            return json_error(
-                "device proof required; reconnect using device registration",
-                StatusCode::UNAUTHORIZED,
-            );
-        }
+        (None, Some(_)) => return Err(RefreshError::DeviceProofRequired),
         (None, None) => None,
     };
+
+    // An agent's session ends with its grant, which also ends when its device goes
+    if let Some(agent) = claims.agent {
+        match state.db.get_oauth_grant(agent.grant_id).await {
+            Ok(Some(grant))
+                if crate::oauth::grants::grant_in_force(
+                    &grant,
+                    claims.user_id,
+                    &agent,
+                    device_id,
+                ) =>
+            {
+                crate::oauth::grants::note_use(state, &grant);
+            }
+            Ok(_) => return Err(RefreshError::GrantRevoked),
+            Err(e) => {
+                warn!("Failed to look up agent grant for token refresh: {e}");
+                return Err(RefreshError::Unavailable);
+            }
+        }
+    }
 
     // A device-bound session ends when its device is removed, rejected or revoked.
     if let Some(device_id) = device_id {
@@ -639,18 +773,10 @@ pub async fn handle_refresh(
                 if device.user_id == claims.user_id
                     && device.status != "rejected"
                     && device.status != "revoked" => {}
-            Ok(_) | Err(sqlx::Error::RowNotFound) => {
-                return json_error(
-                    "device is no longer registered, please log in again",
-                    StatusCode::UNAUTHORIZED,
-                );
-            }
+            Ok(_) | Err(sqlx::Error::RowNotFound) => return Err(RefreshError::DeviceGone),
             Err(e) => {
                 warn!("Failed to look up device for token refresh: {e}");
-                return json_error(
-                    "temporarily unavailable, please retry",
-                    StatusCode::SERVICE_UNAVAILABLE,
-                );
+                return Err(RefreshError::Unavailable);
             }
         }
     }
@@ -662,60 +788,81 @@ pub async fn handle_refresh(
         .await
     {
         Ok(RefreshTokenUse::First) => {}
-        Ok(RefreshTokenUse::Concurrent) => {
-            // Another request rotated this token moments ago; the caller should pick
-            // up the rotated tokens instead.
-            return json_error("refresh token already used", StatusCode::CONFLICT);
-        }
+        Ok(RefreshTokenUse::Concurrent) => return Err(RefreshError::AlreadyUsed),
         Ok(RefreshTokenUse::Reused) => {
-            // Token theft detected — revoke ALL tokens for this user
-            warn!(
-                "Refresh token reuse detected for user {}, revoking all sessions",
-                claims.user_id
-            );
-            let _ = state
-                .db
-                .revoke_all_user_tokens(claims.user_id, crate::routes::auth_service::now_epoch())
-                .await;
-            state.hub.disconnect_user(&claims.user_id.to_string()).await;
-            audit_log_fire(
-                &state.db.pool,
-                Some(claims.user_id),
-                AUDIT_TOKEN_REVOKE_ALL,
-                "unknown",
-                None,
-                &json!({"reason": "refresh_token_reuse"}),
-            )
-            .await;
-            return json_error(
-                "session compromised, all sessions revoked — please log in again",
-                StatusCode::UNAUTHORIZED,
-            );
+            refresh_token_reused(state, &claims, meta).await;
+            return Err(RefreshError::Reused);
         }
         Err(e) => {
             warn!("Failed to record refresh token use: {e}");
-            return json_error(
-                "temporarily unavailable, please retry",
-                StatusCode::SERVICE_UNAVAILABLE,
-            );
+            return Err(RefreshError::Unavailable);
         }
     }
 
     // The rotated session keeps how (and when) the user signed in
     let grant = SessionGrant::from_claims(&claims).with_device(device_id);
-    let (access_token, refresh_token) = match state.auth.issue_session(&grant) {
-        Ok(tokens) => tokens,
-        Err(_) => return json_error("internal error", StatusCode::INTERNAL_SERVER_ERROR),
-    };
-    crate::audit::record_activity(&state, claims.user_id).await;
+    let (access_token, refresh_token) = state
+        .auth
+        .issue_session(&grant)
+        .map_err(|_| RefreshError::Internal)?;
+    crate::audit::record_activity(state, claims.user_id).await;
+    Ok(RotatedSession {
+        access_token,
+        refresh_token,
+        grant,
+    })
+}
 
-    json_response(
-        StatusCode::OK,
-        json!({
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-        }),
+/// Responds to a refresh token used twice (theft). An agent loses its grant and its
+/// device; a first-party user loses every session.
+async fn refresh_token_reused(state: &AppState, claims: &AuthClaims, meta: &RequestMeta) {
+    if let Some(agent) = claims.agent {
+        warn!(
+            "Refresh token reuse detected for agent grant {} of user {}, revoking the grant",
+            agent.grant_id, claims.user_id
+        );
+        let revoked = crate::oauth::grants::revoke_grant(
+            state,
+            claims.user_id,
+            agent.grant_id,
+            crate::oauth::grants::RevokeReason::TokenReuse,
+            meta,
+        )
+        .await;
+        if let Err(e) = revoked {
+            warn!("Failed to revoke agent grant after refresh token reuse: {e}");
+        }
+        crate::audit::record(
+            state,
+            Some(claims.user_id),
+            None,
+            AUDIT_OAUTH_TOKEN_REUSE,
+            meta,
+            json!({ "grant_id": agent.grant_id, "client_id": agent.client_id }),
+        )
+        .await;
+        return;
+    }
+
+    // Token theft detected — revoke ALL tokens for this user
+    warn!(
+        "Refresh token reuse detected for user {}, revoking all sessions",
+        claims.user_id
+    );
+    let _ = state
+        .db
+        .revoke_all_user_tokens(claims.user_id, crate::routes::auth_service::now_epoch())
+        .await;
+    state.hub.disconnect_user(&claims.user_id.to_string()).await;
+    audit_log_fire(
+        &state.db.pool,
+        Some(claims.user_id),
+        AUDIT_TOKEN_REVOKE_ALL,
+        "unknown",
+        None,
+        &json!({"reason": "refresh_token_reuse"}),
     )
+    .await;
 }
 
 #[derive(Deserialize)]
@@ -745,6 +892,10 @@ pub async fn handle_native_code(
 ) -> Response {
     if !is_valid_code_challenge(&req.code_challenge) {
         return json_error("invalid code_challenge", StatusCode::BAD_REQUEST);
+    }
+    // An agent's session never becomes the desktop app's
+    if claims.agent.is_some() {
+        return crate::oauth::policy::insufficient_scope(None).into_response();
     }
     if !claims.authenticated_within(NATIVE_HANDOFF_WINDOW) {
         return json_error_code(

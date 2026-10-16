@@ -17,17 +17,20 @@ use serde_json::{Value, json};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{AssertSqlSafe, PgPool};
 
+use crate::audit::RequestMeta;
 use crate::config::Config;
-use crate::db::Db;
+use crate::db::{Db, GrantBinding};
 use crate::email::EmailService;
 use crate::mfa::totp;
 use crate::mfa::webauthn::tests::TestAuthenticator;
 use crate::mfa::webauthn::{b64url, b64url_decode};
-use crate::models::User;
+use crate::models::{OauthGrant, User};
+use crate::oauth::grants::{RevokeReason, revoke_grant};
+use crate::oauth::{AgentClaims, MCP_CLIENT_ID, Scope, Scopes};
 use crate::pii::PiiService;
 use crate::rbac::Role;
-use crate::routes::auth::PkceCodeStore;
-use crate::routes::auth_service::{AuthService, SessionGrant, now_epoch};
+use crate::routes::auth::{PkceCodeStore, RefreshError, Refresher, rotate_refresh_token};
+use crate::routes::auth_service::{AuthService, RefreshResult, SessionGrant, now_epoch};
 use crate::routes::middleware::build_rate_limiter;
 use crate::settings::SettingsCache;
 use crate::test_support::*;
@@ -547,6 +550,7 @@ struct Options {
     download_url_prefixes: Vec<String>,
     downloads_dir: Option<String>,
     updater_public_key: Option<String>,
+    refresh_reuse_grace: Option<std::time::Duration>,
 }
 
 async fn with_app<F, Fut>(options: Options, body: F)
@@ -596,18 +600,22 @@ where
         EmailService::disabled()
     };
     let keys = test_keys();
+    let mut auth = AuthService::new(
+        TEST_KID,
+        &keys.private_pem,
+        &keys.public_keys_json,
+        Some(pool.clone()),
+    )
+    .unwrap();
+    if let Some(grace) = options.refresh_reuse_grace {
+        auth = auth.with_refresh_reuse_grace(grace);
+    }
     let state = Arc::new(AppState {
         db,
         config,
         hub: Hub::new(),
         pii: Some(PiiService::new(TEST_PII_MASTER_KEY, TEST_PII_HMAC_KEY).unwrap()),
-        auth: AuthService::new(
-            TEST_KID,
-            &keys.private_pem,
-            &keys.public_keys_json,
-            Some(pool.clone()),
-        )
-        .unwrap(),
+        auth,
         email,
         pkce_store: PkceCodeStore::new(),
         rate_limiters: RateLimiters {
@@ -2031,6 +2039,711 @@ async fn an_enroll_ticket_cannot_add_a_factor_once_the_account_has_one() {
             let (status, body) = app.call("POST", path, Some(&ticket), None).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
         }
+    })
+    .await;
+}
+
+// ---- Agents (OAuth clients) ---------------------------------------------------
+
+/// A new cpmesh-mcp grant of `user`, and its session before the agent's device exists.
+async fn agent_grant(app: &TestApp, user: &User, scopes: &[Scope]) -> (OauthGrant, SessionGrant) {
+    let grant = app
+        .state
+        .db
+        .create_oauth_grant(user.id, MCP_CLIENT_ID, Scopes::of(scopes), "Test agent")
+        .await
+        .unwrap();
+    let session = SessionGrant::signed_in(user.id, true).with_agent(AgentClaims {
+        client_id: MCP_CLIENT_ID,
+        scopes: Scopes::of(scopes),
+        grant_id: grant.id,
+    });
+    (grant, session)
+}
+
+/// Registers the device holding `key`, with a fresh proof for `token`'s session.
+async fn register_device(
+    app: &TestApp,
+    token: &str,
+    key: &aws_lc_rs::signature::EcdsaKeyPair,
+    fingerprint: &str,
+) -> (StatusCode, Value) {
+    let (status, challenge) = app
+        .call("POST", "/api/devices/challenge", Some(token), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{challenge}");
+    let body = device_registration(key, challenge["challenge"].as_str().unwrap(), fingerprint);
+    app.call("POST", "/api/devices", Some(token), Some(body))
+        .await
+}
+
+fn registered_id(body: &Value) -> uuid::Uuid {
+    body["device"]["id"].as_str().unwrap().parse().unwrap()
+}
+
+/// Details of `user`'s audit entries for `action`, oldest first.
+async fn audit_details(app: &TestApp, user: &User, action: &str) -> Vec<Value> {
+    sqlx::query_scalar(
+        "SELECT details FROM audit_logs WHERE user_id = $1 AND action = $2 ORDER BY created_at",
+    )
+    .bind(user.id)
+    .bind(action)
+    .fetch_all(&app.state.db.pool)
+    .await
+    .unwrap()
+}
+
+async fn grant_revoked(app: &TestApp, grant_id: uuid::Uuid) -> bool {
+    let grant = app.state.db.get_oauth_grant(grant_id).await.unwrap();
+    grant.unwrap().revoked_at.is_some()
+}
+
+#[tokio::test]
+async fn agents_enroll_under_their_grant_and_use_only_what_it_allows() {
+    use aws_lc_rs::signature::KeyPair as _;
+    with_app(Options::default(), |app| async move {
+        let db = &app.state.db;
+        let auth = &app.state.auth;
+        let user = app.member("agent-owner").await;
+        let desktop = db
+            .create_device(
+                user.id,
+                "Desktop",
+                device_key().public_key().as_ref(),
+                None,
+                "approved",
+                None,
+            )
+            .await
+            .unwrap();
+        let (grant, session) =
+            agent_grant(&app, &user, &[Scope::ClipboardRead, Scope::ClipboardWrite]).await;
+        let token = auth.issue_access(&session).unwrap();
+
+        // Before its device exists, an agent can read the account and enroll, nothing else
+        let (status, me) = app.call("GET", "/api/me", Some(&token), None).await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        assert_eq!(me["id"], user.id.to_string());
+        let (status, body) = app.call("GET", "/api/devices", Some(&token), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["code"], "device_required");
+
+        let key = device_key();
+        let (status, registered) = register_device(&app, &token, &key, "agent").await;
+        assert_eq!(status, StatusCode::CREATED, "{registered}");
+        assert_eq!(registered["device"]["status"], "pending");
+        let device_id = registered_id(&registered);
+        assert_eq!(
+            db.get_oauth_grant(grant.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .device_id,
+            Some(device_id)
+        );
+        // The device's session is still the agent's
+        let device_token = registered["access_token"].as_str().unwrap().to_string();
+        let claims = auth.validate_access_token(&device_token).unwrap();
+        assert_eq!(
+            (claims.device_id, claims.agent),
+            (Some(device_id), session.agent)
+        );
+        let RefreshResult::Ok(refresh, _, _) =
+            auth.validate_refresh_token(registered["refresh_token"].as_str().unwrap())
+        else {
+            panic!("invalid refresh");
+        };
+        assert_eq!(refresh.agent, session.agent);
+
+        // While pending it sees its approval and the account, not the mesh
+        assert_eq!(
+            app.call("GET", "/api/device-approvals/me", Some(&device_token), None)
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.call("GET", "/api/me", Some(&device_token), None)
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.call("GET", "/api/devices", Some(&device_token), None)
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+
+        // One device per grant: the same key reconnects, another key is refused
+        let (status, body) = register_device(&app, &token, &key, "agent").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(registered_id(&body), device_id);
+        let (status, body) = register_device(&app, &token, &device_key(), "another").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["code"], "grant_device_mismatch");
+        assert_eq!(db.get_devices_by_user(user.id).await.unwrap().len(), 2);
+
+        // Once approved, it may do what its scopes allow
+        db.update_device_status(device_id, user.id, "approved", Some(desktop.id))
+            .await
+            .unwrap();
+        db.rotate_group_key(
+            user.id,
+            desktop.id,
+            0,
+            1,
+            &[(desktop.id, vec![1; 60]), (device_id, vec![2; 60])],
+            24,
+        )
+        .await
+        .unwrap();
+        for (method, uri, expected) in [
+            ("GET", "/api/devices".to_string(), StatusCode::OK),
+            ("GET", "/api/devices/keys".into(), StatusCode::OK),
+            ("GET", "/api/group-keys/current".into(), StatusCode::OK),
+            ("GET", "/api/clipboard".into(), StatusCode::OK),
+            ("GET", "/api/me".into(), StatusCode::OK),
+            (
+                "DELETE",
+                format!("/api/clipboard/{}", uuid::Uuid::new_v4()),
+                StatusCode::FORBIDDEN,
+            ),
+            ("DELETE", "/api/clipboard".into(), StatusCode::FORBIDDEN),
+            (
+                "DELETE",
+                format!("/api/devices/{}", desktop.id),
+                StatusCode::FORBIDDEN,
+            ),
+            ("POST", "/api/ws/ticket".into(), StatusCode::FORBIDDEN),
+            ("GET", "/api/me/subscription".into(), StatusCode::FORBIDDEN),
+            (
+                "GET",
+                "/api/device-approvals/pending".into(),
+                StatusCode::FORBIDDEN,
+            ),
+            ("GET", "/api/mfa".into(), StatusCode::FORBIDDEN),
+        ] {
+            let (status, body) = app.call(method, &uri, Some(&device_token), None).await;
+            assert_eq!(status, expected, "{method} {uri}: {body}");
+        }
+        assert!(db.get_device_by_id(desktop.id).await.is_ok());
+
+        // Every request checks the grant, and notes that it was used
+        let mut used = false;
+        for _ in 0..50 {
+            if db
+                .get_oauth_grant(grant.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_used_at
+                .is_some()
+            {
+                used = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(used, "last_used_at was never set");
+        let other = app.member("agent-stranger").await;
+        let (foreign, _) = agent_grant(&app, &other, &[Scope::ClipboardRead]).await;
+        for grant_id in [uuid::Uuid::new_v4(), foreign.id] {
+            let agent = AgentClaims {
+                grant_id,
+                ..session.agent.unwrap()
+            };
+            let forged = auth.issue_access(&session.with_agent(agent)).unwrap();
+            let (status, body) = app.call("GET", "/api/me", Some(&forged), None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+            assert_eq!(body["code"], "invalid_token");
+        }
+
+        // Revoking the grant removes its device the way removing a device does
+        assert!(!db.rotation_required(user.id).await.unwrap());
+        let meta = RequestMeta::default();
+        assert!(
+            revoke_grant(&app.state, user.id, grant.id, RevokeReason::User, &meta)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !revoke_grant(&app.state, user.id, grant.id, RevokeReason::User, &meta)
+                .await
+                .unwrap()
+        );
+        assert!(grant_revoked(&app, grant.id).await);
+        assert!(db.get_device_by_id(device_id).await.is_err());
+        assert!(
+            db.rotation_required(user.id).await.unwrap(),
+            "the group key must exclude it"
+        );
+        let (status, body) = app.call("GET", "/api/me", Some(&device_token), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        let audits = audit_details(&app, &user, "oauth.grant.revoke").await;
+        assert_eq!(audits.len(), 1, "{audits:?}");
+        assert_eq!(audits[0]["reason"], "user");
+        assert_eq!(audits[0]["device_id"], device_id.to_string());
+        assert_eq!(audits[0]["was_approved"], true);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn authorizing_again_moves_the_device_to_the_new_grant_without_pairing() {
+    with_app(Options::default(), |app| async move {
+        let db = &app.state.db;
+        let auth = &app.state.auth;
+        let user = app.member("agent-again").await;
+        let (old, old_session) = agent_grant(&app, &user, &[Scope::ClipboardRead]).await;
+        let old_token = auth.issue_access(&old_session).unwrap();
+        let key = device_key();
+        let (status, registered) = register_device(&app, &old_token, &key, "agent").await;
+        assert_eq!(status, StatusCode::CREATED, "{registered}");
+        assert_eq!(
+            registered["device"]["status"], "approved",
+            "the account's first device"
+        );
+        let device_id = registered_id(&registered);
+        let old_device_token = registered["access_token"].as_str().unwrap().to_string();
+
+        // Its tokens expired, so the agent is authorized again and reconnects its device
+        let (new, new_session) =
+            agent_grant(&app, &user, &[Scope::ClipboardRead, Scope::ClipboardWrite]).await;
+        let new_token = auth.issue_access(&new_session).unwrap();
+        let (status, body) = register_device(&app, &new_token, &key, "agent").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(registered_id(&body), device_id);
+        assert_eq!(body["device"]["status"], "approved", "still paired");
+        let new_device_token = body["access_token"].as_str().unwrap().to_string();
+        let claims = auth.validate_access_token(&new_device_token).unwrap();
+        assert_eq!(claims.agent.unwrap().grant_id, new.id);
+        assert_eq!(
+            db.get_oauth_grant(new.id).await.unwrap().unwrap().device_id,
+            Some(device_id)
+        );
+
+        // The old grant is superseded: revoked, without its device
+        assert!(grant_revoked(&app, old.id).await);
+        assert_eq!(
+            app.call("GET", "/api/devices", Some(&old_device_token), None)
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            app.call("GET", "/api/devices", Some(&new_device_token), None)
+                .await
+                .0,
+            StatusCode::OK
+        );
+        // ...and cannot take the device back
+        let (status, _) = app
+            .call("POST", "/api/devices/challenge", Some(&old_token), None)
+            .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let audits = audit_details(&app, &user, "oauth.grant.revoke").await;
+        assert_eq!(audits.len(), 1, "{audits:?}");
+        assert_eq!(audits[0]["reason"], "superseded");
+        assert_eq!(audits[0]["grant_id"], old.id.to_string());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn agent_refresh_rotates_within_the_grant_and_reuse_revokes_only_the_grant() {
+    let options = Options {
+        refresh_reuse_grace: Some(std::time::Duration::ZERO),
+        ..Options::default()
+    };
+    with_app(options, |app| async move {
+        let db = &app.state.db;
+        let auth = &app.state.auth;
+        let user = app.member("agent-refresh").await;
+        let (_, web_refresh) = auth
+            .issue_session(&SessionGrant::signed_in(user.id, true))
+            .unwrap();
+        let (grant, session) = agent_grant(&app, &user, &[Scope::ClipboardRead]).await;
+        let token = auth.issue_access(&session).unwrap();
+        let (status, registered) = register_device(&app, &token, &device_key(), "agent").await;
+        assert_eq!(status, StatusCode::CREATED, "{registered}");
+        let device_id = registered_id(&registered);
+        let refresh = registered["refresh_token"].as_str().unwrap().to_string();
+        let meta = RequestMeta::default();
+        let mcp = Refresher::Agent {
+            client_id: MCP_CLIENT_ID,
+        };
+
+        // Agents refresh only at the token endpoint, as their own client
+        let (status, body) = app
+            .call(
+                "POST",
+                "/api/auth/refresh",
+                None,
+                Some(json!({"refresh_token": refresh})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["code"], "oauth_client");
+        let other_client = Refresher::Agent {
+            client_id: "another-client",
+        };
+        assert_eq!(
+            rotate_refresh_token(&app.state, &refresh, other_client, &meta)
+                .await
+                .unwrap_err(),
+            RefreshError::WrongClient
+        );
+        assert_eq!(
+            rotate_refresh_token(&app.state, &web_refresh, mcp, &meta)
+                .await
+                .unwrap_err(),
+            RefreshError::WrongClient
+        );
+
+        let rotated = rotate_refresh_token(&app.state, &refresh, mcp, &meta)
+            .await
+            .unwrap();
+        assert_eq!(rotated.grant.agent, session.agent);
+        assert_eq!(rotated.grant.device_id, Some(device_id));
+        let RefreshResult::Ok(claims, _, exp) = auth.validate_refresh_token(&rotated.refresh_token)
+        else {
+            panic!("invalid refresh");
+        };
+        assert_eq!(claims.agent, session.agent);
+        assert!(exp > now_epoch() + 29 * 24 * 3600, "30-day sliding refresh");
+        assert_eq!(
+            app.call("GET", "/api/devices", Some(&rotated.access_token), None)
+                .await
+                .0,
+            StatusCode::OK
+        );
+
+        // Presenting the used token again is theft: the grant and its device go, while
+        // the user's other sessions stay
+        assert_eq!(
+            rotate_refresh_token(&app.state, &refresh, mcp, &meta)
+                .await
+                .unwrap_err(),
+            RefreshError::Reused
+        );
+        assert!(grant_revoked(&app, grant.id).await);
+        assert!(db.get_device_by_id(device_id).await.is_err());
+        assert_eq!(
+            rotate_refresh_token(&app.state, &rotated.refresh_token, mcp, &meta)
+                .await
+                .unwrap_err(),
+            RefreshError::GrantRevoked
+        );
+        assert_eq!(
+            app.call("GET", "/api/me", Some(&rotated.access_token), None)
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let user_row = db.get_user_by_id(user.id).await.unwrap();
+        assert_eq!(user_row.tokens_revoked_before.unwrap_or_default(), 0);
+        let (status, body) = app
+            .call(
+                "POST",
+                "/api/auth/refresh",
+                None,
+                Some(json!({"refresh_token": web_refresh})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let reuse = audit_details(&app, &user, "oauth.token.reuse").await;
+        assert_eq!(reuse.len(), 1);
+        assert_eq!(reuse[0]["grant_id"], grant.id.to_string());
+        let revocations = audit_details(&app, &user, "oauth.grant.revoke").await;
+        assert_eq!(revocations[0]["reason"], "token_reuse");
+        assert!(
+            audit_details(&app, &user, "token_revoke_all")
+                .await
+                .is_empty()
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn removing_or_rejecting_an_agents_device_revokes_its_grant() {
+    use aws_lc_rs::signature::KeyPair as _;
+    with_app(Options::default(), |app| async move {
+        let db = &app.state.db;
+        let auth = &app.state.auth;
+        let user = app.member("agent-devices").await;
+        let desktop = db
+            .create_device(
+                user.id,
+                "Desktop",
+                device_key().public_key().as_ref(),
+                None,
+                "approved",
+                None,
+            )
+            .await
+            .unwrap();
+        let desktop_token = auth
+            .issue_access(&SessionGrant::signed_in(user.id, true).with_device(Some(desktop.id)))
+            .unwrap();
+        let web = app.mfa_session(&user);
+
+        // Removed from the dashboard
+        let (removed, session) = agent_grant(&app, &user, &[Scope::ClipboardRead]).await;
+        let token = auth.issue_access(&session).unwrap();
+        let (status, registered) = register_device(&app, &token, &device_key(), "removed").await;
+        assert_eq!(status, StatusCode::CREATED, "{registered}");
+        let removed_device = registered_id(&registered);
+        let (status, _) = app
+            .call(
+                "DELETE",
+                &format!("/api/devices/{removed_device}"),
+                Some(&web),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(grant_revoked(&app, removed.id).await);
+
+        // Rejected by one of the user's devices
+        let (rejected, session) = agent_grant(&app, &user, &[Scope::ClipboardRead]).await;
+        let token = auth.issue_access(&session).unwrap();
+        let (status, registered) = register_device(&app, &token, &device_key(), "rejected").await;
+        assert_eq!(status, StatusCode::CREATED, "{registered}");
+        let rejected_device = registered_id(&registered);
+        let (status, body) = app
+            .call(
+                "POST",
+                &format!("/api/device-approvals/{rejected_device}/reject"),
+                Some(&desktop_token),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(grant_revoked(&app, rejected.id).await);
+        assert_eq!(
+            db.get_device_status(rejected_device).await.unwrap(),
+            "rejected"
+        );
+        let (status, _) = app.call("GET", "/api/me", Some(&token), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let reasons: Vec<Value> = audit_details(&app, &user, "oauth.grant.revoke")
+            .await
+            .into_iter()
+            .map(|d| d["reason"].clone())
+            .collect();
+        assert_eq!(reasons, [json!("device_removed"), json!("device_rejected")]);
+    })
+    .await;
+}
+
+/// The types of the messages a socket receives, up to and including the first `kind`.
+async fn messages_until(socket: &mut TestSocket, kind: &str) -> Vec<String> {
+    use futures_util::StreamExt;
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let mut kinds = Vec::new();
+        loop {
+            let message = socket.next().await.expect("socket closed").unwrap();
+            if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                let value: Value = serde_json::from_str(&text).unwrap();
+                kinds.push(value["type"].as_str().unwrap_or_default().to_string());
+                if kinds.last().is_some_and(|last| last == kind) {
+                    return kinds;
+                }
+            }
+        }
+    })
+    .await
+    .expect("message deadline")
+}
+
+#[tokio::test]
+async fn send_only_agents_push_without_receiving_entries() {
+    use aws_lc_rs::signature::KeyPair as _;
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    with_app(Options::default(), |app| async move {
+        let auth = &app.state.auth;
+        let user = app.member("send-only").await;
+        let db = &app.state.db;
+        let desktop_key = device_key();
+        let desktop = db
+            .create_device(
+                user.id,
+                "Desktop",
+                desktop_key.public_key().as_ref(),
+                None,
+                "approved",
+                None,
+            )
+            .await
+            .unwrap();
+        // Two paired agents: one may only send, the other only read
+        let mut agents = Vec::new();
+        for (name, scope) in [
+            ("Writer", Scope::ClipboardWrite),
+            ("Reader", Scope::ClipboardRead),
+        ] {
+            let (grant, session) = agent_grant(&app, &user, &[scope]).await;
+            let key = device_key();
+            let device = db
+                .create_device(
+                    user.id,
+                    name,
+                    key.public_key().as_ref(),
+                    None,
+                    "approved",
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                db.bind_oauth_grant_device(grant.id, user.id, device.id)
+                    .await
+                    .unwrap(),
+                GrantBinding::Bound { superseded: None }
+            );
+            let access = auth
+                .issue_access(&session.with_device(Some(device.id)))
+                .unwrap();
+            agents.push((key, device, access));
+        }
+        let [
+            (writer_key, writer, writer_access),
+            (reader_key, reader, reader_access),
+        ] = agents.try_into().ok().unwrap();
+        db.rotate_group_key(
+            user.id,
+            desktop.id,
+            0,
+            1,
+            &[
+                (desktop.id, vec![1; 60]),
+                (writer.id, vec![2; 60]),
+                (reader.id, vec![3; 60]),
+            ],
+            24,
+        )
+        .await
+        .unwrap();
+
+        // An agent that may neither read nor send cannot open the socket at all
+        let (_, session) = agent_grant(&app, &user, &[Scope::DevicesManage]).await;
+        let (status, body) = app
+            .call(
+                "GET",
+                "/ws",
+                Some(&auth.issue_access(&session).unwrap()),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["code"], "insufficient_scope");
+        // ...and a send-only one cannot read the history over HTTP either
+        assert_eq!(
+            app.call("GET", "/api/clipboard", Some(&writer_access), None)
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = app.router.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let desktop_access = auth
+            .issue_access(&SessionGrant::signed_in(user.id, true).with_device(Some(desktop.id)))
+            .unwrap();
+        let mut desktop_socket = open_socket(address, &desktop_access).await;
+        let mut writer_socket = open_socket(address, &writer_access).await;
+        let mut reader_socket = open_socket(address, &reader_access).await;
+        let now = chrono::Utc::now().timestamp_millis();
+
+        // The send-only agent pushes and gets its acknowledgement; the others get the entry
+        let push = signed_push(
+            &writer_key,
+            writer.id,
+            &uuid::Uuid::new_v4().to_string(),
+            1,
+            &[7; 48],
+            now,
+        );
+        writer_socket
+            .send(Message::Text(push.to_string().into()))
+            .await
+            .unwrap();
+        let ack = socket_message(&mut writer_socket, "clipboard_ack").await;
+        assert_eq!(ack["status"], "accepted", "{ack}");
+        assert_eq!(
+            socket_message(&mut desktop_socket, "clipboard_new").await["entry"]["id"],
+            ack["entry_id"]
+        );
+        assert_eq!(
+            socket_message(&mut reader_socket, "clipboard_new").await["entry"]["id"],
+            ack["entry_id"]
+        );
+
+        // ...but never receives an entry itself
+        let push = signed_push(
+            &desktop_key,
+            desktop.id,
+            &uuid::Uuid::new_v4().to_string(),
+            1,
+            &[8; 48],
+            now,
+        );
+        desktop_socket
+            .send(Message::Text(push.to_string().into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            socket_message(&mut desktop_socket, "clipboard_ack").await["status"],
+            "accepted"
+        );
+        assert_eq!(
+            socket_message(&mut reader_socket, "clipboard_new").await["entry"]["device_id"],
+            desktop.id.to_string()
+        );
+        // Messages arrive in order: whatever was sent to it before the pong is in by then
+        writer_socket
+            .send(Message::Text(json!({"type": "ping"}).to_string().into()))
+            .await
+            .unwrap();
+        let received = messages_until(&mut writer_socket, "pong").await;
+        assert!(
+            !received.iter().any(|kind| kind == "clipboard_new"),
+            "{received:?}"
+        );
+
+        // A read-only agent cannot push
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let push = signed_push(&reader_key, reader.id, &request_id, 1, &[9; 48], now);
+        reader_socket
+            .send(Message::Text(push.to_string().into()))
+            .await
+            .unwrap();
+        let ack = socket_message(&mut reader_socket, "clipboard_ack").await;
+        assert_eq!(ack["status"], "rejected", "{ack}");
+        assert_eq!(ack["code"], "insufficient_scope");
+        assert_eq!(ack["request_id"], request_id);
+        assert_eq!(db.count_user_clipboard_entries(user.id).await.unwrap(), 2);
+
+        // Device events still reach the send-only agent
+        reader_socket.close(None).await.unwrap();
+        let event = socket_message(&mut writer_socket, "device_status").await;
+        assert_eq!(event["device_id"], reader.id.to_string());
+        assert_eq!(event["online"], false);
+        server.abort();
+        let _ = server.await;
     })
     .await;
 }

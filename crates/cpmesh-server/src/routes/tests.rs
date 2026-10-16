@@ -121,6 +121,7 @@ fn browser_session() -> crate::routes::middleware::AuthClaims {
         session_start: 0,
         mfa: false,
         auth_time: 0,
+        agent: None,
     }
 }
 
@@ -509,4 +510,298 @@ async fn admin_routes_fail_closed_when_user_cannot_be_loaded() {
     .await;
     // auth_middleware runs first and cannot confirm the user exists
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ---- Agent tokens: default-deny scope policy ---------------------------------
+
+use crate::oauth::policy::{AGENT_ROUTES, agent_access};
+use crate::oauth::{AgentClaims, MCP_CLIENT_ID, Scope, Scopes};
+use crate::routes::auth_service::{RefreshResult, RefreshTokenUse, SessionGrant};
+
+/// Every (method, route template) the router registers. axum has no API to list
+/// routes, so this reads them from the router's `Debug` output.
+fn registered_routes(router: &axum::Router) -> Vec<(Method, String)> {
+    let dump = format!("{router:?}");
+    let start = dump
+        .find("path_router")
+        .expect("axum Router Debug format changed");
+    let end = dump
+        .find("fallback_router")
+        .expect("axum Router Debug format changed");
+    let dump = &dump[start..end];
+    let paths: std::collections::HashMap<&str, &str> =
+        regex::Regex::new(r#"RouteId\((\d+)\): "([^"]*)""#)
+            .unwrap()
+            .captures_iter(dump)
+            .map(|c| (c.get(1).unwrap().as_str(), c.get(2).unwrap().as_str()))
+            .collect();
+    let methods = [
+        Method::GET,
+        Method::HEAD,
+        Method::DELETE,
+        Method::OPTIONS,
+        Method::PATCH,
+        Method::POST,
+        Method::PUT,
+        Method::TRACE,
+        Method::CONNECT,
+    ];
+    let routers = regex::Regex::new(
+        r"RouteId\((\d+)\): MethodRouter\(MethodRouter \{ get: (\w+), head: (\w+), delete: (\w+), options: (\w+), patch: (\w+), post: (\w+), put: (\w+), trace: (\w+), connect: (\w+),",
+    )
+    .unwrap();
+    let mut routes = Vec::new();
+    let mut seen = 0;
+    for c in routers.captures_iter(dump) {
+        seen += 1;
+        let path = paths[c.get(1).unwrap().as_str()];
+        for (i, method) in methods.iter().enumerate() {
+            if &c[i + 2] != "None" {
+                routes.push((method.clone(), path.to_string()));
+            }
+        }
+    }
+    assert_eq!(seen, paths.len(), "axum Router Debug format changed");
+    routes
+}
+
+/// A request path for a route template, with every parameter filled in.
+fn concrete(template: &str) -> String {
+    regex::Regex::new(r"\{[^}]+\}")
+        .unwrap()
+        .replace_all(template, uuid::Uuid::new_v4().to_string())
+        .into_owned()
+}
+
+fn agent_session(scopes: &[Scope], device: bool) -> SessionGrant {
+    SessionGrant::signed_in(uuid::Uuid::new_v4(), true)
+        .with_device(device.then(uuid::Uuid::new_v4))
+        .with_agent(AgentClaims {
+            client_id: MCP_CLIENT_ID,
+            scopes: Scopes::of(scopes),
+            grant_id: uuid::Uuid::new_v4(),
+        })
+}
+
+async fn call_as(
+    app: &axum::Router,
+    method: &Method,
+    path: &str,
+    token: &str,
+) -> axum::http::Response<Body> {
+    send(
+        app,
+        request(method.as_str(), path)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+}
+
+fn insufficient_scope_challenge(resp: &axum::http::Response<Body>) -> Option<String> {
+    let challenge = resp.headers().get(header::WWW_AUTHENTICATE)?;
+    let challenge = challenge.to_str().unwrap().to_string();
+    challenge
+        .contains("error=\"insufficient_scope\"")
+        .then_some(challenge)
+}
+
+#[tokio::test]
+async fn agents_are_refused_on_every_route_the_policy_does_not_list() {
+    let state = test_state(test_config()).await;
+    let app = test_router(state.clone());
+    let routes = registered_routes(&app);
+    assert!(routes.len() > 75, "{routes:?}");
+    for (method, route, _) in AGENT_ROUTES {
+        assert!(
+            routes.contains(&(method.clone(), route.to_string())),
+            "{method} {route} is listed but not registered"
+        );
+    }
+
+    // Even with every scope and a device, only the listed routes get past the policy
+    // (to the session check, which fails here for want of a database).
+    let agent = state
+        .auth
+        .issue_access(&agent_session(&Scope::ALL, true))
+        .unwrap();
+    let first_party = state
+        .auth
+        .generate_access_token(uuid::Uuid::new_v4(), Some(uuid::Uuid::new_v4()))
+        .unwrap();
+    for (method, route) in &routes {
+        let path = concrete(route);
+        let resp = call_as(&app, method, &path, &agent).await;
+        let refused =
+            resp.status() == StatusCode::FORBIDDEN && insufficient_scope_challenge(&resp).is_some();
+        assert_eq!(
+            refused,
+            agent_access(method, route).is_none(),
+            "agent token on {method} {route}: {}",
+            resp.status()
+        );
+
+        let resp = call_as(&app, method, &path, &first_party).await;
+        assert!(
+            insufficient_scope_challenge(&resp).is_none(),
+            "first-party token refused on {method} {route}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn agents_never_reach_account_admin_or_other_devices_routes() {
+    let state = test_state(test_config()).await;
+    let app = test_router(state.clone());
+    let agent = state
+        .auth
+        .issue_access(&agent_session(&Scope::ALL, true))
+        .unwrap();
+    let id = uuid::Uuid::new_v4();
+    for (method, path) in [
+        (Method::POST, "/api/auth/native-code".to_string()),
+        (Method::PUT, "/api/me/password".into()),
+        (Method::GET, "/api/me/subscription".into()),
+        (Method::GET, "/api/mfa".into()),
+        (Method::POST, "/api/mfa/verify".into()),
+        (Method::POST, "/api/mfa/totp/setup".into()),
+        (Method::GET, "/api/admin/users".into()),
+        (Method::GET, "/api/admin/releases".into()),
+        (Method::POST, "/api/ws/ticket".into()),
+        (Method::DELETE, "/api/clipboard".into()),
+        (Method::GET, "/api/group-key".into()),
+        (Method::POST, "/api/group-key".into()),
+        (Method::GET, "/api/device-approvals/pending".into()),
+        (Method::POST, format!("/api/device-approvals/{id}/begin")),
+        (Method::GET, format!("/api/device-approvals/{id}/session")),
+        (Method::POST, format!("/api/device-approvals/{id}/reveal")),
+        (Method::POST, format!("/api/device-approvals/{id}/approve")),
+        (Method::POST, format!("/api/device-approvals/{id}/reject")),
+        (Method::POST, "/api/auth/refresh".into()),
+        (Method::GET, "/api/plans".into()),
+        (Method::GET, "/no/such/route".into()),
+    ] {
+        let resp = call_as(&app, &method, &path, &agent).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {path}");
+        assert_eq!(
+            insufficient_scope_challenge(&resp).as_deref(),
+            Some("Bearer error=\"insufficient_scope\""),
+            "{method} {path}"
+        );
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "insufficient_scope", "{method} {path}");
+    }
+}
+
+#[tokio::test]
+async fn agents_need_a_route_scope_and_a_paired_device() {
+    let state = test_state(test_config()).await;
+    let app = test_router(state.clone());
+    let token = |scopes: &[Scope], device: bool| {
+        state
+            .auth
+            .issue_access(&agent_session(scopes, device))
+            .unwrap()
+    };
+    let entry = format!("/api/clipboard/{}", uuid::Uuid::new_v4());
+
+    let read_only = token(&[Scope::ClipboardRead], true);
+    let resp = call_as(&app, &Method::DELETE, &entry, &read_only).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        insufficient_scope_challenge(&resp).as_deref(),
+        Some("Bearer error=\"insufficient_scope\", scope=\"clipboard:delete\"")
+    );
+    assert_eq!(body_json(resp).await["scope"], "clipboard:delete");
+    // A route its scope allows gets as far as the session check
+    let resp = call_as(&app, &Method::GET, "/api/clipboard", &read_only).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // The WebSocket opens with clipboard:read or clipboard:write
+    let resp = call_as(
+        &app,
+        &Method::GET,
+        "/ws",
+        &token(&[Scope::DevicesManage], true),
+    )
+    .await;
+    assert_eq!(
+        insufficient_scope_challenge(&resp).as_deref(),
+        Some("Bearer error=\"insufficient_scope\", scope=\"clipboard:read clipboard:write\"")
+    );
+    let resp = call_as(
+        &app,
+        &Method::GET,
+        "/ws",
+        &token(&[Scope::ClipboardWrite], true),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Before its device is registered, an agent can only enroll
+    let unpaired = token(&Scope::ALL, false);
+    for (method, path) in [
+        (Method::GET, "/api/devices"),
+        (Method::GET, "/api/group-keys/current"),
+        (Method::GET, "/api/clipboard"),
+        (Method::GET, "/ws"),
+    ] {
+        let resp = call_as(&app, &method, path, &unpaired).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {path}");
+        assert!(resp.headers().get(header::WWW_AUTHENTICATE).is_none());
+        assert_eq!(body_json(resp).await["code"], "device_required");
+    }
+    for (method, path) in [
+        (Method::GET, "/api/me"),
+        (Method::POST, "/api/devices/challenge"),
+        (Method::GET, "/api/device-approvals/me"),
+    ] {
+        let resp = call_as(&app, &method, path, &unpaired).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
+    }
+}
+
+#[tokio::test]
+async fn agent_refresh_tokens_are_refused_at_the_first_party_endpoint() {
+    let state = test_state(test_config()).await;
+    let app = test_router(state.clone());
+    let session = agent_session(&[Scope::ClipboardRead], true);
+    let refresh = state.auth.issue_refresh(&session).unwrap();
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/refresh",
+            serde_json::json!({"refresh_token": refresh}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(resp).await["code"], "oauth_client");
+
+    // Refused before it was used: it still works at the token endpoint
+    let RefreshResult::Ok(_, jti, exp) = state.auth.validate_refresh_token(&refresh) else {
+        panic!("agent refresh token rejected");
+    };
+    assert_eq!(
+        state
+            .auth
+            .consume_refresh_token(&jti, session.user_id, exp)
+            .await
+            .unwrap(),
+        RefreshTokenUse::First
+    );
+}
+
+#[tokio::test]
+async fn websocket_tickets_never_carry_agent_sessions() {
+    let app = test_router(test_state(test_config()).await);
+    let mut claims = browser_session();
+    claims.agent = agent_session(&Scope::ALL, true).agent;
+    let ticket = crate::routes::websocket::issue_ticket(claims, client_addr().ip()).await;
+    let resp = send(&app, ws_upgrade(&format!("/ws?ticket={ticket}"))).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(resp).await["error"], "invalid or expired ticket");
 }

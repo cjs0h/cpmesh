@@ -328,6 +328,28 @@ pub struct ApiToken {
     pub created_at: DateTime<Utc>,
 }
 
+/// An agent's authorization (OAuth grant). Bound to the agent's device once it
+/// registers; one grant per agent device.
+#[derive(Debug, Clone, FromRow)]
+pub struct OauthGrant {
+    pub id: uuid::Uuid,
+    pub user_id: uuid::Uuid,
+    pub client_id: String,
+    pub scopes: sqlx::types::Json<Vec<String>>,
+    pub device_id: Option<uuid::Uuid>,
+    /// Name the agent reported for itself when authorized.
+    pub agent_name: String,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+impl OauthGrant {
+    pub fn scopes(&self) -> crate::oauth::Scopes {
+        crate::oauth::Scopes::from_recorded(self.scopes.iter().map(String::as_str))
+    }
+}
+
 // Audit action constants
 pub const AUDIT_LOGIN_OK: &str = "login_success";
 pub const AUDIT_LOGIN_FAIL: &str = "login_failure";
@@ -377,6 +399,12 @@ pub const AUDIT_ADMIN_TEST_SMTP: &str = "admin_test_smtp";
 pub const AUDIT_ADMIN_TEST_OIDC: &str = "admin_test_oidc";
 pub const AUDIT_ADMIN_API_TOKEN_CREATE: &str = "admin_api_token_create";
 pub const AUDIT_ADMIN_API_TOKEN_REVOKE: &str = "admin_api_token_revoke";
+// OAuth for agents
+pub const AUDIT_OAUTH_GRANT_CREATE: &str = "oauth.grant.create";
+pub const AUDIT_OAUTH_GRANT_REVOKE: &str = "oauth.grant.revoke";
+pub const AUDIT_OAUTH_DEVICE_APPROVE: &str = "oauth.device.approve";
+pub const AUDIT_OAUTH_DEVICE_DENY: &str = "oauth.device.deny";
+pub const AUDIT_OAUTH_TOKEN_REUSE: &str = "oauth.token.reuse";
 
 /// Every audit action, for filtering in the admin console.
 pub const AUDIT_ACTIONS: &[&str] = &[
@@ -426,4 +454,9 @@ pub const AUDIT_ACTIONS: &[&str] = &[
     AUDIT_ADMIN_TEST_OIDC,
     AUDIT_ADMIN_API_TOKEN_CREATE,
     AUDIT_ADMIN_API_TOKEN_REVOKE,
+    AUDIT_OAUTH_GRANT_CREATE,
+    AUDIT_OAUTH_GRANT_REVOKE,
+    AUDIT_OAUTH_DEVICE_APPROVE,
+    AUDIT_OAUTH_DEVICE_DENY,
+    AUDIT_OAUTH_TOKEN_REUSE,
 ];

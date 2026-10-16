@@ -430,6 +430,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(mfa_routes)
         .merge(mfa_code_routes)
         .fallback(spa_handler)
+        // Default-deny for agent tokens. It wraps only the routes merged above, and sees
+        // which one matched.
+        .layer(axum_mw::from_fn_with_state(
+            state.clone(),
+            crate::oauth::policy::agent_policy_middleware,
+        ))
         .layer(axum_mw::from_fn(middleware::security_headers))
         .layer(cors)
         .with_state(state)

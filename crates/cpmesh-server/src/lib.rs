@@ -10,6 +10,7 @@ pub mod db;
 pub mod email;
 pub mod mfa;
 pub mod models;
+pub mod oauth;
 pub mod pii;
 pub mod rbac;
 pub mod routes;

@@ -2188,3 +2188,221 @@ async fn plans_cannot_be_assigned_to_missing_users() {
     })
     .await;
 }
+
+// ---- OAuth grants for agents -------------------------------------------------
+
+#[tokio::test]
+async fn oauth_grants_bind_to_one_device_and_end_with_it() {
+    with_db(|db| async move {
+        use cpmesh_proto::models::RegisterDeviceRequest;
+        use cpmesh_server::db::{DeviceRemoval, GrantBinding, NewDevice, RemovedDevice};
+        use cpmesh_server::oauth::{MCP_CLIENT_ID, Scope, Scopes};
+
+        let user = make_user(&db, "agent-owner", None).await;
+        let other = make_user(&db, "agent-stranger", None).await;
+        let scopes = Scopes::of(&[Scope::ClipboardRead, Scope::ClipboardWrite]);
+        let grant = db
+            .create_oauth_grant(user.id, MCP_CLIENT_ID, scopes, "Claude Code via cpmesh-mcp")
+            .await
+            .unwrap();
+        assert_eq!(grant.scopes(), scopes);
+        assert_eq!(grant.scopes.0, ["clipboard:read", "clipboard:write"]);
+        assert_eq!(grant.client_id, MCP_CLIENT_ID);
+        assert!(grant.device_id.is_none() && grant.revoked_at.is_none());
+        assert!(grant.last_used_at.is_none());
+        db.touch_oauth_grant(grant.id).await.unwrap();
+        let stored = db.get_oauth_grant(grant.id).await.unwrap().unwrap();
+        assert_eq!(stored.agent_name, "Claude Code via cpmesh-mcp");
+        assert!(stored.last_used_at.is_some());
+        assert!(
+            db.get_oauth_grant(uuid::Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // A device the agent registers is bound to its grant, which takes only one
+        let request = |name: &str, key: u8| RegisterDeviceRequest {
+            name: name.into(),
+            public_key: vec![key; 65],
+            public_key_sig: None,
+            encryption_key: None,
+            encryption_key_sig: None,
+            fingerprint: None,
+            proof: None,
+        };
+        let NewDevice::Registered(device) = db
+            .register_device(user.id, &request("Agent", 1), 10, Some(grant.id))
+            .await
+            .unwrap()
+        else {
+            panic!("device not registered");
+        };
+        assert_eq!(device.status, "approved", "the account's first device");
+        let bound = db.get_oauth_grant(grant.id).await.unwrap().unwrap();
+        assert_eq!(bound.device_id, Some(device.id));
+        assert!(matches!(
+            db.register_device(user.id, &request("Second", 2), 10, Some(grant.id))
+                .await
+                .unwrap(),
+            NewDevice::GrantHasDevice
+        ));
+        assert!(matches!(
+            db.register_device(other.id, &request("Foreign", 3), 10, Some(grant.id))
+                .await
+                .unwrap(),
+            NewDevice::GrantRevoked
+        ));
+        assert_eq!(db.get_devices_by_user(user.id).await.unwrap().len(), 1);
+
+        // Existing devices: the same one again, or another one
+        assert_eq!(
+            db.bind_oauth_grant_device(grant.id, user.id, device.id)
+                .await
+                .unwrap(),
+            GrantBinding::Unchanged
+        );
+        let laptop = make_device(&db, &user, "Laptop", "approved").await;
+        assert_eq!(
+            db.bind_oauth_grant_device(grant.id, user.id, laptop.id)
+                .await
+                .unwrap(),
+            GrantBinding::OtherDevice
+        );
+
+        // Authorizing again moves the device to the new grant and supersedes the old
+        // one; the device stays, still paired
+        let renewed = db
+            .create_oauth_grant(user.id, MCP_CLIENT_ID, scopes, "renewed")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.bind_oauth_grant_device(renewed.id, other.id, device.id)
+                .await
+                .unwrap(),
+            GrantBinding::Revoked,
+            "not that user's grant"
+        );
+        assert_eq!(
+            db.bind_oauth_grant_device(renewed.id, user.id, device.id)
+                .await
+                .unwrap(),
+            GrantBinding::Bound {
+                superseded: Some(grant.id)
+            }
+        );
+        let superseded = db.get_oauth_grant(grant.id).await.unwrap().unwrap();
+        assert!(superseded.revoked_at.is_some());
+        assert_eq!(db.get_device_status(device.id).await.unwrap(), "approved");
+        assert_eq!(
+            db.bind_oauth_grant_device(grant.id, user.id, device.id)
+                .await
+                .unwrap(),
+            GrantBinding::Revoked
+        );
+        assert!(
+            db.revoke_oauth_grant(grant.id, user.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "revoking a superseded grant leaves the device alone"
+        );
+        assert!(db.get_device_by_id(device.id).await.is_ok());
+
+        // At most one grant in force per device
+        let spare = db
+            .create_oauth_grant(user.id, MCP_CLIENT_ID, scopes, "spare")
+            .await
+            .unwrap();
+        let duplicate = sqlx::query("UPDATE oauth_grants SET device_id = $1 WHERE id = $2")
+            .bind(device.id)
+            .bind(spare.id)
+            .execute(&db.pool)
+            .await;
+        assert!(duplicate.is_err());
+        let rejected = make_device(&db, &user, "Rejected", "pending").await;
+        assert_eq!(
+            db.update_device_status(rejected.id, user.id, "rejected", None)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            db.bind_oauth_grant_device(spare.id, user.id, rejected.id)
+                .await
+                .unwrap(),
+            GrantBinding::NoDevice
+        );
+
+        // Revoking a grant deletes its device in the same transaction
+        assert!(
+            db.revoke_oauth_grant(renewed.id, other.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let revoked = db
+            .revoke_oauth_grant(renewed.id, user.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(revoked.client_id, MCP_CLIENT_ID);
+        assert_eq!(
+            revoked.device,
+            Some(RemovedDevice {
+                id: device.id,
+                was_approved: true
+            })
+        );
+        assert!(db.get_device_by_id(device.id).await.is_err());
+        assert!(
+            db.revoke_oauth_grant(renewed.id, user.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Rejecting or removing a device revokes the grant bound to it
+        let NewDevice::Registered(pending) = db
+            .register_device(user.id, &request("Pending agent", 4), 10, Some(spare.id))
+            .await
+            .unwrap()
+        else {
+            panic!("device not registered");
+        };
+        assert_eq!(pending.status, "pending");
+        assert_eq!(
+            db.update_device_status(pending.id, user.id, "rejected", None)
+                .await
+                .unwrap(),
+            Some(spare.id)
+        );
+        let spare = db.get_oauth_grant(spare.id).await.unwrap().unwrap();
+        assert!(spare.revoked_at.is_some());
+        let last = db
+            .create_oauth_grant(user.id, MCP_CLIENT_ID, scopes, "last")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.bind_oauth_grant_device(last.id, user.id, laptop.id)
+                .await
+                .unwrap(),
+            GrantBinding::Bound { superseded: None }
+        );
+        assert_eq!(
+            db.delete_device(laptop.id, user.id).await.unwrap(),
+            DeviceRemoval {
+                was_approved: true,
+                revoked_grant: Some(last.id)
+            }
+        );
+        let last = db.get_oauth_grant(last.id).await.unwrap().unwrap();
+        assert!(last.revoked_at.is_some());
+        assert!(last.device_id.is_none(), "the device is gone");
+
+        // Grants go with their user
+        db.admin_delete_user(user.id).await.unwrap();
+        assert!(db.get_oauth_grant(last.id).await.unwrap().is_none());
+    })
+    .await;
+}
