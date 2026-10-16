@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { getVersion } from '@tauri-apps/api/app';
+	import { listen } from '@tauri-apps/api/event';
 	import {
 		getConfig,
 		updateConfig,
@@ -205,12 +206,29 @@
 
 	onMount(() => {
 		loadConfig();
+		// e.g. Open at Login toggled from the tray menu
+		let disposed = false;
+		let unlisten: (() => void) | undefined;
+		listen('config-changed', () => {
+			getConfig()
+				.then((next) => (config = next))
+				.catch(() => {});
+		})
+			.then((u) => {
+				if (disposed) u();
+				else unlisten = u;
+			})
+			.catch(() => {});
 		getUserInfo()
 			.then((info) => (user = info))
 			.catch(() => {});
 		getVersion()
 			.then((v) => (appVersion = v))
 			.catch(() => {});
+		return () => {
+			disposed = true;
+			unlisten?.();
+		};
 	});
 
 	const providerLabel = $derived(authProvider === 'local' ? 'Password' : authProvider.charAt(0).toUpperCase() + authProvider.slice(1));
@@ -311,7 +329,7 @@
 			{#if desktop}
 				<SettingRow
 					label="Open at login"
-					description="Launch cpmesh in the {isMacLike() ? 'menu bar' : 'system tray'} when you sign in to this computer."
+					description="Start cpmesh quietly in the {isMacLike() ? 'menu bar' : 'system tray'} when you sign in to this computer."
 					for="setting-autostart"
 				>
 					{#snippet control()}

@@ -191,6 +191,15 @@ graph on future Tauri updates and exercise Linux builds when a compatible fix be
 - Fingerprints are always shown in full with the `Fingerprint` component (groups of four); never shorten them.
 - Keep keyboard parity with desktop conventions: `⌘/Ctrl+1…4` switch sections, `⌘/Ctrl+,` opens
   Settings, `⌘/Ctrl+F` searches history.
+- cpmesh is a background app: closing the window hides it (and its macOS Dock icon) while the tray /
+  menu bar item in `src-tauri/src/tray.rs` keeps the status, recent clips and quick actions. "Open at
+  login" launches it with `--background`, so it starts without a window. The tray and app menus open
+  sections of the window by emitting `navigate` with a route.
+- App and tray icons are generated from the SVGs in `src-tauri/icons/source/` (the website's mesh
+  mark). After changing one, regenerate with `npx tauri icon` into a temporary directory and copy the
+  files in: `app-icon.svg` for the PNG/ICO icons, `app-icon-macos.svg` for `icon.icns`, and
+  `npx tauri icon --png 32,64` for the `tray*.svg` sources into `src-tauri/icons/tray/` (64px for the
+  macOS template glyphs, 32px for the colour tray icons).
 
 ## Submitting Changes
 

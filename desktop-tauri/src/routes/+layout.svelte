@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
+	import { listen } from '@tauri-apps/api/event';
 
 	import {
 		initEventListeners,
@@ -61,7 +62,20 @@
 
 	onMount(() => {
 		initEventListeners();
+		// The tray and app menus open sections of the window
+		let disposed = false;
+		let unlistenNavigate: (() => void) | undefined;
+		listen<string>('navigate', (event) => {
+			if (isConfigured) goto(event.payload);
+		})
+			.then((unlisten) => {
+				if (disposed) unlisten();
+				else unlistenNavigate = unlisten;
+			})
+			.catch(() => {});
 		return () => {
+			disposed = true;
+			unlistenNavigate?.();
 			destroyEventListeners();
 			if (approvalPollTimer) clearInterval(approvalPollTimer);
 		};

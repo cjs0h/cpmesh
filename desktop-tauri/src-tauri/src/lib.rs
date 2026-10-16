@@ -8,6 +8,8 @@ mod key_sync;
 mod proto;
 mod secure_storage;
 mod state;
+#[cfg(desktop)]
+mod tray;
 mod updater;
 mod ws;
 
@@ -16,70 +18,6 @@ use tauri::{Emitter, Listener, Manager};
 
 #[cfg(desktop)]
 use tauri::menu::{AboutMetadataBuilder, MenuBuilder, MenuItemBuilder, SubmenuBuilder};
-#[cfg(desktop)]
-use tauri::tray::TrayIconEvent;
-
-#[cfg(desktop)]
-fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    let show = MenuItemBuilder::with_id("show", "Show cpmesh").build(app)?;
-    let connect = MenuItemBuilder::with_id("connect", "Connect").build(app)?;
-    let disconnect = MenuItemBuilder::with_id("disconnect", "Disconnect").build(app)?;
-    let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
-
-    let menu = MenuBuilder::new(app)
-        .item(&show)
-        .separator()
-        .item(&connect)
-        .item(&disconnect)
-        .separator()
-        .item(&quit)
-        .build()?;
-
-    if let Some(tray) = app.tray_by_id("main") {
-        tray.set_menu(Some(menu))?;
-        tray.set_show_menu_on_left_click(false)?;
-
-        let handle = app.handle().clone();
-        tray.on_menu_event(move |app_handle, event| match event.id().as_ref() {
-            "show" => {
-                if let Some(w) = app_handle.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.set_focus();
-                }
-            }
-            "connect" => {
-                let h = handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    let ctx: tauri::State<'_, AppContext> = h.state::<AppContext>();
-                    let _ = commands::connect(h.clone(), ctx).await;
-                });
-            }
-            "disconnect" => {
-                let h = handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    let ctx: tauri::State<'_, AppContext> = h.state::<AppContext>();
-                    let _ = commands::disconnect(h.clone(), ctx).await;
-                });
-            }
-            "quit" => {
-                app_handle.exit(0);
-            }
-            _ => {}
-        });
-
-        let handle2 = app.handle().clone();
-        tray.on_tray_icon_event(move |_tray, event| {
-            if let TrayIconEvent::DoubleClick { .. } = event
-                && let Some(w) = handle2.get_webview_window("main")
-            {
-                let _ = w.show();
-                let _ = w.set_focus();
-            }
-        });
-    }
-
-    Ok(())
-}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -93,8 +31,13 @@ pub fn run() {
             .name(Some("cpmesh"))
             .version(Some(env!("CARGO_PKG_VERSION")))
             .build();
+        let settings = MenuItemBuilder::with_id("app:settings", "Settings…")
+            .accelerator("CmdOrCtrl+,")
+            .build(handle)?;
         let app_menu = SubmenuBuilder::new(handle, "cpmesh")
             .about(Some(about))
+            .separator()
+            .item(&settings)
             .separator()
             .hide()
             .hide_others()
@@ -122,6 +65,10 @@ pub fn run() {
             .build()
     });
 
+    // One handler for every menu, the tray's included (tray menu handlers receive them all)
+    #[cfg(desktop)]
+    let builder = builder.on_menu_event(tray::handle_menu_event);
+
     let builder = builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
@@ -132,17 +79,15 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
+            // Opened at login, cpmesh starts in the background
+            Some(vec![tray::BACKGROUND_ARG]),
         ))
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             // When a second instance is launched (e.g. via deep link), this callback fires
             // in the ORIGINAL instance. The new instance exits immediately.
 
             // Show and focus the main window
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.show();
-                let _ = w.set_focus();
-            }
+            tray::show_main_window(app);
 
             // Check argv for a deep-link URL (e.g. cpmesh://auth/callback?code=...)
             for arg in &argv {
@@ -222,6 +167,12 @@ pub fn run() {
             log::info!("Config directory: {}", cfg_dir.display());
 
             let ctx = AppContext::new(cfg_dir);
+            #[cfg(desktop)]
+            let (configured, autostart) = ctx
+                .config
+                .try_read()
+                .map(|c| (c.is_configured(), c.autostart))
+                .unwrap_or((false, false));
             app.manage(ctx);
 
             // Handle deep-link URLs (OAuth callback from browser)
@@ -277,20 +228,44 @@ pub fn run() {
 
             #[cfg(desktop)]
             {
-                // Setup system tray (non-fatal if it fails)
-                if let Err(e) = setup_tray(app) {
-                    log::error!("Failed to setup tray: {e}");
-                }
+                // Menu bar / system tray (non-fatal if it fails)
+                let tray_ready = match tray::setup(app) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log::error!("Failed to setup tray: {e}");
+                        false
+                    }
+                };
 
-                // Hide to tray on window close (instead of quitting)
+                // Closing the window leaves cpmesh syncing from the tray; without a tray
+                // there would be no way back, so the window closes normally
                 if let Some(window) = app.get_webview_window("main") {
-                    let w = window.clone();
+                    let handle = app.handle().clone();
                     window.on_window_event(move |event| {
-                        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        if let tauri::WindowEvent::CloseRequested { api, .. } = event
+                            && tray::is_ready()
+                        {
                             api.prevent_close();
-                            let _ = w.hide();
+                            tray::hide_main_window(&handle);
+                            tray::announce_background(&handle);
                         }
                     });
+                }
+
+                // The window starts hidden; it stays that way only when opened at login
+                let background = std::env::args().any(|arg| arg == tray::BACKGROUND_ARG);
+                if tray_ready && configured && background {
+                    tray::hide_main_window(app.handle());
+                } else {
+                    tray::show_main_window(app.handle());
+                }
+
+                // Re-register Open at Login so its launch arguments match this version
+                if autostart {
+                    use tauri_plugin_autostart::ManagerExt;
+                    if let Err(e) = app.autolaunch().enable() {
+                        log::warn!("Failed to refresh Open at Login: {e}");
+                    }
                 }
 
                 // Register global hotkey (non-fatal if it fails — e.g. shortcut already taken)
@@ -300,11 +275,8 @@ pub fn run() {
                     if let Err(e) = app.global_shortcut().on_shortcut(
                         "CmdOrCtrl+Shift+Space",
                         move |_app, _shortcut, event| {
-                            if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed
-                                && let Some(w) = handle_for_hotkey.get_webview_window("main")
-                            {
-                                let _ = w.show();
-                                let _ = w.set_focus();
+                            if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                                tray::show_main_window(&handle_for_hotkey);
                             }
                         },
                     ) {
@@ -391,6 +363,20 @@ pub fn run() {
             });
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // Opening cpmesh again (Finder, Spotlight, the Dock) while it runs in the
+            // background shows the window
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen {
+                has_visible_windows: false,
+                ..
+            } = event
+            {
+                tray::show_main_window(app);
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
+        });
 }

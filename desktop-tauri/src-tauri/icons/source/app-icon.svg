@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- cpmesh mark, matching web/public/favicon.svg; full-bleed tile for Windows and Linux -->
+  <rect width="1024" height="1024" rx="224" fill="#0a0a0a"/>
+  <path d="M320.00 704.00 L512.00 352.00 L704.00 704.00 Z" fill="none" stroke="#ffffff" stroke-width="57.60" stroke-linejoin="round"/>
+  <circle cx="512.00" cy="352.00" r="83.20" fill="#0a0a0a" stroke="#ffffff" stroke-width="57.60"/>
+  <circle cx="320.00" cy="704.00" r="83.20" fill="#0a0a0a" stroke="#ffffff" stroke-width="57.60"/>
+  <circle cx="704.00" cy="704.00" r="83.20" fill="#ff5c38" stroke="#ffffff" stroke-width="57.60"/>
+</svg>

@@ -19,17 +19,11 @@
         "minWidth": 700,
         "minHeight": 500,
         "center": true,
-        "visible": true
+        "visible": false
       }
     ],
     "security": {
       "csp": "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; connect-src 'self' https: wss:; script-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
-    },
-    "trayIcon": {
-      "id": "main",
-      "iconPath": "icons/icon.png",
-      "iconAsTemplate": true,
-      "tooltip": "cpmesh - Clipboard Sync"
     }
   },
   "bundle": {
