@@ -125,10 +125,13 @@ CPMESH_E2E_DATABASE_URL=postgres://postgres:pw@127.0.0.1:55432/cpmesh_e2e \
   node mcp/cpmesh-mcp/scripts/live-smoke.mjs
 ```
 
-This creates a synthetic account with TOTP, uses a recovery code to sign in through the MCP protocol,
-checks persistence/retry/restart, and probes two stalled 128 MiB installer downloads. It generates its own
-keys and isolated profile, disables inherited auto-login credentials, and removes its processes and files.
-The supplied database is not deleted automatically. Windows skips the Unix RSS probe.
+This creates a synthetic account with TOTP and signs it in through the web API with a recovery code, the way
+a user would on the dashboard. It then approves the MCP server's device-code sign-in with that session
+(`POST /api/oauth/device/approve`), and later a send-only re-authorization through the browser flow with the
+script as the browser, and checks registration, persistence/retry/restart, scopes and revocation on sign-out.
+It also probes two stalled 128 MiB installer downloads. It generates its own keys and isolated profile, never
+opens a real browser, and removes its processes and files. The supplied database is not deleted
+automatically. Windows skips the Unix RSS probe.
 
 ### Dependency constraints
 

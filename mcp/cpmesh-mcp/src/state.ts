@@ -5,7 +5,9 @@
  *   device.key      — P-256 identity private key (PEM, 0600); signs only
  *   encryption.key  — P-256 static encryption private key (PEM, 0600); ECDH only
  *   keyring.enc     — encrypted group-key keyring (same format as desktop)
- *   session.json    — server URL, device identity, JWT tokens (0600)
+ *   session.json    — server URL, device identity, OAuth grant and tokens (0600)
+ *   authorization.json — a sign-in in progress: the pending device authorization,
+ *                     or tokens not yet bound to this device (0600)
  *   verified_keys.json — independently authenticated, versioned device membership
  *   sender_clocks.json — replay guard: newest accepted `sent_at` per sender device
  */
@@ -38,11 +40,24 @@ export interface Session {
   device_id: string;
   device_name: string;
   device_status: DeviceStatus;
-  /** Device fingerprint registered at login; reused when re-binding refreshed tokens. */
+  /** Device fingerprint registered at sign-in; reused when the device registers again. */
   fingerprint?: string;
+  /** Empty once the server refused to refresh the session (see `signed_out`). */
   access_token: string;
   refresh_token: string;
   created_at: string;
+  /** The OAuth grant behind the tokens. Profiles of cpmesh-mcp 0.2 have none and count as signed out. */
+  grant_id?: string;
+  client_id?: string;
+  /** What the user allowed this agent to do (space-separated scopes). */
+  scope?: string;
+  /** Why the session ended; the device keys and pairing are kept for signing in again. */
+  signed_out?: string;
+}
+
+/** A session this version can use: signed in with OAuth and not signed out since. */
+export function isSignedIn(session: Session | null): session is Session & { grant_id: string } {
+  return session !== null && !!session.grant_id && !!session.refresh_token;
 }
 
 export interface StatePaths {
@@ -51,6 +66,7 @@ export interface StatePaths {
   encryptionKey: string;
   keyring: string;
   session: string;
+  authorization: string;
   pinnedKeys: string;
   requests: string;
   senderClocks: string;
@@ -65,6 +81,7 @@ export function statePaths(): StatePaths {
     encryptionKey: join(root, "encryption.key"),
     keyring: join(root, "keyring.enc"),
     session: join(root, "session.json"),
+    authorization: join(root, "authorization.json"),
     pinnedKeys: join(root, "verified_keys.json"),
     requests: join(root, "clipboard_requests.json"),
     senderClocks: join(root, "sender_clocks.json"),
@@ -78,6 +95,8 @@ export function loadSession(): Session | null {
     server_url: z.string().url(), user_id: z.string(), device_id: z.string(),
     device_name: z.string(), device_status: z.enum(["pending", "approved", "rejected", "revoked"]),
     fingerprint: z.string().optional(), access_token: z.string(), refresh_token: z.string(), created_at: z.string(),
+    grant_id: z.string().optional(), client_id: z.string().optional(), scope: z.string().optional(),
+    signed_out: z.string().optional(),
   }).parse(JSON.parse(readFileSync(paths.session, "utf8")));
 }
 
@@ -100,10 +119,73 @@ export function updateSession(patch: Partial<Session>): Session | null {
 export function clearAllState(): void {
   const paths = statePaths();
   for (const file of [
-    paths.session, paths.keyring, paths.deviceKey, paths.encryptionKey, paths.pinnedKeys, paths.requests, paths.senderClocks,
+    paths.session, paths.authorization, paths.keyring, paths.deviceKey, paths.encryptionKey, paths.pinnedKeys,
+    paths.requests, paths.senderClocks,
   ]) {
     if (existsSync(file)) rmSync(file);
   }
+}
+
+/** Forgets what belongs to a device registration that no longer exists (its unsent signed pushes). */
+export function clearDeviceState(): void {
+  const { requests } = statePaths();
+  if (existsSync(requests)) rmSync(requests);
+}
+
+// === A sign-in in progress ===
+
+const pendingAuthorizationSchema = z.object({
+  stage: z.literal("pending"),
+  server_url: z.string(),
+  token_endpoint: z.string(),
+  device_code: z.string().min(1),
+  user_code: z.string(),
+  verification_uri: z.string(),
+  verification_uri_complete: z.string().optional(),
+  /** Unix milliseconds. */
+  expires_at: z.number(),
+  /** Seconds to wait after each poll; grows with `slow_down`. */
+  interval: z.number().int().positive(),
+  /** Unix milliseconds; shared by every process polling this device code. */
+  next_poll_at: z.number(),
+  created_at: z.string(),
+});
+const authorizedSchema = z.object({
+  stage: z.literal("authorized"),
+  server_url: z.string(),
+  access_token: z.string(),
+  refresh_token: z.string().min(1),
+  scope: z.string().optional(),
+  user_id: z.string(),
+  grant_id: z.string(),
+  created_at: z.string(),
+});
+const authorizationSchema = z.discriminatedUnion("stage", [pendingAuthorizationSchema, authorizedSchema]);
+
+/** A device authorization waiting for the user's approval (RFC 8628). */
+export type PendingDeviceAuthorization = z.infer<typeof pendingAuthorizationSchema>;
+/** Tokens of an approved sign-in that the device has not registered with yet. */
+export type AuthorizedTokens = z.infer<typeof authorizedSchema>;
+export type StoredAuthorization = PendingDeviceAuthorization | AuthorizedTokens;
+
+export function loadAuthorization(): StoredAuthorization | null {
+  const path = statePaths().authorization;
+  if (!existsSync(path)) return null;
+  try {
+    return authorizationSchema.parse(JSON.parse(readFileSync(path, "utf8")));
+  } catch {
+    console.error("[cpmesh-mcp] Ignoring an unreadable sign-in in progress (authorization.json)");
+    return null;
+  }
+}
+
+export function saveAuthorization(authorization: StoredAuthorization): void {
+  writeSecretFile(statePaths().authorization, Buffer.from(JSON.stringify(authorization, null, 2), "utf8"));
+}
+
+export function clearAuthorization(): void {
+  const { authorization } = statePaths();
+  if (existsSync(authorization)) rmSync(authorization);
 }
 
 // The legacy TOFU file is never implicitly promoted to authenticated membership.
