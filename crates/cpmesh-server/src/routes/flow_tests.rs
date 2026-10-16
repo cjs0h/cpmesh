@@ -131,17 +131,19 @@ async fn device_registration_requires_fresh_session_bound_possession_and_issues_
             challenge["challenge"].as_str().unwrap(),
             "fp",
         );
-        assert_eq!(
-            app.call(
+        let (status, conflict) = app
+            .call(
                 "POST",
                 "/api/devices",
                 Some(&other_session),
-                Some(replacement)
+                Some(replacement),
             )
-            .await
-            .0,
-            StatusCode::CONFLICT
-        );
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        // The app offers to replace exactly this registration
+        assert_eq!(conflict["code"], "device_keys_changed", "{conflict}");
+        assert_eq!(conflict["device_id"], id.to_string());
+        assert_eq!(conflict["device_name"], "Proof device");
         let (_, challenge) = app
             .call("POST", "/api/devices/challenge", Some(&other_session), None)
             .await;
@@ -157,6 +159,103 @@ async fn device_registration_requires_fresh_session_bound_possession_and_issues_
             .0,
             StatusCode::OK
         );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_account_whose_only_key_holder_was_removed_can_start_new_keys() {
+    use aws_lc_rs::signature::KeyPair as _;
+    use base64::Engine;
+    use cpmesh_proto::models as proto;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    with_app(Options::default(), |app| async move {
+        let user = app.member("lost-keys").await;
+        let web = app.mfa_session(&user);
+        let register = |key: aws_lc_rs::signature::EcdsaKeyPair, fingerprint: &'static str| {
+            let app = &app;
+            let web = web.clone();
+            async move {
+                let (_, challenge) = app
+                    .call("POST", "/api/devices/challenge", Some(&web), None)
+                    .await;
+                let body = device_registration(
+                    &key,
+                    challenge["challenge"].as_str().unwrap(),
+                    fingerprint,
+                );
+                let (status, registered) = app
+                    .call("POST", "/api/devices", Some(&web), Some(body))
+                    .await;
+                assert_eq!(status, StatusCode::CREATED, "{registered}");
+                (key, registered)
+            }
+        };
+
+        // The only device that held the account's keys (versions 1 and 2) is removed
+        let (_, old) = register(device_key(), "fp-old").await;
+        let old_id: uuid::Uuid = old["device"]["id"].as_str().unwrap().parse().unwrap();
+        let db = &app.state.db;
+        db.rotate_group_key(user.id, old_id, 0, 1, &[(old_id, vec![1; 60])], 24)
+            .await
+            .unwrap();
+        db.rotate_group_key(user.id, old_id, 1, 2, &[(old_id, vec![2; 60])], 24)
+            .await
+            .unwrap();
+        let (status, _) = app
+            .call(
+                "DELETE",
+                &format!("/api/devices/{old_id}"),
+                Some(&web),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // Registered again, this computer is the first device and approved, but no
+        // device can give it key 2
+        let (new_key, new) = register(device_key(), "fp-new").await;
+        assert_eq!(new["device"]["status"], "approved");
+        let new_id = new["device"]["id"].as_str().unwrap().to_string();
+        let access = new["access_token"].as_str().unwrap().to_string();
+        let current_uri = "/api/group-keys/current?since_version=0";
+        let (status, current) = app.call("GET", current_uri, Some(&access), None).await;
+        assert_eq!(status, StatusCode::OK, "{current}");
+        assert_eq!(current["current_version"], 2);
+        assert_eq!(current["keys"], json!([]));
+        assert_eq!(current["rotation_required"], true);
+
+        // The app's last resort: version 3 for every approved device, from a device that
+        // never held version 2. No database reset needed.
+        let members = vec![proto::DeviceIdentity {
+            id: new_id.clone(),
+            public_key: new_key.public_key().as_ref().to_vec(),
+        }];
+        let wrap = vec![7u8; proto::WRAP_V3_LEN];
+        let hashes: std::collections::BTreeMap<String, String> =
+            [(new_id.clone(), proto::wrapped_key_hash(&wrap))].into();
+        let transcript = proto::membership_transcript(3, &new_id, &members, &hashes).unwrap();
+        let reset = json!({
+            "expected_current_version": 2,
+            "new_version": 3,
+            "wrapped_keys": [{
+                "device_id": new_id,
+                "encrypted_key": b64.encode(&wrap),
+                "membership": {
+                    "members": members,
+                    "wrapped_key_hashes": hashes,
+                    "signature": b64.encode(device_sign(&new_key, &transcript)),
+                },
+            }],
+        });
+        let (status, body) = app
+            .call("POST", "/api/group-keys/rotate", Some(&access), Some(reset))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, current) = app.call("GET", current_uri, Some(&access), None).await;
+        assert_eq!(current["current_version"], 3);
+        assert_eq!(current["keys"].as_array().unwrap().len(), 1);
+        assert_eq!(current["rotation_required"], false);
     })
     .await;
 }

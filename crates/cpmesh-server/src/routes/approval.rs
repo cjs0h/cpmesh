@@ -225,10 +225,7 @@ pub async fn handle_begin_approval(
         .and_then(|v| v.parse::<u32>().ok())
         != Some(proto::PAIRING_VERSION)
     {
-        return json_error(
-            "update your client: committed short-code pairing is required",
-            StatusCode::UPGRADE_REQUIRED,
-        );
+        return super::middleware::upgrade_required("committed short-code pairing is required");
     }
     let commit = match body {
         Some(axum::Json(req)) if req.commit.len() == 32 => req.commit,
