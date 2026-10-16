@@ -21,7 +21,9 @@ tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-clipboard-manager = "2"
-tauri-plugin-deep-link = "2"
+# 2.6.2 doesn't compile on Linux: it fills ini::ParseOption with two of rust-ini 0.21.3's four
+# fields. Move on once a release builds against it.
+tauri-plugin-deep-link = "=2.6.1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
