@@ -193,7 +193,8 @@ graph on future Tauri updates and exercise Linux builds when a compatible fix be
   Settings, `⌘/Ctrl+F` (or `/`) searches history. List in-app shortcuts under Settings → Keyboard
   shortcuts, and add them to `APP_SHORTCUTS` in `lib/shortcuts.ts` so the global shortcut can't take them.
 - The global shortcut that shows cpmesh is saved as an accelerator (`global_hotkey` in `config.json`,
-  `CmdOrCtrl+Shift+Space` by default, empty when turned off) and owned by `src-tauri/src/shortcut.rs`:
+  `CmdOrCtrl+Shift+Space` by default, empty when turned off) and owned by `src-tauri/src/shortcut.rs`
+  (the webview has no `global-shortcut:*` permissions):
   it registers the shortcut at startup and when Settings changes it (the new one before the old one is
   released, so a combination another app holds leaves the current one working), reports refusals to
   Settings and gives the tray menu its accelerator. Settings records new combinations with
