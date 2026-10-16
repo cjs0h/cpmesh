@@ -20,6 +20,10 @@ on:
       - "Cargo.lock"
       - ".github/workflows/mcp.yml"
 
+# CI only reads the repository; artifacts and caches use the runner's own token
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Test (Node ${{ matrix.node }})

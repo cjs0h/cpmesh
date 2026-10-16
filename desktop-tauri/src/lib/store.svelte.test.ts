@@ -155,6 +155,44 @@ describe('desktop app store', () => {
 		expect(mocks.invoke).toHaveBeenCalledWith('get_status');
 	});
 
+	it('records connection, device and error events for the activity timeline', async () => {
+		mocks.invoke.mockResolvedValue({ ...status, state: 'disconnected' });
+		store.initEventListeners();
+		await flush();
+		expect(store.getActivity()).toEqual([]);
+
+		emit('connection-state-changed', 'connected');
+		// Repeating the same state adds nothing
+		emit('connection-state-changed', 'connected');
+		emit('device-status-changed', { device_id: 'd2', device_name: 'Phone', online: true });
+		// Payloads without a name or state are ignored
+		emit('device-status-changed', {});
+		emit('sync-error', 'Key synchronization failed');
+		emit('connection-state-changed', 'disconnected');
+
+		expect(store.getActivity().map((e) => [e.kind, e.label])).toEqual([
+			['disconnected', 'Disconnected from the relay'],
+			['sync-error', 'Key synchronization failed'],
+			['device-online', 'Phone came online'],
+			['connected', 'Connected to the relay'],
+		]);
+		expect(store.getSyncError()).toBe('Key synchronization failed');
+		store.clearSyncError();
+		expect(store.getSyncError()).toBe('');
+	});
+
+	it('caps the activity log and shares the pending device count', async () => {
+		store.initEventListeners();
+		await flush();
+		for (let i = 0; i < 40; i++) emit('sync-error', `e${i}`);
+		expect(store.getActivity()).toHaveLength(30);
+		expect(store.getActivity()[0].label).toBe('e39');
+
+		expect(store.getPendingDeviceCount()).toBe(0);
+		store.setPendingDeviceCount(2);
+		expect(store.getPendingDeviceCount()).toBe(2);
+	});
+
 	it('surfaces available updates with a notification and honours dismissal', async () => {
 		store.initEventListeners();
 		await flush();

@@ -8,6 +8,17 @@ use sha2::Sha256;
 type HmacSha256 = Hmac<Sha256>;
 type GcmNonce = Nonce<Aes256Gcm>;
 
+/// Decodes a base64 key that must be exactly 32 bytes.
+fn decode_key(value_b64: &str, name: &str) -> Result<[u8; 32], String> {
+    let bytes = STANDARD
+        .decode(value_b64)
+        .map_err(|e| format!("decode {name}: {e}"))?;
+    let len = bytes.len();
+    bytes
+        .try_into()
+        .map_err(|_| format!("{name} must be exactly 32 bytes (got {len})"))
+}
+
 pub struct PiiService {
     encryption_key: [u8; 32],
     hmac_key: [u8; 32],
@@ -15,34 +26,9 @@ pub struct PiiService {
 
 impl PiiService {
     pub fn new(encryption_key_b64: &str, hmac_key_b64: &str) -> Result<Self, String> {
-        let enc_key = STANDARD
-            .decode(encryption_key_b64)
-            .map_err(|e| format!("decode PII_MASTER_KEY: {e}"))?;
-        if enc_key.len() != 32 {
-            return Err(format!(
-                "PII_MASTER_KEY must be exactly 32 bytes (got {})",
-                enc_key.len()
-            ));
-        }
-
-        let hmac_key = STANDARD
-            .decode(hmac_key_b64)
-            .map_err(|e| format!("decode PII_HMAC_KEY: {e}"))?;
-        if hmac_key.len() != 32 {
-            return Err(format!(
-                "PII_HMAC_KEY must be exactly 32 bytes (got {})",
-                hmac_key.len()
-            ));
-        }
-
-        let mut ek = [0u8; 32];
-        ek.copy_from_slice(&enc_key);
-        let mut hk = [0u8; 32];
-        hk.copy_from_slice(&hmac_key);
-
         Ok(PiiService {
-            encryption_key: ek,
-            hmac_key: hk,
+            encryption_key: decode_key(encryption_key_b64, "PII_MASTER_KEY")?,
+            hmac_key: decode_key(hmac_key_b64, "PII_HMAC_KEY")?,
         })
     }
 

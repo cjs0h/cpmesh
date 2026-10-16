@@ -12,6 +12,10 @@ on:
       - "web/**"
       - ".github/workflows/web.yml"
 
+# CI only reads the repository; artifacts and caches use the runner's own token
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Check, test and build

@@ -17,6 +17,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# CI only reads the repository; artifacts and caches use the runner's own token
+permissions:
+  contents: read
+
 jobs:
   check:
     name: Svelte check and tests

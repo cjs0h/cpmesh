@@ -1,177 +1,308 @@
-:root {
-	--bg: #ffffff;
-	--bg-secondary: #f5f5f5;
-	--bg-hover: #eeeeee;
-	--text: #1a1a1a;
-	--text-secondary: #666666;
-	--border: #e0e0e0;
-	--accent: #4f46e5;
-	--accent-hover: #4338ca;
-	--accent-light: #eef2ff;
-	--success: #16a34a;
-	--warning: #ca8a04;
-	--danger: #dc2626;
-	--danger-hover: #b91c1c;
-	--radius: 8px;
-	--radius-sm: 4px;
-	--shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
-	--font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+@import '@fontsource-variable/geist';
+@import '@fontsource-variable/geist-mono';
+@import 'tailwindcss';
+
+/* Dark utilities follow the resolved theme class on <html>, set by theme.svelte.ts */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+ * cpmesh design tokens, shared with the web dashboard: neutral surfaces, hairline
+ * borders, Geist type and a single orange accent kept for live state and emphasis.
+ * Every colour is a variable so the dark theme only swaps values.
+ */
+@theme {
+	--color-bg: #ffffff;
+	--color-bg-deep: #fafafa;
+	--color-surface: #ffffff;
+	--color-surface-2: #f5f5f5;
+	--color-surface-3: #ebebeb;
+
+	--color-border: #e5e5e5;
+	--color-border-strong: #d4d4d4;
+
+	--color-ink: #0a0a0a;
+	--color-on-ink: #ffffff;
+	--color-ink-hover: #2e2e2e;
+	--color-fg: #171717;
+	--color-muted: #666666;
+	--color-dim: #8f8f8f;
+
+	--color-accent: #ff5c38;
+	--color-accent-hover: #e94a27;
+	--color-accent-soft: rgb(255 92 56 / 0.08);
+
+	--color-success: #16a34a;
+	--color-success-fg: #15803d;
+	--color-success-soft: #f0fdf4;
+	--color-success-line: #bbf7d0;
+
+	--color-warning: #d97706;
+	--color-warning-fg: #b45309;
+	--color-warning-soft: #fffbeb;
+	--color-warning-line: #fde68a;
+
+	--color-danger: #dc2626;
+	--color-danger-hover: #b91c1c;
+	--color-danger-fg: #b91c1c;
+	--color-danger-soft: #fef2f2;
+	--color-danger-line: #fecaca;
+
+	--font-sans: 'Geist Variable', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+	--font-mono: 'Geist Mono Variable', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+	--shadow-xs: 0 1px 2px rgb(0 0 0 / 0.04);
+	--shadow-sm: 0 1px 3px rgb(0 0 0 / 0.06), 0 1px 2px rgb(0 0 0 / 0.04);
+	--shadow-md: 0 4px 12px rgb(0 0 0 / 0.06), 0 1px 3px rgb(0 0 0 / 0.04);
+	--shadow-lg: 0 12px 32px rgb(0 0 0 / 0.08), 0 2px 6px rgb(0 0 0 / 0.04);
+	--shadow-pop: 0 24px 48px -12px rgb(0 0 0 / 0.18), 0 0 0 1px rgb(0 0 0 / 0.04);
+
+	--ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
 }
 
-@media (prefers-color-scheme: dark) {
-	:root {
-		--bg: #1a1a1a;
-		--bg-secondary: #262626;
-		--bg-hover: #333333;
-		--text: #e5e5e5;
-		--text-secondary: #a3a3a3;
-		--border: #404040;
-		--accent: #818cf8;
-		--accent-hover: #6366f1;
-		--accent-light: #1e1b4b;
-		--success: #22c55e;
-		--warning: #eab308;
-		--danger: #ef4444;
-		--danger-hover: #dc2626;
-	}
+:root.dark {
+	--color-bg: #0a0a0a;
+	--color-bg-deep: #111111;
+	--color-surface: #141414;
+	--color-surface-2: #1c1c1c;
+	--color-surface-3: #262626;
+
+	--color-border: #262626;
+	--color-border-strong: #383838;
+
+	--color-ink: #f5f5f5;
+	--color-on-ink: #0a0a0a;
+	--color-ink-hover: #d4d4d4;
+	--color-fg: #ededed;
+	--color-muted: #a1a1a1;
+	--color-dim: #737373;
+
+	--color-accent: #ff5c38;
+	--color-accent-hover: #ff7a5c;
+	--color-accent-soft: rgb(255 92 56 / 0.12);
+
+	--color-success: #22c55e;
+	--color-success-fg: #4ade80;
+	--color-success-soft: rgb(34 197 94 / 0.1);
+	--color-success-line: rgb(34 197 94 / 0.28);
+
+	--color-warning: #f59e0b;
+	--color-warning-fg: #fbbf24;
+	--color-warning-soft: rgb(245 158 11 / 0.1);
+	--color-warning-line: rgb(245 158 11 / 0.28);
+
+	--color-danger: #dc2626;
+	--color-danger-hover: #b91c1c;
+	--color-danger-fg: #f87171;
+	--color-danger-soft: rgb(239 68 68 / 0.1);
+	--color-danger-line: rgb(239 68 68 / 0.3);
+
+	--shadow-xs: 0 1px 2px rgb(0 0 0 / 0.4);
+	--shadow-sm: 0 1px 3px rgb(0 0 0 / 0.45);
+	--shadow-md: 0 4px 12px rgb(0 0 0 / 0.5);
+	--shadow-lg: 0 12px 32px rgb(0 0 0 / 0.55);
+	--shadow-pop: 0 24px 48px -12px rgb(0 0 0 / 0.7), 0 0 0 1px rgb(255 255 255 / 0.06);
 }
 
-* {
-	margin: 0;
-	padding: 0;
-	box-sizing: border-box;
-}
-
-body {
-	font-family: var(--font);
-	background: var(--bg);
-	color: var(--text);
-	line-height: 1.5;
-}
-
-button {
-	cursor: pointer;
-	font-family: inherit;
-	font-size: 0.875rem;
-	padding: 0.5rem 1rem;
-	border-radius: var(--radius-sm);
-	border: 1px solid var(--border);
-	background: var(--bg);
-	color: var(--text);
-	transition: all 0.15s ease;
-}
-
-button:hover {
-	background: var(--bg-hover);
-}
-
-button.primary {
-	background: var(--accent);
-	color: white;
-	border-color: var(--accent);
-}
-
-button.primary:hover {
-	background: var(--accent-hover);
-}
-
-button.danger {
-	color: var(--danger);
-	border-color: var(--danger);
-}
-
-button.danger:hover {
-	background: var(--danger);
-	color: white;
-}
-
-input, select {
-	font-family: inherit;
-	font-size: 0.875rem;
-	padding: 0.5rem 0.75rem;
-	border: 1px solid var(--border);
-	border-radius: var(--radius-sm);
-	background: var(--bg);
-	color: var(--text);
-	width: 100%;
-}
-
-input:focus, select:focus {
-	outline: none;
-	border-color: var(--accent);
-	box-shadow: 0 0 0 2px var(--accent-light);
-}
-
-.card {
-	background: var(--bg);
-	border: 1px solid var(--border);
-	border-radius: var(--radius);
-	padding: 1.25rem;
-	box-shadow: var(--shadow);
-}
-
-.badge {
-	display: inline-flex;
-	align-items: center;
-	gap: 0.25rem;
-	padding: 0.125rem 0.5rem;
-	border-radius: 9999px;
-	font-size: 0.75rem;
-	font-weight: 500;
-}
-
-.badge.online {
-	background: #dcfce7;
-	color: #166534;
-}
-
-.badge.offline {
-	background: #fef2f2;
-	color: #991b1b;
-}
-
-@media (prefers-color-scheme: dark) {
-	.badge.online {
-		background: #14532d;
-		color: #86efac;
-	}
-	.badge.offline {
-		background: #450a0a;
-		color: #fca5a5;
-	}
-}
-
-/* === Mobile-friendly styles === */
-
-@media (max-width: 768px) {
-	button {
-		min-height: 44px;
-		padding: 0.625rem 1rem;
-		font-size: 1rem;
+@layer base {
+	html {
+		color-scheme: light;
 	}
 
-	input, select {
-		min-height: 44px;
-		padding: 0.625rem 0.75rem;
-		font-size: 1rem;
+	html.dark {
+		color-scheme: dark;
 	}
 
-	.card {
-		padding: 1rem;
-		border-radius: var(--radius-sm);
+	html,
+	body {
+		height: 100%;
 	}
 
 	body {
-		-webkit-text-size-adjust: 100%;
+		font-family: var(--font-sans);
+		background-color: var(--color-bg);
+		color: var(--color-fg);
+		line-height: 1.5;
+		-webkit-font-smoothing: antialiased;
+		-moz-osx-font-smoothing: grayscale;
+		text-rendering: optimizeLegibility;
+		font-feature-settings: 'cv11', 'ss01';
 		-webkit-tap-highlight-color: transparent;
+		overscroll-behavior: none;
+	}
+
+	::selection {
+		background: var(--color-ink);
+		color: var(--color-on-ink);
+	}
+
+	a {
+		color: inherit;
+		text-decoration: none;
+	}
+
+	button {
+		cursor: pointer;
+		font-family: inherit;
+	}
+
+	button:disabled {
+		cursor: not-allowed;
+	}
+
+	input,
+	select,
+	textarea {
+		font-family: inherit;
+	}
+
+	:focus-visible {
+		outline: 2px solid var(--color-ink);
+		outline-offset: 2px;
+	}
+
+	code,
+	kbd,
+	pre {
+		font-family: var(--font-mono);
+		font-feature-settings: normal;
+	}
+
+	h1,
+	h2,
+	h3,
+	h4 {
+		font-weight: 600;
+		letter-spacing: -0.02em;
+		text-wrap: balance;
+	}
+
+	/* Slim scrollbars that follow the theme */
+	* {
+		scrollbar-width: thin;
+		scrollbar-color: var(--color-border-strong) transparent;
 	}
 }
 
-/* iOS safe area support */
-@supports (padding: env(safe-area-inset-top)) {
-	body {
-		padding-top: env(safe-area-inset-top);
-		padding-left: env(safe-area-inset-left);
-		padding-right: env(safe-area-inset-right);
+@layer components {
+	/* Status dot; `data-live` adds a soft pulse ring */
+	.status-dot {
+		position: relative;
+		display: inline-block;
+		width: 7px;
+		height: 7px;
+		flex-shrink: 0;
+		border-radius: 999px;
+		background: currentColor;
+	}
+
+	.status-dot[data-live='true']::after {
+		content: '';
+		position: absolute;
+		inset: -3px;
+		border-radius: inherit;
+		border: 1.5px solid currentColor;
+		opacity: 0.5;
+		animation: ping-ring 2s var(--ease-out-expo) infinite;
+	}
+}
+
+@keyframes spin {
+	to {
+		transform: rotate(360deg);
+	}
+}
+
+@keyframes ping-ring {
+	0% {
+		transform: scale(0.7);
+		opacity: 0.6;
+	}
+	100% {
+		transform: scale(1.9);
+		opacity: 0;
+	}
+}
+
+@keyframes fade-in {
+	from {
+		opacity: 0;
+	}
+	to {
+		opacity: 1;
+	}
+}
+
+@keyframes rise-in {
+	from {
+		opacity: 0;
+		transform: translateY(6px);
+	}
+	to {
+		opacity: 1;
+		transform: none;
+	}
+}
+
+@keyframes pop-in {
+	from {
+		opacity: 0;
+		transform: translateY(4px) scale(0.98);
+	}
+	to {
+		opacity: 1;
+		transform: none;
+	}
+}
+
+@keyframes shimmer {
+	0% {
+		background-position: -200% 0;
+	}
+	100% {
+		background-position: 200% 0;
+	}
+}
+
+/*
+ * The mesh beam's light (see MeshBeam): a fixed-size gradient streak that
+ * crosses its beam in the first 70% of a cycle, entering and leaving fully
+ * outside the clipped beam.
+ */
+@keyframes beam-out {
+	0% {
+		left: -40px;
+	}
+	70%,
+	100% {
+		left: 100%;
+	}
+}
+
+@keyframes beam-in {
+	0% {
+		left: 100%;
+	}
+	70%,
+	100% {
+		left: -40px;
+	}
+}
+
+@keyframes node-flash {
+	0% {
+		box-shadow: 0 0 0 0 var(--color-accent);
+	}
+	100% {
+		box-shadow: 0 0 0 10px transparent;
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	*,
+	*::before,
+	*::after {
+		animation-duration: 0.01ms !important;
+		animation-iteration-count: 1 !important;
+		transition-duration: 0.01ms !important;
 	}
 }
