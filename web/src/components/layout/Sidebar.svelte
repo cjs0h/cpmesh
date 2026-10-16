@@ -25,7 +25,6 @@
     disconnectWS();
     resetUserState();
     window.location.hash = '#/login';
-    window.location.reload();
   }
 </script>
 

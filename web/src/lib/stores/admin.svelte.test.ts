@@ -296,8 +296,8 @@ describe('admin helpers', () => {
   it('reads plan prices sent as numbers or decimal strings', () => {
     expect(planPrice('12.30')).toBe(12.3);
     expect(planPrice(5)).toBe(5);
-    expect(planPrice('free')).toBe(0);
-    expect(planPrice(null)).toBe(0);
+    expect(() => planPrice('free')).toThrow('Invalid decimal price');
+    expect(() => planPrice(null)).toThrow('Invalid decimal price');
   });
 
   it('asks for a confirmation before an upload only when the sign-in is not recent', async () => {

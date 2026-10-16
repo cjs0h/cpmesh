@@ -1,5 +1,16 @@
+import { writable } from 'svelte/store';
+
 const TOKEN_KEY = 'cpmesh_access_token';
 const REFRESH_KEY = 'cpmesh_refresh_token';
+let generation = 0;
+const sessionEndHandlers = new Set<() => void>();
+export const authSession = writable(typeof localStorage !== 'undefined' && !!getAccessToken());
+
+export function authGeneration(): number { return generation; }
+export function onSessionEnd(handler: () => void): () => void {
+  sessionEndHandlers.add(handler);
+  return () => { sessionEndHandlers.delete(handler); };
+}
 
 export function getAccessToken(): string | null {
   return localStorage.getItem(TOKEN_KEY);
@@ -10,13 +21,30 @@ export function getRefreshToken(): string | null {
 }
 
 export function setTokens(access: string, refresh: string) {
+  if (!getAccessToken()) generation++;
   localStorage.setItem(TOKEN_KEY, access);
   localStorage.setItem(REFRESH_KEY, refresh);
+  authSession.set(!!access);
 }
 
 export function clearTokens() {
   localStorage.removeItem(TOKEN_KEY);
   localStorage.removeItem(REFRESH_KEY);
+  endSession();
+}
+
+function endSession() {
+  generation++;
+  authSession.set(false);
+  sessionEndHandlers.forEach((handler) => handler());
+}
+
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+  window.addEventListener('storage', (event) => {
+    if (event.key !== TOKEN_KEY && event.key !== null) return;
+    if (!getAccessToken()) endSession();
+    else authSession.set(true);
+  });
 }
 
 export function isLoggedIn(): boolean {

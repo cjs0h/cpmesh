@@ -1,5 +1,6 @@
 import { api } from '../api';
-import { clearTokens } from '../auth';
+import { clearTokens, onSessionEnd, authGeneration } from '../auth';
+import { toast } from './toast.svelte';
 
 export type Role = 'user' | 'viewer' | 'support' | 'admin' | 'owner';
 
@@ -29,6 +30,7 @@ interface UserState {
   /** Two-factor authentication: set up, required for this account, and whether this session was confirmed with it. */
   mfa: { enabled: boolean; required: boolean; sessionVerified: boolean };
   loaded: boolean;
+  error: string;
 }
 
 export const userState: UserState = $state({
@@ -44,6 +46,7 @@ export const userState: UserState = $state({
   permissions: [],
   mfa: { enabled: false, required: false, sessionVerified: false },
   loaded: false,
+  error: '',
 });
 
 /** Whether the signed-in user's role grants `permission`. */
@@ -52,6 +55,8 @@ export function can(permission: Permission): boolean {
 }
 
 export async function fetchCurrentUser() {
+  const generation = authGeneration();
+  userState.error = '';
   try {
     const data = await api<{
       id: string;
@@ -66,6 +71,7 @@ export async function fetchCurrentUser() {
       permissions?: Permission[];
       mfa?: { enabled: boolean; required: boolean; session_verified: boolean };
     }>('/api/me');
+    if (generation !== authGeneration()) return;
     userState.id = data.id;
     userState.username = data.username;
     userState.email = data.email || '';
@@ -82,13 +88,19 @@ export async function fetchCurrentUser() {
       sessionVerified: data.mfa?.session_verified ?? false,
     };
     userState.loaded = true;
-  } catch {
+  } catch (error) {
+    if (generation !== authGeneration()) return;
+    userState.error = error instanceof Error ? error.message : String(error);
+    toast.error('Could not load your account', userState.error);
     userState.loaded = true;
   }
 }
 
 export function resetUserState() {
   clearTokens();
+}
+
+onSessionEnd(() => {
   userState.id = '';
   userState.username = '';
   userState.email = '';
@@ -101,4 +113,5 @@ export function resetUserState() {
   userState.permissions = [];
   userState.mfa = { enabled: false, required: false, sessionVerified: false };
   userState.loaded = false;
-}
+  userState.error = '';
+});

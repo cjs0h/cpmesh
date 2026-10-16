@@ -131,7 +131,7 @@
         challenge = next;
         loginPassword = '';
       } else if (err instanceof ApiError && err.message === 'email_not_verified') {
-        error = err.data.message || 'Please verify your email address first.';
+        error = typeof err.data.message === 'string' ? err.data.message : 'Please verify your email address first.';
         resendOpen = true;
         resendEmail = loginIdentifier.includes('@') ? loginIdentifier.trim() : resendEmail;
       } else {

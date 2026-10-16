@@ -4,6 +4,7 @@
 // factor (or their password, when they have none). `api()` calls the registered
 // handler, which opens the dialog through `requestStepUp`; the dialog resolves the
 // request with `finishStepUp` after storing the refreshed session.
+import { onSessionEnd } from '../auth';
 
 export const reauthState: { open: boolean; reason: string } = $state({
   open: false,
@@ -39,3 +40,5 @@ export function finishStepUp(confirmed: boolean) {
   reauthState.reason = '';
   resolve?.(confirmed);
 }
+
+onSessionEnd(() => finishStepUp(false));

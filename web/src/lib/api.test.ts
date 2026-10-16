@@ -114,14 +114,14 @@ describe('api()', () => {
     expect(fetch).toHaveBeenCalledTimes(2);
   });
 
-  it('treats a network failure during refresh as a failed refresh', async () => {
+  it('surfaces a network failure without deleting the session', async () => {
     setTokens('expired', 'refresh-1');
     fetchMock()
       .mockResolvedValueOnce(jsonResponse(401, { error: 'expired' }))
       .mockRejectedValueOnce(new TypeError('network down'));
 
-    await expect(api('/api/me')).rejects.toThrow('Session expired');
-    expect(getAccessToken()).toBeNull();
+    await expect(api('/api/me')).rejects.toThrow('network down');
+    expect(getAccessToken()).toBe('expired');
   });
 
   it('does not refresh when there is no refresh token', async () => {
@@ -142,7 +142,7 @@ describe('api()', () => {
     setTokens('expired-again', 'refresh-2');
     fetchMock()
       .mockResolvedValueOnce(jsonResponse(401, { error: 'expired' }))
-      .mockResolvedValueOnce(jsonResponse(200, { access_token: 'fresh-2' }))
+      .mockResolvedValueOnce(jsonResponse(200, { access_token: 'fresh-2', refresh_token: 'refresh-3' }))
       .mockResolvedValueOnce(jsonResponse(200, { id: 'me' }));
 
     await expect(api('/api/me')).resolves.toEqual({ id: 'me' });
@@ -167,7 +167,7 @@ describe('api()', () => {
     // Let both initial requests fail and both callers reach tryRefresh()
     await Promise.resolve();
     await Promise.resolve();
-    resolveRefresh(jsonResponse(200, { access_token: 'fresh' }));
+    resolveRefresh(jsonResponse(200, { access_token: 'fresh', refresh_token: 'refresh-2' }));
 
     await expect(first).resolves.toEqual({ url: '/api/a' });
     await expect(second).resolves.toEqual({ url: '/api/b' });
@@ -257,6 +257,7 @@ describe('api() errors and step-up', () => {
 
     expect(error).toBeInstanceOf(ApiError);
     expect(error).toBeInstanceOf(Error);
+    if (!(error instanceof ApiError)) throw new Error('Expected ApiError');
     expect(error.message).toBe('Finish two-factor authentication first.');
     expect(error.status).toBe(403);
     expect(error.code).toBe('mfa_required');
@@ -266,6 +267,7 @@ describe('api() errors and step-up', () => {
   it('leaves the code unset for plain errors', async () => {
     fetchMock().mockResolvedValueOnce(jsonResponse(409, { error: 'conflict' }));
     const error = await api('/api/x').catch((e) => e);
+    if (!(error instanceof ApiError)) throw new Error('Expected ApiError');
     expect(error.status).toBe(409);
     expect(error.code).toBeUndefined();
   });
@@ -308,6 +310,7 @@ describe('api() errors and step-up', () => {
     fetchMock().mockResolvedValueOnce(jsonResponse(403, { error: "Confirm it's you to continue.", code: 'reauth_required' }));
 
     const error = await api('/api/mfa/totp', { method: 'DELETE' }).catch((e) => e);
+    if (!(error instanceof ApiError)) throw new Error('Expected ApiError');
 
     expect(error).toBeInstanceOf(ApiError);
     expect(error.code).toBe('reauth_required');
@@ -391,6 +394,7 @@ describe('apiWithToken()', () => {
     fetchMock().mockResolvedValueOnce(jsonResponse(401, { error: 'invalid or expired token; sign in again' }));
 
     const error = await apiWithToken('/api/mfa/verify', 'ticket', { method: 'POST', body: '{}' }).catch((e) => e);
+    if (!(error instanceof ApiError)) throw new Error('Expected ApiError');
 
     expect(error).toBeInstanceOf(ApiError);
     expect(error.status).toBe(401);

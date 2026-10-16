@@ -1,4 +1,4 @@
-import { getAccessToken, getRefreshToken, setTokens, clearTokens } from './auth';
+import { getAccessToken, getRefreshToken, setTokens, clearTokens, authGeneration } from './auth';
 
 let refreshPromise: Promise<boolean> | null = null;
 
@@ -36,6 +36,7 @@ async function refreshOnce(rejected: string): Promise<boolean> {
   if (access && access !== rejected) return true;
 
   const refreshToken = getRefreshToken();
+  const generation = authGeneration();
   if (!refreshToken) return false;
   try {
     const res = await fetch('/api/auth/refresh', {
@@ -45,13 +46,21 @@ async function refreshOnce(rejected: string): Promise<boolean> {
     });
     // Another tab used this token moments ago (browsers without Web Locks)
     if (res.status === 409) return waitForRotation(refreshToken);
-    if (!res.ok) return false;
+    if (res.status === 401) return false;
+    if (!res.ok) throw await readError(res);
     const data = await res.json();
+    if (generation !== authGeneration() || getRefreshToken() !== refreshToken) return false;
+    if (!data || typeof data.access_token !== 'string' || typeof data.refresh_token !== 'string') {
+      clearTokens();
+      window.location.hash = '#/login';
+      throw new Error('Invalid refresh response');
+    }
     // The presented refresh token is now spent: keep the rotated one
-    setTokens(data.access_token, data.refresh_token ?? refreshToken);
+    setTokens(data.access_token, data.refresh_token);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    // Network and server failures are not evidence that the user's session ended.
+    throw error;
   }
 }
 
@@ -71,9 +80,9 @@ async function waitForRotation(spent: string): Promise<boolean> {
 export class ApiError extends Error {
   readonly status: number;
   readonly code?: string;
-  readonly data: Record<string, any>;
+  readonly data: Record<string, unknown>;
 
-  constructor(message: string, status: number, data: Record<string, any> = {}) {
+  constructor(message: string, status: number, data: Record<string, unknown> = {}) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
@@ -104,7 +113,8 @@ async function readError(res: Response): Promise<ApiError> {
   return new ApiError(body.error || res.statusText || 'Request failed', res.status, body);
 }
 
-export async function api<T = any>(path: string, options: RequestInit = {}): Promise<T> {
+export async function api<T = unknown>(path: string, options: RequestInit = {}): Promise<T> {
+  const generation = authGeneration();
   const token = getAccessToken();
   const headers: Record<string, string> = {
     ...Object.fromEntries(new Headers(options.headers).entries()),
@@ -117,9 +127,11 @@ export async function api<T = any>(path: string, options: RequestInit = {}): Pro
   }
 
   let res = await fetch(path, { ...options, headers });
+  if (token && generation !== authGeneration()) throw new Error('Session changed');
 
   if (res.status === 401 && token) {
     const refreshed = await tryRefresh(token);
+    if (generation !== authGeneration()) throw new Error('Session changed');
     if (refreshed) {
       headers['Authorization'] = `Bearer ${getAccessToken()}`;
       res = await fetch(path, { ...options, headers });
@@ -145,7 +157,9 @@ export async function api<T = any>(path: string, options: RequestInit = {}): Pro
     throw err;
   }
 
-  return res.json();
+  const data: T = await res.json();
+  if (token && generation !== authGeneration()) throw new Error('Session changed');
+  return data;
 }
 
 /**
@@ -153,7 +167,7 @@ export async function api<T = any>(path: string, options: RequestInit = {}): Pro
  * the sign-in ticket while a second factor is pending, or a session that is handed
  * to the desktop app and never stored. No refresh or step-up; failures throw `ApiError`.
  */
-export async function apiWithToken<T = any>(path: string, token: string | null, options: RequestInit = {}): Promise<T> {
+export async function apiWithToken<T = unknown>(path: string, token: string | null, options: RequestInit = {}): Promise<T> {
   const headers: Record<string, string> = {
     ...Object.fromEntries(new Headers(options.headers).entries()),
   };

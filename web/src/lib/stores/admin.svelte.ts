@@ -1,4 +1,6 @@
 import { api, ApiError } from '../api';
+import { onSessionEnd } from '../auth';
+import { priceForDisplay } from '../money';
 import { titleCase } from '../format';
 import { requestStepUp } from './reauth.svelte';
 import { publicSettings } from './settings.svelte';
@@ -372,10 +374,7 @@ export function apiTokenStatus(token: ApiToken, now: number = Date.now()): ApiTo
 }
 
 /** A plan price as a number, whether the server sent a number or a decimal string. */
-export function planPrice(value: number | string | null | undefined): number {
-  const price = typeof value === 'number' ? value : Number.parseFloat(value ?? '');
-  return Number.isFinite(price) ? price : 0;
-}
+export const planPrice = priceForDisplay;
 
 // === State ===
 
@@ -475,6 +474,14 @@ export async function ensureRecentAuth(reason: string): Promise<boolean> {
 // === Users ===
 
 let usersRequest = 0;
+onSessionEnd(() => {
+  usersRequest++;
+  Object.assign(adminState, {
+    users: [], usersTotal: 0, usersQuery: '', stats: null, plans: [], downloads: [],
+    releases: [], settings: null, apiTokens: [], loading: false,
+  });
+  Object.assign(adminGate, { required: false, enrolled: false });
+});
 
 /**
  * Loads a page of users into `adminState`. A response overtaken by a newer request

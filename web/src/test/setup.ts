@@ -102,10 +102,14 @@ export function jsonResponse(status: number, body: unknown, statusText = ''): Re
 }
 
 beforeEach(() => {
-  vi.stubGlobal('localStorage', new MemoryStorage());
-  const location = makeLocation();
-  vi.stubGlobal('location', location);
-  vi.stubGlobal('window', { location });
+  if (typeof document === 'undefined') {
+    vi.stubGlobal('localStorage', new MemoryStorage());
+    const location = makeLocation();
+    vi.stubGlobal('location', location);
+    vi.stubGlobal('window', { location });
+  } else {
+    localStorage.clear();
+  }
   FakeWebSocket.reset();
   vi.stubGlobal('WebSocket', FakeWebSocket);
   vi.stubGlobal('fetch', vi.fn());

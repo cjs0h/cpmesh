@@ -3,9 +3,9 @@
   import Router, { router } from 'svelte-spa-router';
   import { wrap } from 'svelte-spa-router/wrap';
   import { setReauthHandler } from './lib/api';
-  import { isLoggedIn, parseAppSignIn } from './lib/auth';
+  import { authSession, parseAppSignIn } from './lib/auth';
   import { fetchCurrentUser, userState } from './lib/stores/user.svelte';
-  import { prependEntry } from './lib/stores/clipboard.svelte';
+  import { prependEntry, parseClipboardEntry } from './lib/stores/clipboard.svelte';
   import { updateDeviceStatus } from './lib/stores/devices.svelte';
   import { markActivity } from './lib/stores/connection.svelte';
   import { requestStepUp } from './lib/stores/reauth.svelte';
@@ -55,13 +55,13 @@
     '*': NotFound,
   };
 
-  let loggedIn = $state(isLoggedIn());
+  const loggedIn = $derived($authSession);
 
   // Sign-in pages stay reachable with a session: SSO callbacks, the desktop app's
   // "Sign in with browser", and the sign-in screen once the session has ended.
   const signInPage = $derived(
     router.location === '/auth/callback' ||
-      (router.location === '/login' && (!isLoggedIn() || parseAppSignIn(router.querystring) !== null)),
+      (router.location === '/login' && (!loggedIn || parseAppSignIn(router.querystring) !== null)),
   );
   // Two-factor authentication is required but not set up yet (an older session, or reset by an admin)
   const mustEnroll = $derived(userState.id !== '' && userState.mfa.required && !userState.mfa.enabled);
@@ -80,8 +80,15 @@
     // Keep the shared stores live so every page reflects pushes immediately.
     const unsub = onWSMessage((msg) => {
       markActivity();
-      if (msg.type === 'clipboard_new' && msg.payload?.entry) prependEntry(msg.payload.entry);
-      else if (msg.type === 'device_status' && msg.payload) updateDeviceStatus(msg.payload.device_id, msg.payload.online);
+      const payload = msg.payload;
+      if (!payload || typeof payload !== 'object') return;
+      if (msg.type === 'clipboard_new' && 'entry' in payload) {
+        try { prependEntry(parseClipboardEntry(payload.entry)); }
+        catch (error) { console.warn('Invalid clipboard event', error); }
+      } else if (msg.type === 'device_status' && 'device_id' in payload && 'online' in payload
+        && typeof payload.device_id === 'string' && typeof payload.online === 'boolean') {
+        updateDeviceStatus(payload.device_id, payload.online);
+      }
     });
     return () => {
       setReauthHandler(null);
@@ -101,6 +108,11 @@
       Unlocking your workspace…
     </div>
   </div>
+{:else if userState.error}
+    <div class="wrap py-12" role="alert">
+      <p>{userState.error}</p>
+      <button type="button" onclick={fetchCurrentUser}>Retry account loading</button>
+    </div>
 {:else if mustEnroll}
   <EnrollGate />
 {:else}

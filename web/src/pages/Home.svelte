@@ -5,21 +5,11 @@
   import SyncDemo from '../components/landing/SyncDemo.svelte';
   import Button from '../components/ui/Button.svelte';
   import { agentSetups, DEFAULT_SERVER_URL } from '../lib/mcp';
+  import { currentDownloads, type PublicDownload as DownloadLink } from '../lib/downloads';
 
   const GITHUB_URL = 'https://github.com/cjs0h/cpmesh';
 
   // --- Downloads (DB-driven) ---
-  interface DownloadLink {
-    id: string;
-    name: string;
-    url: string;
-    platform: string;
-    arch: string;
-    format: string;
-    sort_order: number;
-    is_active: boolean;
-  }
-
   interface PlatformGroup {
     platform: string;
     label: string;
@@ -64,6 +54,8 @@
   }
 
   let downloads = $state<DownloadLink[]>([]);
+  let downloadError = $state('');
+  let downloadsLoading = $state(true);
   let detectedPlatform = $state('');
   const dlGroups = $derived(groupByPlatform(downloads, detectedPlatform));
   const detectedGroup = $derived(dlGroups.find((g) => g.platform === detectedPlatform) ?? dlGroups[0]);
@@ -71,10 +63,11 @@
 
   onMount(() => {
     detectedPlatform = detectPlatform();
-    fetch('/api/downloads/current')
-      .then((res) => (res.ok ? res.json() : []))
-      .then((data) => (downloads = Array.isArray(data) ? data : []))
-      .catch(() => {});
+    const controller = new AbortController();
+    currentDownloads(controller.signal).then((data) => { downloads = data; })
+      .catch((error) => { if (!controller.signal.aborted) downloadError = String(error); })
+      .finally(() => { downloadsLoading = false; });
+    return () => controller.abort();
   });
 
   // --- Navigation ---
@@ -153,7 +146,7 @@
   const agentAbilities = [
     { icon: 'send', text: 'Sends commands, links and snippets straight to your phone or desktop clipboard' },
     { icon: 'clipboard', text: 'Reads and searches what you copied, decrypted only on your machine' },
-    { icon: 'key', text: 'Joins as its own device, approved with an 8-digit code like any other' },
+    { icon: 'key', text: 'Joins as its own device after full-fingerprint verification on both ends' },
   ];
 
   const protocols = [
@@ -423,7 +416,11 @@ relay.send(ciphertext)  <span class="text-dim">// the relay only ever sees this<
         {@render sectionHeader('Downloads', 'Get the app for your platform', 'System-tray integration, background sync and automatic reconnection are included on every platform.')}
 
         <div class="mt-12 overflow-hidden rounded-lg border border-border bg-surface">
-          {#if dlGroups.length > 0}
+          {#if downloadError}
+            <p class="p-6 text-sm text-danger" role="alert">Downloads are temporarily unavailable: {downloadError}</p>
+          {:else if downloadsLoading}
+            <p class="p-6 text-sm text-muted" role="status">Loading downloads...</p>
+          {:else if dlGroups.length > 0}
             {#if detectedGroup}
               <div class="flex flex-col gap-5 border-b border-border p-6 sm:flex-row sm:items-center">
                 <span class="text-fg"><Icon name={detectedGroup.icon} size={28} strokeWidth={1.5} /></span>

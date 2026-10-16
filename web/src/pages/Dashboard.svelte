@@ -5,7 +5,7 @@
   import { userState } from '../lib/stores/user.svelte';
   import { connectionState } from '../lib/stores/connection.svelte';
   import { createClock } from '../lib/clock.svelte';
-  import { absoluteTime, base64Size, contentTypeMeta, formatBytes, greeting, relativeTime } from '../lib/format';
+  import { absoluteTime, contentTypeMeta, formatBytes, greeting, relativeTime } from '../lib/format';
   import Icon from '../components/Icon.svelte';
   import StatCard from '../components/ui/StatCard.svelte';
   import Card from '../components/ui/Card.svelte';
@@ -15,6 +15,7 @@
   import Skeleton from '../components/ui/Skeleton.svelte';
   import IconTile from '../components/ui/IconTile.svelte';
   import DownloadButtons from '../components/ui/DownloadButtons.svelte';
+  import Alert from '../components/ui/Alert.svelte';
 
   const clock = createClock();
   let initialLoad = $state(true);
@@ -45,6 +46,7 @@
 </script>
 
 <!-- Greeting -->
+{#if clipboardState.error || devicesState.error}<Alert tone="danger">{clipboardState.error || devicesState.error}</Alert>{/if}
 <div class="mb-6 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
   <div>
     <p class="text-xs font-medium text-muted">Overview</p>
@@ -105,7 +107,7 @@
             <div class="min-w-0 flex-1">
               <p class="truncate text-sm font-medium text-fg">{meta.label} from {entry.device_name || 'unknown device'}</p>
               <p class="mt-0.5 flex items-center gap-2 text-[12px] text-dim">
-                <span class="font-mono">{formatBytes(base64Size(entry.encrypted_data))}</span>
+                <span class="font-mono">{formatBytes(entry.encrypted_size)}</span>
                 <span aria-hidden="true">·</span>
                 <span class="inline-flex items-center gap-1"><Icon name="lock" size={10} /> encrypted</span>
               </p>

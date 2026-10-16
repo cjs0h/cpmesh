@@ -61,16 +61,16 @@
 
   const pairing = [
     { title: 'Ask your agent to connect', desc: 'Say "Connect to cpmesh". The agent calls cpmesh_status, then asks for your username, password and the 6-digit code from your authenticator app, and calls cpmesh_login.' },
-    { title: 'Get the pairing code', desc: 'The agent registers as a new device named "MCP Agent - <hostname>" and shows you an 8-digit pairing code.' },
-    { title: 'Approve on a device you trust', desc: 'Open the cpmesh app on an approved device, go to Devices, approve the new agent and check that the code matches.' },
+    { title: 'Get the full fingerprint', desc: 'Start approval in Devices on a trusted device, then ask the agent for cpmesh_status. It shows a 64-character pairing fingerprint.' },
+    { title: 'Confirm on both ends', desc: 'Compare every character directly on the trusted device or through an independent trusted channel. Confirm there, then give the independently confirmed fingerprint to the agent for cpmesh_confirm_pairing.' },
     { title: 'Start using it', desc: 'The agent calls cpmesh_wait_for_approval, receives the encryption key and is ready. Sign-in persists across restarts.' },
   ];
 
   const security = [
     'The agent is a real cpmesh device with its own ECDH P-256 key pair. Clips are encrypted with AES-256-GCM before they leave your machine, and the relay only stores ciphertext.',
-    'Pairing requires a person to compare the 8-digit code on an approved device. This is the check that stops a man-in-the-middle, and the agent cannot skip it.',
-    'Peer keys are verified by signature and pinned on first use. A changed key is refused as a possible attack.',
-    'State lives in ~/.cpmesh/mcp (files are 0600 on macOS and Linux). Remove the agent from Devices or ask it to run cpmesh_logout to revoke it.',
+    'Pairing requires a person to compare all 64 characters on both ends through an independent trusted channel. Do not shorten the fingerprint or skip confirmation.',
+    'Peer identities require explicit verification or a signed transition from a verified member. A relay-provided self-signature or approval flag does not establish trust.',
+    'State lives in ~/.cpmesh/mcp (files are 0600 on macOS and Linux). Remove the agent from Devices to revoke access. cpmesh_logout only wipes its local profile.',
   ];
 
   const troubleshooting = [

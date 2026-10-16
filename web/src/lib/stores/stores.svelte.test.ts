@@ -28,12 +28,10 @@ const fetchMock = () => fetch as unknown as Mock;
 function entry(id: string) {
   return {
     id,
-    user_id: 'u',
     device_id: 'd',
     device_name: 'Laptop',
     content_type: 'text',
-    encrypted_data: 'AA==',
-    metadata: '',
+    encrypted_size: 1,
     created_at: '2026-01-01T00:00:00Z',
   };
 }
@@ -123,7 +121,7 @@ describe('clipboard store', () => {
     expect(clipboardState.loading).toBe(true);
     await pending;
 
-    expect(fetchMock().mock.calls[0][0]).toBe('/api/clipboard?limit=20&offset=0');
+    expect(fetchMock().mock.calls[0][0]).toBe('/api/clipboard?metadata_only=true&limit=20&offset=0');
     expect(clipboardState.entries.map((e) => e.id)).toEqual(['e1', 'e2']);
     expect(clipboardState.hasMore).toBe(true);
     expect(clipboardState.loading).toBe(false);
@@ -134,7 +132,7 @@ describe('clipboard store', () => {
 
     await loadNextPage();
     expect(clipboardState.offset).toBe(20);
-    expect(fetchMock().mock.calls.at(-1)?.[0]).toBe('/api/clipboard?limit=20&offset=20');
+    expect(fetchMock().mock.calls.at(-1)?.[0]).toBe('/api/clipboard?metadata_only=true&limit=20&offset=20');
 
     await loadNextPage();
     expect(clipboardState.offset).toBe(40);
@@ -151,17 +149,19 @@ describe('clipboard store', () => {
     expect(clipboardState.offset).toBe(0);
   });
 
-  it('empties the list on error and tolerates a missing entries field', async () => {
+  it('preserves the last snapshot and reports failed or malformed loads', async () => {
     clipboardState.entries = [entry('old')];
     fetchMock().mockResolvedValueOnce(jsonResponse(500, { error: 'boom' }));
     await fetchClipboard();
-    expect(clipboardState.entries).toEqual([]);
+    expect(clipboardState.entries).toEqual([entry('old')]);
+    expect(clipboardState.error).toBe('boom');
     expect(clipboardState.hasMore).toBe(false);
     expect(clipboardState.loading).toBe(false);
 
     fetchMock().mockResolvedValueOnce(jsonResponse(200, { has_more: false }));
     await fetchClipboard();
-    expect(clipboardState.entries).toEqual([]);
+    expect(clipboardState.entries).toEqual([entry('old')]);
+    expect(clipboardState.error).not.toBe('');
   });
 
   it('deletes a single entry and clears everything', async () => {
@@ -233,11 +233,12 @@ describe('devices store', () => {
     expect(devicesState.list).toHaveLength(2);
   });
 
-  it('clears the list on error', async () => {
+  it('preserves the list and reports errors', async () => {
     devicesState.list = [{ id: 'd1', name: 'x', last_seen: '', online: false, status: 'approved' }];
     fetchMock().mockResolvedValueOnce(jsonResponse(401, { error: 'nope' }));
     await fetchDevices();
-    expect(devicesState.list).toEqual([]);
+    expect(devicesState.list).toHaveLength(1);
+    expect(devicesState.error).toBe('nope');
     expect(devicesState.loading).toBe(false);
   });
 });
