@@ -35,7 +35,7 @@ cargo run -p cpmesh-server
 ```bash
 # Requires Node.js 22.12+ (24 LTS recommended)
 cd web
-npm install
+npm ci
 npm run dev
 ```
 
@@ -44,9 +44,18 @@ npm run dev
 ```bash
 # Requires Node.js 22.17+ (24 LTS recommended)
 cd desktop-tauri
-npm install
+npm ci
 npx tauri dev
 ```
+
+### JavaScript dependencies
+
+`web`, `desktop-tauri` and `mcp/cpmesh-mcp` pin their dependencies in `package-lock.json`. Install them with `npm ci`,
+and run it again after pulling a change to a lockfile. Their dev, build, check, typecheck and test scripts (and so
+`tauri dev` and `tauri build`) first run `scripts/check-deps.mjs`, which stops with that instruction when
+`node_modules` no longer matches the lockfile, instead of the build failing later with a "Cannot find module" error.
+The `scripts/build-*` scripts run `npm ci` themselves in that case. Set `CPMESH_SKIP_DEPS_CHECK=1` to skip the check,
+for example while trying out a dependency with `npm link`. The check's tests run with `node --test "scripts/*.test.mjs"`.
 
 ## Testing
 

@@ -40,11 +40,11 @@ case "$ARCH" in
     *)             ARCH_LABEL="$ARCH" ;;
 esac
 
-# Install frontend dependencies if needed
+# Install frontend dependencies when they are missing or out of date with package-lock.json
 cd "$ROOT/desktop-tauri"
-if [ ! -d "node_modules" ]; then
-    echo "Installing frontend dependencies..."
-    npm install
+if ! node "$ROOT/scripts/check-deps.mjs"; then
+    echo "Installing frontend dependencies with npm ci..."
+    npm ci
 fi
 
 # Build Tauri app (runs npm build automatically via beforeBuildCommand)

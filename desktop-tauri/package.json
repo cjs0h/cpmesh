@@ -7,11 +7,15 @@
     "node": ">=22.17"
   },
   "scripts": {
+    "predev": "node ../scripts/check-deps.mjs",
     "dev": "vite dev",
+    "prebuild": "node ../scripts/check-deps.mjs",
     "build": "vite build",
     "preview": "vite preview",
+    "precheck": "node ../scripts/check-deps.mjs",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
+    "pretest": "node ../scripts/check-deps.mjs",
     "test": "svelte-kit sync && vitest run",
     "test:watch": "vitest",
     "tauri": "tauri"

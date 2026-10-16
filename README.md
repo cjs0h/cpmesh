@@ -103,7 +103,7 @@ Download the latest release from the [Releases page](https://github.com/cjs0h/cp
 ```bash
 # Requires Rust 1.94+, Node.js 22.17+ (24 LTS recommended), and Tauri CLI
 cd desktop-tauri
-npm install
+npm ci
 npx tauri build
 ```
 

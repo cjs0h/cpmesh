@@ -5,11 +5,13 @@ on:
     branches: [main, master]
     paths:
       - "web/**"
+      - "scripts/check-deps.mjs"
       - ".github/workflows/web.yml"
   pull_request:
     branches: [main, master]
     paths:
       - "web/**"
+      - "scripts/check-deps.mjs"
       - ".github/workflows/web.yml"
 
 # CI only reads the repository; artifacts and caches use the runner's own token
