@@ -242,11 +242,11 @@ for at least 24 hours, and MCP retains up to 32 encrypted requests/receipts for 
 
 cpmesh keeps running in the tray after its window is closed, so an update (a package upgrade, the in-app updater's
 installer or a new AppImage) leaves the previous version running until it restarts. Opening cpmesh again starts the new
-version: on Linux, launching an upgraded package ends the previous version still running the replaced binary; otherwise
-the running version restarts into the new one with the launch's arguments (a `cpmesh://` sign-in link stays with the
-version that started the sign-in). While the window is open, a **Restart now** banner appears once a newer version is
-installed. Versions up to 0.4.0 do neither: if a server answers "update your client" (HTTP 426) right after you
-installed an update, quit cpmesh from its tray (menu bar) icon and open it again.
+version: on Linux, launching an upgraded package ends your previous version still running the replaced binary (never
+another user's); otherwise the running version restarts into the new one with the launch's arguments (a `cpmesh://`
+sign-in link stays with the version that started the sign-in). While the window is open, a **Restart now** banner appears
+once a newer version is installed. Versions up to 0.4.0 do neither: if a server answers "update your client" (HTTP 426)
+right after you installed an update, quit cpmesh from its tray (menu bar) icon and open it again.
 
 ### Recovering keys in the desktop app
 

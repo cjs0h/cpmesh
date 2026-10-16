@@ -164,7 +164,8 @@ pub fn update_installed() -> bool {
 /// new file in place of the old one, which the kernel then reports as deleted for the
 /// processes still running it. Versions from before [`relaunch_if_updated`] never
 /// restart by themselves, so without this an update would only take effect once they
-/// quit. An AppImage is a separate file, and links belong to the running instance
+/// quit. Only the launching user's own processes are ended, even when cpmesh runs as
+/// root. An AppImage is a separate file, and links belong to the running instance
 /// (see [`is_link_launch`]), so both are left alone.
 #[cfg(target_os = "linux")]
 pub fn end_outdated_instances(env: &tauri::Env) {
@@ -174,7 +175,12 @@ pub fn end_outdated_instances(env: &tauri::Env) {
     let Ok(exe) = tauri::process::current_binary(env) else {
         return;
     };
-    let outdated = outdated_processes(Path::new("/proc"), &exe, std::process::id());
+    let outdated = outdated_processes(
+        Path::new("/proc"),
+        &exe,
+        std::process::id(),
+        rustix::process::geteuid().as_raw(),
+    );
     if outdated.is_empty() {
         return;
     }
@@ -190,9 +196,14 @@ pub fn end_outdated_instances(env: &tauri::Env) {
     std::thread::sleep(Duration::from_millis(200));
 }
 
-/// Processes other than `own` whose executable is `exe` as it was before being replaced.
+/// Processes other than `own` that run as user `uid` and whose executable is `exe` as it
+/// was before being replaced. The kernel gives a process's `/proc/<pid>` folder to its
+/// effective user, so that is whose processes they are; anyone else's are never
+/// returned, whatever they run.
 #[cfg(target_os = "linux")]
-fn outdated_processes(proc: &Path, exe: &Path, own: u32) -> Vec<u32> {
+fn outdated_processes(proc: &Path, exe: &Path, own: u32, uid: u32) -> Vec<u32> {
+    use std::os::unix::fs::MetadataExt;
+
     let mut replaced = exe.as_os_str().to_os_string();
     replaced.push(" (deleted)");
     let Ok(entries) = std::fs::read_dir(proc) else {
@@ -202,8 +213,11 @@ fn outdated_processes(proc: &Path, exe: &Path, own: u32) -> Vec<u32> {
         .flatten()
         .filter_map(|entry| {
             let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
+            if pid == own || entry.metadata().ok()?.uid() != uid {
+                return None;
+            }
             let running = std::fs::read_link(entry.path().join("exe")).ok()?;
-            (pid != own && running.as_os_str() == replaced).then_some(pid)
+            (running.as_os_str() == replaced).then_some(pid)
         })
         .collect()
 }
@@ -283,6 +297,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn finds_processes_still_running_a_replaced_executable() {
+        use std::os::unix::fs::MetadataExt;
+
         let proc = tempfile::tempdir().unwrap();
         let link = |pid: &str, target: &str| {
             std::fs::create_dir(proc.path().join(pid)).unwrap();
@@ -293,13 +309,41 @@ mod tests {
         link("300", "/opt/other/cpmesh-desktop (deleted)");
         link("400", "/usr/bin/cpmesh-desktop (deleted)");
         std::fs::create_dir(proc.path().join("self")).unwrap();
-        let mut found = outdated_processes(proc.path(), Path::new("/usr/bin/cpmesh-desktop"), 400);
+        let user = std::fs::metadata(proc.path().join("100")).unwrap().uid();
+        let mut found =
+            outdated_processes(proc.path(), Path::new("/usr/bin/cpmesh-desktop"), 400, user);
         found.sort();
         assert_eq!(
             found,
             [100],
             "only other processes running the replaced file"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn leaves_other_users_processes_alone() {
+        use std::os::unix::fs::MetadataExt;
+
+        let proc = tempfile::tempdir().unwrap();
+        let process = proc.path().join("100");
+        std::fs::create_dir(&process).unwrap();
+        std::os::unix::fs::symlink("/usr/bin/cpmesh-desktop (deleted)", process.join("exe"))
+            .unwrap();
+        // Like /proc/<pid>, the folder belongs to the user the process runs as
+        let user = std::fs::metadata(&process).unwrap().uid();
+        let exe = Path::new("/usr/bin/cpmesh-desktop");
+
+        assert_eq!(outdated_processes(proc.path(), exe, 1, user), [100]);
+        // Not even a cpmesh running as root ends another user's process
+        for other in [0, user.wrapping_add(1)] {
+            if other != user {
+                assert!(
+                    outdated_processes(proc.path(), exe, 1, other).is_empty(),
+                    "found by uid {other}"
+                );
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -326,11 +370,15 @@ mod tests {
         std::fs::copy("/bin/sh", &staged).unwrap();
         std::fs::rename(&staged, &exe).unwrap();
 
-        let found = outdated_processes(Path::new("/proc"), &exe, std::process::id());
+        let own = std::process::id();
+        let user = rustix::process::geteuid().as_raw();
+        let found = outdated_processes(Path::new("/proc"), &exe, own, user);
         assert_eq!(found, [child.id()]);
+        // The real /proc gives it to this test's user, so for anyone else it isn't there
+        assert!(outdated_processes(Path::new("/proc"), &exe, own, user.wrapping_add(1)).is_empty());
         terminate(child.id());
         let status = child.wait().unwrap();
         assert!(!status.success(), "ended by the signal");
-        assert!(outdated_processes(Path::new("/proc"), &exe, std::process::id()).is_empty());
+        assert!(outdated_processes(Path::new("/proc"), &exe, own, user).is_empty());
     }
 }
