@@ -49,10 +49,11 @@ impl Db {
         }
         let status = if count == 0 { "approved" } else { "pending" };
         let device = sqlx::query_as::<_, Device>(
-            "INSERT INTO devices (user_id, name, public_key, public_key_sig, status, fingerprint, approved_at)
-             VALUES ($1, $2, $3, $4, $5, $6, CASE WHEN $5 = 'approved' THEN NOW() ELSE NULL END) RETURNING *",
+            "INSERT INTO devices (user_id, name, public_key, public_key_sig, status, fingerprint, approved_at, encryption_key, encryption_key_sig)
+             VALUES ($1, $2, $3, $4, $5, $6, CASE WHEN $5 = 'approved' THEN NOW() ELSE NULL END, $7, $8) RETURNING *",
         ).bind(user_id).bind(&req.name).bind(&req.public_key).bind(&req.public_key_sig)
-            .bind(status).bind(&req.fingerprint).fetch_one(&mut *tx).await?;
+            .bind(status).bind(&req.fingerprint).bind(&req.encryption_key).bind(&req.encryption_key_sig)
+            .fetch_one(&mut *tx).await?;
         tx.commit().await?;
         Ok(Some(device))
     }
@@ -194,16 +195,19 @@ impl Db {
         }
         let metadata = payload.metadata.as_deref().unwrap_or_default();
         let content_type = payload.content_type.to_string();
+        let signature = payload.sender_signature.as_deref().unwrap_or_default();
         let mut hash = Sha256::new();
         for part in [
             content_type.as_bytes(),
             payload.encrypted_data.as_slice(),
             metadata.as_bytes(),
+            signature,
         ] {
             hash.update((part.len() as u64).to_be_bytes());
             hash.update(part);
         }
         hash.update(payload.key_version.to_be_bytes());
+        hash.update(payload.sent_at.unwrap_or_default().to_be_bytes());
         let digest = hash.finalize().to_vec();
         let receipt: Option<(Uuid, chrono::DateTime<chrono::Utc>, Vec<u8>)> = sqlx::query_as(
             "SELECT entry_id, created_at, payload_hash FROM clipboard_requests
@@ -236,6 +240,8 @@ impl Db {
                 || entry.metadata.as_deref().unwrap_or_default() != metadata
                 || entry.key_version != payload.key_version
                 || entry.content_type != payload.content_type.to_string()
+                || entry.sent_at != payload.sent_at
+                || entry.sender_signature.as_deref().unwrap_or_default() != signature
             {
                 return Ok(ClipboardWrite::Rejected("request_id_conflict"));
             }
@@ -254,10 +260,11 @@ impl Db {
             return Ok(ClipboardWrite::Rejected("rotation_required"));
         }
         let entry = sqlx::query_as::<_, ClipboardEntryRow>(
-            "INSERT INTO clipboard_entries (user_id, device_id, request_id, content_type, encrypted_data, metadata, key_version)
-             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *",
+            "INSERT INTO clipboard_entries (user_id, device_id, request_id, content_type, encrypted_data, metadata, key_version, sent_at, sender_signature)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *",
         ).bind(user_id).bind(device_id).bind(request_id).bind(payload.content_type.to_string())
             .bind(&payload.encrypted_data).bind(metadata).bind(payload.key_version)
+            .bind(payload.sent_at).bind(&payload.sender_signature)
             .fetch_one(&mut *tx).await?;
         sqlx::query(
                 "INSERT INTO clipboard_requests (user_id, device_id, request_id, entry_id, payload_hash, created_at)

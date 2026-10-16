@@ -34,6 +34,11 @@ const MAX_CONNECTIONS_PER_USER: usize = 10;
 const MAX_WIRE_BYTES: usize =
     (MAX_FILE_BYTES + ENCRYPTION_OVERHEAD).div_ceil(3) * 4 + MAX_METADATA_BYTES * 2 + 4096;
 const SEND_DEADLINE: Duration = Duration::from_secs(5);
+/// Sender clocks more than a day off are rejected explicitly rather than failing
+/// silently on receivers' replay checks.
+const CLOCK_SKEW_MS: i64 = 24 * 60 * 60 * 1000;
+/// A DER P-256 signature is at most 72 bytes (96 base64 characters).
+const MAX_SIGNATURE_CHARS: usize = 128;
 
 // WS ticket store (short-lived, single-use)
 static TICKETS: LazyLock<Mutex<HashMap<String, WsTicket>>> =
@@ -156,7 +161,7 @@ pub async fn handle_ws_upgrade(
             != Some(PROTOCOL_VERSION)
     {
         return json_error(
-            "update your client: WebSocket protocol 2 is required",
+            &format!("update your client: WebSocket protocol {PROTOCOL_VERSION} is required"),
             StatusCode::UPGRADE_REQUIRED,
         );
     }
@@ -414,6 +419,45 @@ async fn handle_clipboard_push(
     {
         return rejected(&id, "payload_size");
     }
+    // Protocol v3: the entry is signed by the sending device's identity key over
+    // its context and ciphertexts. Receivers verify this themselves; the relay
+    // checks it too so a stolen session token alone cannot inject entries.
+    let (Some(sent_at), Some(signature)) = (payload.sent_at, payload.sender_signature.as_deref())
+    else {
+        return rejected(&id, "signature_required");
+    };
+    let now = chrono::Utc::now().timestamp_millis();
+    if sent_at <= 0 || (now - sent_at).abs() > CLOCK_SKEW_MS {
+        return rejected(&id, "clock_skew");
+    }
+    let metadata_bytes = match payload.metadata.as_deref() {
+        Some(encoded) if !encoded.is_empty() => {
+            match base64::engine::general_purpose::STANDARD.decode(encoded) {
+                Ok(bytes) => bytes,
+                Err(_) => return rejected(&id, "invalid_payload"),
+            }
+        }
+        _ => Vec::new(),
+    };
+    let sender_key = match state.db.get_device_by_id(device_id).await {
+        Ok(device) => device.public_key,
+        Err(e) => {
+            warn!(%user_id, "Failed to load sender identity: {e}");
+            return rejected(&id, "temporarily_unavailable");
+        }
+    };
+    let transcript = clipboard_signature_transcript(
+        payload.key_version,
+        &payload.content_type,
+        &device_id.to_string(),
+        &id,
+        sent_at,
+        &payload.encrypted_data,
+        &metadata_bytes,
+    );
+    if !super::devices::verify_device_signature(&sender_key, &transcript, signature) {
+        return rejected(&id, "invalid_signature");
+    }
     let sub = match state.db.get_user_subscription(user_id).await {
         Ok(sub) => sub,
         Err(e) => {
@@ -464,6 +508,9 @@ async fn handle_clipboard_push(
                         "metadata": entry.metadata.unwrap_or_default(),
                         "created_at": entry.created_at.to_rfc3339(),
                         "key_version": entry.key_version,
+                        "request_id": entry.request_id.map(|id| id.to_string()),
+                        "sent_at": entry.sent_at,
+                        "sender_signature": entry.sender_signature.map(|sig| base64::engine::general_purpose::STANDARD.encode(sig)),
                     }
                 }),
             };
@@ -523,6 +570,10 @@ fn validate_push_wire(value: &serde_json::Value) -> Result<(), &'static str> {
             .get("metadata")
             .and_then(|v| v.as_str())
             .is_some_and(|s| s.len() > MAX_METADATA_BYTES)
+        || value
+            .get("sender_signature")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.len() > MAX_SIGNATURE_CHARS)
     {
         return Err("payload_size");
     }

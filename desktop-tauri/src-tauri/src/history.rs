@@ -195,6 +195,7 @@ impl HistoryRow {
             data: self.data,
             metadata,
             created_at,
+            authenticated: true,
         }
     }
 }
@@ -233,6 +234,7 @@ mod tests {
                 ..Metadata::default()
             },
             created_at: Utc.timestamp_opt(1_700_000_000 + secs, 0).unwrap(),
+            authenticated: true,
         }
     }
 
@@ -316,6 +318,7 @@ mod tests {
                 height: Some(480),
             },
             created_at: Utc.timestamp_opt(1_700_000_123, 0).unwrap(),
+            authenticated: true,
         };
         h.add(&e).unwrap();
 

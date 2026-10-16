@@ -143,13 +143,17 @@ export interface PendingDevice {
 
 export interface ApprovalSession {
 	session_id: string;
+	/** Full 64-character pairing code over both identity keys. */
 	approval_code: string;
+	/** Eight-digit short authentication string ("1234 5678"), once both devices have contributed. */
+	sas?: string | null;
 	expires_at: string;
 }
 
 export interface MyApprovalStatus {
 	status: 'pending' | 'approved' | 'rejected' | 'revoked';
 	approval_code?: string;
+	sas?: string | null;
 	session_id?: string;
 	locally_verified: boolean;
 }
@@ -160,6 +164,11 @@ export async function getPendingDevices(): Promise<PendingDevice[]> {
 
 export async function beginDeviceApproval(pendingDeviceId: string): Promise<ApprovalSession> {
 	return invoke('begin_device_approval', { pendingDeviceId });
+}
+
+/** Approver: advances the committed short-code exchange; `sas` is set once both nonces are known. */
+export async function pollDeviceApproval(pendingDeviceId: string, sessionId: string): Promise<ApprovalSession> {
+	return invoke('poll_device_approval', { pendingDeviceId, sessionId });
 }
 
 export async function confirmDeviceApproval(pendingDeviceId: string, sessionId: string, fingerprint: string): Promise<void> {

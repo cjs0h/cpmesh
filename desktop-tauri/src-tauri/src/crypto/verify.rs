@@ -19,6 +19,8 @@ pub enum VerifyError {
     Revoked,
     #[error("invalid persisted membership state")]
     InvalidState,
+    #[error("clipboard entry is a replay or arrived out of order")]
+    Replay,
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
@@ -33,7 +35,8 @@ pub enum VerifyError {
 ///
 /// Key changes after pinning are hard failures (possible MITM).
 pub struct KeyVerifier {
-    pins: HashMap<String, String>, // device_id -> hex(SHA-256(public_key))
+    pins: HashMap<String, String>,  // device_id -> hex(SHA-256(public_key))
+    keys: HashMap<String, Vec<u8>>, // device_id -> SEC1 public key, for signature checks
     version: i32,
     revoked: HashMap<String, i64>,
     rotation_required: bool,
@@ -47,6 +50,7 @@ impl KeyVerifier {
         let file_path = config_dir.join("verified_keys.json");
         let mut kv = KeyVerifier {
             pins: HashMap::new(),
+            keys: HashMap::new(),
             version: 0,
             revoked: HashMap::new(),
             rotation_required: false,
@@ -72,6 +76,36 @@ impl KeyVerifier {
             return Err(VerifyError::KeyChanged);
         }
         self.pins.insert(device_id.to_string(), hash);
+        self.keys
+            .insert(device_id.to_string(), public_key_to_bytes(public_key));
+        self.save()
+    }
+
+    /// The pinned identity key of a member, for verifying its signatures. Pins
+    /// written before v3 stored only the hash; `record_public_key` fills them in
+    /// once a key matching the pin has been seen.
+    pub fn public_key_of(&self, device_id: &str) -> Option<PublicKey> {
+        if self.revoked.contains_key(device_id) {
+            return None;
+        }
+        self.keys
+            .get(device_id)
+            .and_then(|bytes| super::keys::KeyPair::parse_public_key(bytes).ok())
+    }
+
+    /// Stores the full key behind an existing hash-only pin after checking it
+    /// matches; never creates a new pin.
+    pub fn record_public_key(
+        &mut self,
+        device_id: &str,
+        public_key: &PublicKey,
+    ) -> Result<(), VerifyError> {
+        self.verify_identity(device_id, public_key)?;
+        if self.keys.contains_key(device_id) {
+            return Ok(());
+        }
+        self.keys
+            .insert(device_id.to_string(), public_key_to_bytes(public_key));
         self.save()
     }
 
@@ -124,6 +158,7 @@ impl KeyVerifier {
             return Ok(());
         }
         let mut pins = HashMap::new();
+        let mut keys = HashMap::new();
         for member in members {
             if self
                 .revoked
@@ -140,6 +175,7 @@ impl KeyVerifier {
             {
                 return Err(VerifyError::KeyChanged);
             }
+            keys.insert(member.id.clone(), public_key_to_bytes(&key));
         }
         if version == self.version {
             let active: HashMap<_, _> = self
@@ -159,6 +195,7 @@ impl KeyVerifier {
             }
         }
         self.pins.extend(pins);
+        self.keys.extend(keys);
         self.version = version;
         self.rotation_required = false;
         self.save()
@@ -202,6 +239,8 @@ impl KeyVerifier {
                     version: i32,
                     pins: HashMap<String, String>,
                     #[serde(default)]
+                    keys: HashMap<String, String>,
+                    #[serde(default)]
                     revoked: HashMap<String, i64>,
                     #[serde(default)]
                     rotation_required: bool,
@@ -210,6 +249,20 @@ impl KeyVerifier {
                 if saved.version < 0 || saved.revoked.values().any(|epoch| *epoch < 1) {
                     return Err(VerifyError::InvalidState);
                 }
+                // A stored key must match its pin; anything else is tampering or corruption.
+                let mut keys = HashMap::new();
+                for (id, encoded) in saved.keys {
+                    let bytes =
+                        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
+                            .map_err(|_| VerifyError::InvalidState)?;
+                    let key = super::keys::KeyPair::parse_public_key(&bytes)
+                        .map_err(|_| VerifyError::InvalidState)?;
+                    if saved.pins.get(&id) != Some(&hash_public_key(&key)) {
+                        return Err(VerifyError::InvalidState);
+                    }
+                    keys.insert(id, bytes);
+                }
+                self.keys = keys;
                 self.pins = saved.pins;
                 self.version = saved.version;
                 self.revoked = saved.revoked;
@@ -225,11 +278,62 @@ impl KeyVerifier {
         if let Some(dir) = self.file_path.parent() {
             fs::create_dir_all(dir)?;
         }
+        let keys: HashMap<&String, String> = self
+            .keys
+            .iter()
+            .map(|(id, bytes)| {
+                (
+                    id,
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes),
+                )
+            })
+            .collect();
         let data = serde_json::to_vec(&serde_json::json!({
-            "version": self.version, "pins": self.pins, "revoked": self.revoked,
+            "version": self.version, "pins": self.pins, "keys": keys, "revoked": self.revoked,
             "rotation_required": self.rotation_required,
         }))?;
         super::keys::write_private_file(&self.file_path, &data)?;
+        Ok(())
+    }
+}
+
+/// Per-sender high-water mark of `sent_at`, so a relay cannot re-deliver an old
+/// entry as new. Live entries must arrive with strictly increasing sender clocks;
+/// history catch-up does not use this guard.
+pub struct ReplayGuard {
+    last_sent_at: HashMap<String, i64>,
+    file_path: PathBuf,
+}
+
+impl ReplayGuard {
+    pub fn new(config_dir: &Path) -> Result<Self, VerifyError> {
+        let file_path = config_dir.join("sender_clocks.json");
+        let last_sent_at = match fs::read_to_string(&file_path) {
+            Ok(data) => serde_json::from_str(&data)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(ReplayGuard {
+            last_sent_at,
+            file_path,
+        })
+    }
+
+    /// Accepts `sent_at` only if it is newer than everything seen from `device_id`.
+    pub fn accept(&mut self, device_id: &str, sent_at: i64) -> Result<(), VerifyError> {
+        if sent_at <= 0
+            || self
+                .last_sent_at
+                .get(device_id)
+                .is_some_and(|last| sent_at <= *last)
+        {
+            return Err(VerifyError::Replay);
+        }
+        self.last_sent_at.insert(device_id.to_string(), sent_at);
+        if let Some(dir) = self.file_path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        super::keys::write_private_file(&self.file_path, &serde_json::to_vec(&self.last_sent_at)?)?;
         Ok(())
     }
 }
@@ -396,5 +500,122 @@ mod tests {
         kv.pin_after_approval("dev-1", &KeyPair::generate().public)
             .unwrap();
         assert!(nested.join("verified_keys.json").is_file());
+    }
+}
+
+#[cfg(test)]
+mod v3_tests {
+    use super::*;
+    use crate::crypto::keys::{KeyPair, public_key_to_bytes};
+    use cpmesh_proto::models::DeviceIdentity;
+    use tempfile::TempDir;
+
+    #[test]
+    fn pins_keep_the_full_key_for_signature_checks() {
+        let dir = TempDir::new().unwrap();
+        let kp = KeyPair::generate();
+        {
+            let mut kv = KeyVerifier::new(dir.path()).unwrap();
+            kv.pin_after_approval("dev-1", &kp.public).unwrap();
+        }
+        let kv = KeyVerifier::new(dir.path()).unwrap();
+        assert_eq!(
+            public_key_to_bytes(&kv.public_key_of("dev-1").unwrap()),
+            kp.public_key_bytes()
+        );
+        assert!(kv.public_key_of("dev-2").is_none());
+    }
+
+    #[test]
+    fn hash_only_legacy_pins_learn_their_key_only_when_it_matches() {
+        let dir = TempDir::new().unwrap();
+        let kp = KeyPair::generate();
+        fs::write(
+            dir.path().join("verified_keys.json"),
+            serde_json::json!({"version": 1, "pins": {"dev-1": hash_public_key(&kp.public)}})
+                .to_string(),
+        )
+        .unwrap();
+        let mut kv = KeyVerifier::new(dir.path()).unwrap();
+        assert!(kv.public_key_of("dev-1").is_none());
+        let other = KeyPair::generate();
+        assert!(matches!(
+            kv.record_public_key("dev-1", &other.public),
+            Err(VerifyError::KeyChanged)
+        ));
+        assert!(matches!(
+            kv.record_public_key("dev-9", &kp.public),
+            Err(VerifyError::NotPinned)
+        ));
+        kv.record_public_key("dev-1", &kp.public).unwrap();
+        assert!(
+            KeyVerifier::new(dir.path())
+                .unwrap()
+                .public_key_of("dev-1")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn stored_keys_that_do_not_match_their_pin_are_rejected() {
+        let dir = TempDir::new().unwrap();
+        let kp = KeyPair::generate();
+        let other = KeyPair::generate();
+        fs::write(
+            dir.path().join("verified_keys.json"),
+            serde_json::json!({
+                "version": 1,
+                "pins": {"dev-1": hash_public_key(&kp.public)},
+                "keys": {"dev-1": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, other.public_key_bytes())},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(matches!(
+            KeyVerifier::new(dir.path()),
+            Err(VerifyError::InvalidState)
+        ));
+    }
+
+    #[test]
+    fn membership_transitions_record_member_keys_and_revocation_hides_them() {
+        let dir = TempDir::new().unwrap();
+        let a = KeyPair::generate();
+        let b = KeyPair::generate();
+        let members = vec![
+            DeviceIdentity {
+                id: "a".into(),
+                public_key: a.public_key_bytes(),
+            },
+            DeviceIdentity {
+                id: "b".into(),
+                public_key: b.public_key_bytes(),
+            },
+        ];
+        let mut kv = KeyVerifier::new(dir.path()).unwrap();
+        kv.accept_membership(1, &members).unwrap();
+        assert!(kv.public_key_of("a").is_some() && kv.public_key_of("b").is_some());
+        kv.accept_membership(2, &members[..1]).unwrap();
+        assert!(kv.public_key_of("b").is_none());
+        assert!(kv.public_key_of("a").is_some());
+    }
+
+    #[test]
+    fn replay_guard_requires_strictly_increasing_sender_clocks() {
+        let dir = TempDir::new().unwrap();
+        let mut guard = ReplayGuard::new(dir.path()).unwrap();
+        assert!(matches!(guard.accept("a", 0), Err(VerifyError::Replay)));
+        guard.accept("a", 100).unwrap();
+        assert!(matches!(guard.accept("a", 100), Err(VerifyError::Replay)));
+        assert!(matches!(guard.accept("a", 99), Err(VerifyError::Replay)));
+        guard.accept("a", 101).unwrap();
+        // Independent per sender, and persisted.
+        guard.accept("b", 5).unwrap();
+        let mut reloaded = ReplayGuard::new(dir.path()).unwrap();
+        assert!(matches!(
+            reloaded.accept("a", 101),
+            Err(VerifyError::Replay)
+        ));
+        reloaded.accept("a", 102).unwrap();
     }
 }

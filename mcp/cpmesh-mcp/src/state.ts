@@ -2,10 +2,12 @@
  * Persistent local state for the MCP device.
  *
  * Everything lives under $CPMESH_HOME (default ~/.cpmesh/mcp):
- *   device.key      — ECDH P-256 device private key (PEM, 0600)
+ *   device.key      — P-256 identity private key (PEM, 0600); signs only
+ *   encryption.key  — P-256 static encryption private key (PEM, 0600); ECDH only
  *   keyring.enc     — encrypted group-key keyring (same format as desktop)
  *   session.json    — server URL, device identity, JWT tokens (0600)
  *   verified_keys.json — independently authenticated, versioned device membership
+ *   sender_clocks.json — replay guard: newest accepted `sent_at` per sender device
  */
 
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
@@ -46,10 +48,12 @@ export interface Session {
 export interface StatePaths {
   root: string;
   deviceKey: string;
+  encryptionKey: string;
   keyring: string;
   session: string;
   pinnedKeys: string;
   requests: string;
+  senderClocks: string;
 }
 
 export function statePaths(): StatePaths {
@@ -58,10 +62,12 @@ export function statePaths(): StatePaths {
   return {
     root,
     deviceKey: join(root, "device.key"),
+    encryptionKey: join(root, "encryption.key"),
     keyring: join(root, "keyring.enc"),
     session: join(root, "session.json"),
     pinnedKeys: join(root, "verified_keys.json"),
     requests: join(root, "clipboard_requests.json"),
+    senderClocks: join(root, "sender_clocks.json"),
   };
 }
 
@@ -93,7 +99,9 @@ export function updateSession(patch: Partial<Session>): Session | null {
 /** Wipes all local secrets (logout). */
 export function clearAllState(): void {
   const paths = statePaths();
-  for (const file of [paths.session, paths.keyring, paths.deviceKey, paths.pinnedKeys, paths.requests]) {
+  for (const file of [
+    paths.session, paths.keyring, paths.deviceKey, paths.encryptionKey, paths.pinnedKeys, paths.requests, paths.senderClocks,
+  ]) {
     if (existsSync(file)) rmSync(file);
   }
 }
@@ -137,6 +145,7 @@ const savedPushSchema = z.object({
     request_id: z.string().uuid().optional(), content_type: z.enum(["text", "image", "file"]),
     encrypted_data: z.string().max(2 * 1024 * 1024), metadata: z.string().max(16384).optional(),
     key_version: z.number().int().positive(),
+    sent_at: z.number().int().positive().optional(), sender_signature: z.string().max(256).optional(),
   }),
   receipt: clipboardReceiptSchema.optional(),
 });
@@ -161,4 +170,31 @@ export function savePushes(deviceId: string, requests: Map<string, SavedPush>): 
   writeSecretFile(statePaths().requests, Buffer.from(JSON.stringify({
     device_id: deviceId, requests: [...requests],
   })));
+}
+
+export class ReplayError extends Error {}
+
+/**
+ * Per-sender high-water mark of `sent_at`, so a relay cannot re-deliver an old
+ * entry as new (mirrors the desktop ReplayGuard). Live entries must arrive with
+ * strictly increasing sender clocks; history catch-up does not use this guard.
+ */
+export class ReplayGuard {
+  private readonly lastSentAt: Record<string, number>;
+
+  constructor(private readonly path: string = statePaths().senderClocks) {
+    this.lastSentAt = existsSync(path)
+      ? z.record(z.number().int().positive()).parse(JSON.parse(readFileSync(path, "utf8")))
+      : {};
+  }
+
+  /** Accepts `sentAt` only if it is newer than everything seen from `deviceId`, then persists it. */
+  accept(deviceId: string, sentAt: number): void {
+    const last = this.lastSentAt[deviceId];
+    if (!Number.isSafeInteger(sentAt) || sentAt <= 0 || (last !== undefined && sentAt <= last)) {
+      throw new ReplayError("clipboard entry is a replay or arrived out of order");
+    }
+    this.lastSentAt[deviceId] = sentAt;
+    writeSecretFile(this.path, Buffer.from(JSON.stringify(this.lastSentAt), "utf8"));
+  }
 }

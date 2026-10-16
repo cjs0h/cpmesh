@@ -345,7 +345,10 @@ impl WsConnection {
             != Some(PROTOCOL_VERSION)
         {
             let _ = tokio::time::timeout(Duration::from_secs(1), ws_stream.close(None)).await;
-            return Err("Server upgrade required: WebSocket protocol 2 was not confirmed".into());
+            return Err(format!(
+                "Server upgrade required: WebSocket protocol {PROTOCOL_VERSION} was not confirmed"
+            )
+            .into());
         }
         Ok(ws_stream.split())
     }
@@ -546,6 +549,8 @@ mod tests {
             encrypted_data: vec![9, 8, 7],
             metadata: Some("bWV0YQ==".into()),
             key_version: 3,
+            sent_at: None,
+            sender_signature: None,
         });
         tokio::pin!(send);
 
@@ -588,6 +593,8 @@ mod tests {
                 encrypted_data: vec![],
                 metadata: None,
                 key_version: 1,
+                sent_at: None,
+                sender_signature: None,
             })
             .await
             .unwrap_err();
@@ -622,7 +629,7 @@ mod tests {
                         let accepted = auth == "Bearer fresh";
                         let _ = seen_tx.send(auth);
                         resp.headers_mut()
-                            .insert("x-cpmesh-protocol", "2".parse().unwrap());
+                            .insert("x-cpmesh-protocol", PROTOCOL_VERSION.parse().unwrap());
                         if accepted {
                             Ok(resp)
                         } else {

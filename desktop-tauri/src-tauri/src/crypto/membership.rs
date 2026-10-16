@@ -1,16 +1,54 @@
 use cpmesh_proto::models::{
     DeviceIdentity, KeyMembership, StoreGroupKeyEntry, VersionedGroupKey, membership_transcript,
-    wrapped_key_hash,
+    wrap_aad, wrapped_key_hash,
 };
+use p256::PublicKey;
 use zeroize::Zeroizing;
 
 use super::{encrypt, exchange::KeyExchange, keys::KeyPair, verify::KeyVerifier};
+
+/// A mesh member together with the encryption key its identity key certified.
+/// Only targets built through [`certified_target`] receive wraps.
+#[derive(Clone)]
+pub struct WrapTarget {
+    pub identity: DeviceIdentity,
+    pub encryption_key: PublicKey,
+}
+
+/// Checks a member's published encryption key against its (already pinned)
+/// identity key. A missing or forged certification means the device has not
+/// been updated to protocol v3, or the relay is lying; neither gets a wrap.
+pub fn certified_target(
+    identity: DeviceIdentity,
+    encryption_key: Option<&[u8]>,
+    encryption_key_sig: Option<&[u8]>,
+) -> Result<WrapTarget, String> {
+    let identity_key =
+        KeyPair::parse_public_key(&identity.public_key).map_err(|e| e.to_string())?;
+    let (Some(encryption_key), Some(signature)) = (encryption_key, encryption_key_sig) else {
+        return Err(format!(
+            "device {} has not published a certified encryption key; update it to protocol 3 or remove it",
+            identity.id
+        ));
+    };
+    let encryption_key =
+        super::keys::verify_encryption_key(&identity_key, encryption_key, signature)
+            .map_err(|e| format!("device {}: {e}", identity.id))?;
+    Ok(WrapTarget {
+        identity,
+        encryption_key,
+    })
+}
+
+fn identities(targets: &[WrapTarget]) -> Vec<DeviceIdentity> {
+    targets.iter().map(|t| t.identity.clone()).collect()
+}
 
 /// Candidate wraps are staged without changing the active or persisted keyring.
 pub fn stage_rotation(
     exchange: &KeyExchange,
     sender: &str,
-    members: &[DeviceIdentity],
+    targets: &[WrapTarget],
 ) -> Result<(i32, Vec<StoreGroupKeyEntry>), String> {
     let version = exchange
         .current_version
@@ -19,26 +57,32 @@ pub fn stage_rotation(
     let key = Zeroizing::new(encrypt::generate_group_key());
     Ok((
         version,
-        signed_wraps(exchange.key_pair(), sender, version, key.as_ref(), members)?,
+        signed_wraps(exchange.key_pair(), sender, version, key.as_ref(), targets)?,
     ))
 }
 
+/// Wraps `key` for every target with a fresh ephemeral key and signs the
+/// membership transcript with the identity key.
 pub fn signed_wraps(
     pair: &KeyPair,
     sender: &str,
     version: i32,
     key: &[u8],
-    members: &[DeviceIdentity],
+    targets: &[WrapTarget],
 ) -> Result<Vec<StoreGroupKeyEntry>, String> {
-    validate_members(members, sender, &pair.public_key_bytes())?;
-    let mut wraps: Vec<StoreGroupKeyEntry> = members
+    let members = identities(targets);
+    validate_members(&members, sender, &pair.public_key_bytes())?;
+    let mut wraps: Vec<StoreGroupKeyEntry> = targets
         .iter()
-        .map(|member| {
-            let peer = KeyPair::parse_public_key(&member.public_key).map_err(|e| e.to_string())?;
-            let encrypted_key =
-                encrypt::encrypt_group_key(key, &pair.private, &peer).map_err(|e| e.to_string())?;
+        .map(|target| {
+            let encrypted_key = encrypt::wrap_group_key_v3(
+                key,
+                &target.encryption_key,
+                &wrap_aad(version, sender, &target.identity.id),
+            )
+            .map_err(|e| e.to_string())?;
             Ok(StoreGroupKeyEntry {
-                device_id: member.id.clone(),
+                device_id: target.identity.id.clone(),
                 encrypted_key,
                 membership: None,
             })
@@ -53,9 +97,9 @@ pub fn signed_wraps(
             )
         })
         .collect();
-    let transcript = membership_transcript(version, sender, members, &hashes)?;
+    let transcript = membership_transcript(version, sender, &members, &hashes)?;
     wraps[0].membership = Some(KeyMembership {
-        members: members.to_vec(),
+        members,
         wrapped_key_hashes: hashes,
         signature: pair.sign_message(&transcript),
     });
@@ -111,7 +155,13 @@ pub fn import_key(
     }
     let mut candidate = exchange.clone();
     candidate
-        .decrypt_from_device(&key.encrypted_key, &sender, key.version)
+        .import_wrapped(
+            &key.encrypted_key,
+            &sender,
+            &key.from_device_id,
+            recipient,
+            key.version,
+        )
         .map_err(|e| e.to_string())?;
     if let Some(membership) = &key.membership {
         verifier
@@ -150,31 +200,39 @@ fn validate_members(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::keys::public_key_to_bytes;
+    use crate::crypto::keys::{DeviceKeys, public_key_to_bytes};
+
+    fn target(id: &str, keys: &DeviceKeys) -> WrapTarget {
+        certified_target(
+            DeviceIdentity {
+                id: id.into(),
+                public_key: keys.identity.public_key_bytes(),
+            },
+            Some(&keys.encryption.public_key_bytes()),
+            Some(&keys.certify_encryption_key()),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn unknown_sender_cannot_self_authorize_and_wraps_bind_the_transcript() {
-        let a = KeyPair::generate();
-        let b = KeyPair::generate();
+        let a = DeviceKeys::generate();
+        let b = DeviceKeys::generate();
         let aid = uuid::Uuid::new_v4().to_string();
         let bid = uuid::Uuid::new_v4().to_string();
-        let members = vec![
-            DeviceIdentity {
-                id: aid.clone(),
-                public_key: a.public_key_bytes(),
-            },
-            DeviceIdentity {
-                id: bid.clone(),
-                public_key: b.public_key_bytes(),
-            },
-        ];
+        let targets = vec![target(&aid, &a), target(&bid, &b)];
         let mut recipient = KeyExchange::new(b);
         let sender = KeyExchange::new(a);
         let dir = tempfile::tempdir().unwrap();
         let mut verifier = KeyVerifier::new(dir.path()).unwrap();
-        let (version, wraps) = stage_rotation(&sender, &aid, &members).unwrap();
+        let (version, wraps) = stage_rotation(&sender, &aid, &targets).unwrap();
         assert_eq!(sender.current_version, 0);
         assert!(!sender.has_group_key());
+        assert!(
+            wraps
+                .iter()
+                .all(|w| w.encrypted_key.len() == cpmesh_proto::models::WRAP_V3_LEN)
+        );
         let manifest = wraps[0].membership.clone();
         let wrap = wraps.into_iter().find(|w| w.device_id == bid).unwrap();
         let mut key = VersionedGroupKey {
@@ -196,5 +254,43 @@ mod tests {
         import_key(&mut recipient, &mut verifier, &bid, &key).unwrap();
         assert_eq!(recipient.current_version, 1);
         assert!(verifier.is_pinned(&bid));
+        assert!(verifier.public_key_of(&bid).is_some());
+    }
+
+    #[test]
+    fn wraps_only_target_certified_encryption_keys() {
+        let a = DeviceKeys::generate();
+        let identity = DeviceIdentity {
+            id: uuid::Uuid::new_v4().to_string(),
+            public_key: a.identity.public_key_bytes(),
+        };
+        // Not yet upgraded: no encryption key.
+        assert!(certified_target(identity.clone(), None, None).is_err());
+        // The relay substitutes its own encryption key.
+        let mallory = DeviceKeys::generate();
+        assert!(
+            certified_target(
+                identity.clone(),
+                Some(&mallory.encryption.public_key_bytes()),
+                Some(&a.certify_encryption_key()),
+            )
+            .is_err()
+        );
+        assert!(
+            certified_target(
+                identity.clone(),
+                Some(&mallory.encryption.public_key_bytes()),
+                Some(&mallory.certify_encryption_key()),
+            )
+            .is_err()
+        );
+        assert!(
+            certified_target(
+                identity,
+                Some(&a.encryption.public_key_bytes()),
+                Some(&a.certify_encryption_key()),
+            )
+            .is_ok()
+        );
     }
 }

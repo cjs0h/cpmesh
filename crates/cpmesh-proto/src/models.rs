@@ -2,7 +2,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 // WebSocket message types — must match between server and clients.
-pub const PROTOCOL_VERSION: &str = "2";
+pub const PROTOCOL_VERSION: &str = "3";
+/// Pairing protocol: committed short authentication string (see `sas_*`).
+pub const PAIRING_VERSION: u32 = 3;
 pub const MSG_CLIPBOARD_PUSH: &str = "clipboard_push";
 pub const MSG_CLIPBOARD_NEW: &str = "clipboard_new";
 pub const MSG_CLIPBOARD_ACK: &str = "clipboard_ack";
@@ -110,6 +112,16 @@ pub struct ClipboardPushPayload {
     pub metadata: Option<String>,
     #[serde(default = "default_key_version")]
     pub key_version: i32,
+    /// Sender clock, Unix milliseconds. Bound into the AAD and the signature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_at: Option<i64>,
+    /// DER ECDSA by the sender identity key over [`clipboard_signature_transcript`].
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_base64_serde"
+    )]
+    pub sender_signature: Option<Vec<u8>>,
 }
 
 /// An acknowledgement means database persistence, not receipt by another device.
@@ -215,6 +227,19 @@ pub struct RegisterDeviceRequest {
         with = "option_base64_serde"
     )]
     pub public_key_sig: Option<Vec<u8>>,
+    /// Static ECDH key, certified by the identity key ([`encryption_key_transcript`]).
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        with = "option_base64_serde"
+    )]
+    pub encryption_key: Option<Vec<u8>>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        with = "option_base64_serde"
+    )]
+    pub encryption_key_sig: Option<Vec<u8>>,
     /// Stable device fingerprint: SHA-256 hex of platform hardware ID salted with user_id.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub fingerprint: Option<String>,
@@ -241,6 +266,170 @@ pub fn device_proof_transcript(challenge: &str) -> Vec<u8> {
     format!("cpmesh-device-proof-v1\n{challenge}").into_bytes()
 }
 
+/// Request body for PUT /api/devices/me/encryption-key.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PublishEncryptionKeyRequest {
+    #[serde(with = "base64_serde")]
+    pub encryption_key: Vec<u8>,
+    #[serde(with = "base64_serde")]
+    pub encryption_key_sig: Vec<u8>,
+}
+
+/// Certification of a device's static ECDH key by its identity (signing) key.
+/// The identity key never performs ECDH itself in protocol v3.
+pub fn encryption_key_transcript(identity_public_key: &[u8], encryption_key: &[u8]) -> Vec<u8> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    format!(
+        "cpmesh-encryption-key-v1\n{}\n{}\n",
+        STANDARD.encode(identity_public_key),
+        STANDARD.encode(encryption_key)
+    )
+    .into_bytes()
+}
+
+/// Length of a v3 group-key wrap: ephemeral key(65) || nonce(12) || key(32) || tag(16).
+pub const WRAP_V3_LEN: usize = 65 + 12 + 32 + 16;
+/// Length of a legacy static-static wrap: nonce(12) || key(32) || tag(16).
+pub const WRAP_LEGACY_LEN: usize = 12 + 32 + 16;
+
+/// Associated data binding a v3 wrap to the key version and both parties.
+pub fn wrap_aad(version: i32, sender_device_id: &str, recipient_device_id: &str) -> Vec<u8> {
+    format!("cpmesh-wrap-v3\n{version}\n{sender_device_id}\n{recipient_device_id}\n").into_bytes()
+}
+
+/// Context every v3 clipboard ciphertext and signature is bound to.
+fn clipboard_context(
+    key_version: i32,
+    content_type: &ContentType,
+    sender_device_id: &str,
+    request_id: &str,
+    sent_at: i64,
+) -> String {
+    format!(
+        "cpmesh-clipboard-v3\n{key_version}\n{content_type}\n{sender_device_id}\n{request_id}\n{sent_at}\n"
+    )
+}
+
+/// AAD for the clipboard data ciphertext.
+pub fn clipboard_data_aad(
+    key_version: i32,
+    content_type: &ContentType,
+    sender_device_id: &str,
+    request_id: &str,
+    sent_at: i64,
+) -> Vec<u8> {
+    let mut aad = clipboard_context(
+        key_version,
+        content_type,
+        sender_device_id,
+        request_id,
+        sent_at,
+    );
+    aad.push_str("data\n");
+    aad.into_bytes()
+}
+
+/// AAD for the encrypted metadata; distinct from the data AAD so the relay cannot
+/// splice the metadata of one entry onto the data of another.
+pub fn clipboard_metadata_aad(
+    key_version: i32,
+    content_type: &ContentType,
+    sender_device_id: &str,
+    request_id: &str,
+    sent_at: i64,
+) -> Vec<u8> {
+    let mut aad = clipboard_context(
+        key_version,
+        content_type,
+        sender_device_id,
+        request_id,
+        sent_at,
+    );
+    aad.push_str("metadata\n");
+    aad.into_bytes()
+}
+
+/// Message signed by the sender identity key: the context plus commitments to
+/// both ciphertexts. `metadata` is the raw (pre-base64) encrypted metadata.
+pub fn clipboard_signature_transcript(
+    key_version: i32,
+    content_type: &ContentType,
+    sender_device_id: &str,
+    request_id: &str,
+    sent_at: i64,
+    encrypted_data: &[u8],
+    metadata: &[u8],
+) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut transcript = clipboard_context(
+        key_version,
+        content_type,
+        sender_device_id,
+        request_id,
+        sent_at,
+    );
+    for bytes in [encrypted_data, metadata] {
+        for byte in Sha256::digest(bytes) {
+            transcript.push_str(&format!("{byte:02x}"));
+        }
+        transcript.push('\n');
+    }
+    transcript.into_bytes()
+}
+
+/// Pairing: the approver's commitment to its nonce, published before the pending
+/// device contributes its own.
+pub fn sas_commitment(approver_nonce: &[u8; 32]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"cpmesh-sas-commit-v1\n");
+    hasher.update(approver_nonce);
+    hasher.finalize().into()
+}
+
+fn sorted_pair(a: &[u8], b: &[u8]) -> Vec<u8> {
+    if a <= b {
+        [a, b].concat()
+    } else {
+        [b, a].concat()
+    }
+}
+
+/// Eight-digit short authentication string, shown as "1234 5678" on both devices.
+/// Each side hashes the keys as IT sees them, so a relay that substitutes a key must
+/// also predict a nonce that is still hidden from it (see protocol-v3 notes).
+pub fn sas_code(
+    approver_nonce: &[u8; 32],
+    pending_nonce: &[u8; 32],
+    own_public_key: &[u8],
+    peer_public_key: &[u8],
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"cpmesh-sas-v1\n");
+    hasher.update(approver_nonce);
+    hasher.update(pending_nonce);
+    hasher.update(sorted_pair(own_public_key, peer_public_key));
+    let digest = hasher.finalize();
+    let prefix: [u8; 8] = digest[..8].try_into().expect("8-byte prefix");
+    let digits = u64::from_be_bytes(prefix) % 100_000_000;
+    format!("{:04} {:04}", digits / 10_000, digits % 10_000)
+}
+
+/// Full 256-bit pairing code over both identity keys (no ECDH: the identity key only
+/// signs in v3). Compare every character when the short code is not enough.
+pub fn pairing_fingerprint(own_public_key: &[u8], peer_public_key: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"cpmesh-pairing-fingerprint-v3\n");
+    hasher.update(sorted_pair(own_public_key, peer_public_key));
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceInfo {
     pub id: String,
@@ -257,6 +446,18 @@ pub struct DeviceInfo {
         with = "option_base64_serde"
     )]
     pub public_key_sig: Option<Vec<u8>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_base64_serde"
+    )]
+    pub encryption_key: Option<Vec<u8>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_base64_serde"
+    )]
+    pub encryption_key_sig: Option<Vec<u8>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_seen: Option<String>,
     #[serde(default)]
@@ -308,6 +509,17 @@ pub struct ClipboardEntry {
     pub created_at: DateTime<Utc>,
     #[serde(default = "default_key_version")]
     pub key_version: i32,
+    /// Sender-chosen request ID; part of the signed context. Absent on legacy entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_at: Option<i64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_base64_serde"
+    )]
+    pub sender_signature: Option<Vec<u8>>,
 }
 
 /// Decrypted clipboard entry used locally on clients.
@@ -321,6 +533,13 @@ pub struct PlainEntry {
     pub data: Vec<u8>,
     pub metadata: Metadata,
     pub created_at: DateTime<Utc>,
+    /// False for legacy (pre-v3) entries whose sender could not be authenticated.
+    #[serde(default = "default_true")]
+    pub authenticated: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -491,7 +710,27 @@ pub struct PendingDeviceInfo {
     pub public_key: Vec<u8>,
     #[serde(default, with = "option_base64_serde")]
     pub public_key_sig: Option<Vec<u8>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_base64_serde"
+    )]
+    pub encryption_key: Option<Vec<u8>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_base64_serde"
+    )]
+    pub encryption_key_sig: Option<Vec<u8>>,
     pub created_at: DateTime<Utc>,
+}
+
+/// Request body for POST /api/device-approvals/{id}/begin.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BeginApprovalRequest {
+    /// [`sas_commitment`] of the approver's nonce.
+    #[serde(with = "base64_serde")]
+    pub commit: Vec<u8>,
 }
 
 /// Response for POST /api/device-approvals/{id}/begin.
@@ -505,7 +744,48 @@ pub struct ApprovalSessionResponse {
     pub pending_public_key: Vec<u8>,
     #[serde(default, with = "option_base64_serde")]
     pub pending_public_key_sig: Option<Vec<u8>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_base64_serde"
+    )]
+    pub pending_encryption_key: Option<Vec<u8>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_base64_serde"
+    )]
+    pub pending_encryption_key_sig: Option<Vec<u8>>,
     pub expires_at: DateTime<Utc>,
+}
+
+/// Response for GET /api/device-approvals/{id}/session (approver polls for the
+/// pending device's nonce).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ApprovalSessionState {
+    pub session_id: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_base64_serde"
+    )]
+    pub pending_nonce: Option<Vec<u8>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_base64_serde"
+    )]
+    pub approver_nonce: Option<Vec<u8>>,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Request body for POST /api/device-approvals/me/nonce (pending device) and
+/// POST /api/device-approvals/{id}/reveal (approver).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SasNonceRequest {
+    pub session_id: String,
+    #[serde(with = "base64_serde")]
+    pub nonce: Vec<u8>,
 }
 
 /// Request body for POST /api/device-approvals/{id}/approve.
@@ -539,6 +819,24 @@ pub struct ApprovalStatusResponse {
     pub approver_public_key_sig: Option<Vec<u8>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_base64_serde"
+    )]
+    pub approver_commit: Option<Vec<u8>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_base64_serde"
+    )]
+    pub pending_nonce: Option<Vec<u8>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_base64_serde"
+    )]
+    pub approver_nonce: Option<Vec<u8>>,
 }
 
 /// Serde helper for base64-encoding Vec<u8> in JSON.

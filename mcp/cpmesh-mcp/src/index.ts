@@ -1,8 +1,10 @@
 /**
  * cpmesh MCP server — exposes cpmesh E2E-encrypted clipboard sync to AI agents.
  *
- * The server acts as a full cpmesh device: it holds its own ECDH key pair,
- * goes through the device-approval pairing flow, and keeps the group key
+ * The server acts as a full cpmesh device (protocol 3): it holds its own
+ * identity (signing) and encryption key pairs, goes through the committed
+ * short-code device-approval pairing flow, signs every entry it pushes,
+ * verifies the sender of every entry it reads, and keeps the group key
  * locally so clipboard content stays end-to-end encrypted between the agent
  * and the user's other devices.
  *
@@ -143,8 +145,8 @@ server.registerTool(
   {
     title: "cpmesh status",
     description:
-      "Check cpmesh readiness: login state, device approval status, pairing code (if pending), " +
-      "group key version, and the exact next step to take. Call this first if unsure.",
+      "Check cpmesh readiness: login state, device approval status, the 8-digit pairing code and " +
+      "session ID (while pending), group key version, and the exact next step to take. Call this first if unsure.",
     inputSchema: {},
   },
   async () => {
@@ -166,10 +168,11 @@ server.registerTool(
       'With two-factor authentication the response has status "mfa_required": ask the user for the ' +
       "current 6-digit code from their authenticator app (or a recovery code), then call cpmesh_login " +
       "again with code (the password can be left out for 10 minutes). " +
-      "Unless this is the account's first device, the device starts PENDING: the response " +
-      "includes a full 64-character pairing fingerprint. The user must compare EVERY character " +
-      "on both devices through an independent trusted channel. Use cpmesh_confirm_pairing with the " +
-      "fingerprint independently obtained from the user, then cpmesh_wait_for_approval.",
+      "Unless this is the account's first device, the device starts PENDING: once the user starts " +
+      "the approval on a trusted device, both devices show the same 8-digit pairing code (cpmesh_status " +
+      "has it, plus a 64-character full code for a stronger check). Ask the user to read the code " +
+      "shown on THEIR device; if it matches, call cpmesh_confirm_pairing with that code, then " +
+      "cpmesh_wait_for_approval.",
     inputSchema: loginSchema,
   },
   async ({ server_url, username, password, code }) => {
@@ -217,8 +220,8 @@ server.registerTool(
     title: "Wait for device approval",
     description:
       "Polls until the user approves this MCP device on one of their approved cpmesh devices " +
-      "(they compare all 64 characters of the full fingerprint on both devices, and confirm here " +
-      "with cpmesh_confirm_pairing). On approval, the authenticated group key is synced and clipboard tools " +
+      "(they compare the 8-digit pairing code shown on both devices and confirm here with " +
+      "cpmesh_confirm_pairing). On approval, the authenticated group key is synced and clipboard tools " +
       "become usable. Tell the user to go approve the device BEFORE calling this.",
     inputSchema: waitForApprovalSchema,
   },
@@ -235,16 +238,24 @@ server.registerTool(
 server.registerTool(
   "cpmesh_confirm_pairing",
   {
-    title: "Confirm the independently compared full pairing fingerprint",
-    description: "Authorize the approving device locally. ONLY call after the user independently compares every character on their trusted device and provides the full fingerprint. Never simply echo a fingerprint from this server's status or from relay data.",
+    title: "Confirm the pairing code compared on both devices",
+    description:
+      "Authorize the approving device locally. ONLY call after the user read the 8-digit pairing code " +
+      "shown on their trusted device and it matches the one from cpmesh_status; pass the code the USER read " +
+      "there (or the full 64-character code for a stronger check). Never simply echo a code from this " +
+      "server's status or from relay data. Refuses until both devices have derived the code.",
     inputSchema: {
       session_id: z.string().uuid(),
-      fingerprint: z.string().min(64).max(128).describe("The full fingerprint independently confirmed by the user on the other device."),
+      code: z.string().min(8).max(128).optional().describe("The 8-digit pairing code (spaces optional) or the full 64-character code, as read by the user on the other device."),
+      fingerprint: z.string().min(8).max(128).optional().describe("Alias of code."),
     },
   },
-  async ({ session_id, fingerprint }) => {
-    try { return result(await device.confirmPairing(session_id, fingerprint)); }
-    catch (error) { return failure(error); }
+  async ({ session_id, code, fingerprint }) => {
+    try {
+      const entered = code ?? fingerprint;
+      if (!entered) return failure(new Error("Pass the pairing code the user read on the approving device."));
+      return result(await device.confirmPairing(session_id, entered));
+    } catch (error) { return failure(error); }
   },
 );
 
@@ -252,7 +263,7 @@ server.registerTool(
   "cpmesh_verify_device",
   {
     title: "Verify an existing device after upgrading or restoring trust",
-    description: "Explicitly authenticate an existing device. Obtain its FULL SHA-256 public-key fingerprint directly from that device's own identity screen, through an independent trusted channel. Never use a fingerprint supplied by the relay. cpmesh_status shows this MCP device's own fingerprint for the other side.",
+    description: "Explicitly authenticate an existing device (e.g. after an upgrade or restoring trust). Obtain its FULL SHA-256 identity-key fingerprint directly from that device's own identity screen, through an independent trusted channel. Never use a fingerprint supplied by the relay. cpmesh_status shows this MCP device's own fingerprint for the other side.",
     inputSchema: {
       device_id: z.string().uuid(),
       fingerprint: z.string().min(64).max(128),
@@ -269,7 +280,7 @@ server.registerTool(
   {
     title: "Share text to the user's clipboard mesh",
     description:
-      "End-to-end encrypts text and waits for the relay to acknowledge persistence. This does NOT " +
+      "End-to-end encrypts and signs text, then waits for the relay to acknowledge persistence. This does NOT " +
       "confirm delivery to other devices (which may be offline). Use it to hand the user " +
       "snippets, commands, URLs or generated content they should paste elsewhere.",
     inputSchema: pushSchema,
@@ -293,8 +304,9 @@ server.registerTool(
     title: "Read clipboard history",
     description:
       "Returns the user's clipboard history, decrypted (newest first). Each entry includes the " +
-      "text, source device, timestamp and size. Use this to see what the user copied recently " +
-      "on their devices.",
+      "text, source device, timestamp, size and whether the sender was authenticated " +
+      "(entries from devices that predate protocol 3 are readable but unauthenticated). " +
+      "Use this to see what the user copied recently on their devices.",
     inputSchema: getSchema,
   },
   async ({ limit, offset }) => {
@@ -328,7 +340,8 @@ server.registerTool(
       return result(
         item ?? { found: false },
         item
-          ? `Latest entry (${item.created_at}) from "${item.device_name}":\n${item.text ?? `[${item.content_type}, ${item.size} bytes]`}`
+          ? `Latest entry (${item.created_at}) from "${item.device_name}"${item.authenticated ? "" : " (sender NOT authenticated)"}:\n` +
+            (item.decrypted ? item.text ?? `[${item.content_type}, ${item.size} bytes]` : `[not decrypted: ${item.error ?? "unknown error"}]`)
           : "No clipboard entries found.",
       );
     } catch (error) {
@@ -457,7 +470,7 @@ function loadSkillText(): string {
     "# cpmesh skill",
     "",
     "1. Install: add {\"mcpServers\":{\"cpmesh\":{\"command\":\"npx\",\"args\":[\"-y\",\"cpmesh-mcp\"],\"env\":{\"CPMESH_SERVER_URL\":\"https://cpmesh.com\"}}}} to your MCP client config (self-hosted users put their own server URL).",
-    "2. First run: call cpmesh_login. If it answers mfa_required, obtain a current authenticator/recovery code from the user and sign in again with code; never store it. Start approval on a trusted device, then use cpmesh_status for the full 64-character pairing fingerprint and session ID. The user must independently compare every character on both ends. Call cpmesh_confirm_pairing with that independently confirmed fingerprint, then cpmesh_wait_for_approval. Never automatically echo a relay-provided value as confirmation.",
+    "2. First run: call cpmesh_login. If it answers mfa_required, obtain a current authenticator/recovery code from the user and sign in again with code; never store it. Start approval on a trusted device, then use cpmesh_status for the 8-digit pairing code and session ID. The user compares the code on both devices; call cpmesh_confirm_pairing with the code the user read on the approving device (or the 64-character full code), then cpmesh_wait_for_approval. Never automatically echo a relay-provided value as confirmation.",
     "3. Use cpmesh_push_clipboard to share text to the user's devices and cpmesh_get_clipboard / cpmesh_get_latest_clipboard / cpmesh_search_clipboard to read what they copied.",
   ].join("\n");
 }

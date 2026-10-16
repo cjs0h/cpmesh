@@ -2,6 +2,7 @@ mod api;
 mod commands;
 mod config;
 mod crypto;
+mod device_keys;
 mod fingerprint;
 mod history;
 mod key_sync;
@@ -138,6 +139,7 @@ pub fn run() {
             commands::remove_device,
             commands::get_pending_devices,
             commands::begin_device_approval,
+            commands::poll_device_approval,
             commands::confirm_device_approval,
             commands::reject_pending_device,
             commands::get_my_approval_status,

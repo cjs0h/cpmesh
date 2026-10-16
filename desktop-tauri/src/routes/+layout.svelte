@@ -159,10 +159,10 @@
 	}
 
 	async function handleConfirmPairing() {
-		if (!approvalStatus?.session_id || !approvalStatus.approval_code) return;
+		if (!approvalStatus?.session_id || !approvalStatus.sas) return;
 		confirmingPairing = true;
 		try {
-			await confirmPairing(approvalStatus.session_id, approvalStatus.approval_code);
+			await confirmPairing(approvalStatus.session_id, approvalStatus.sas);
 			await pollApprovalStatus();
 		} catch (e) {
 			approvalError = errorMessage(e);

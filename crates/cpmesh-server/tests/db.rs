@@ -97,7 +97,10 @@ async fn approval_rotation_rolls_back_all_state_and_serializes_competing_version
         db.rotate_group_key(user.id, a.id, 0, 1, &[(a.id, vec![1; 60])], 24)
             .await
             .unwrap();
-        let session = db.create_approval_session(b.id, a.id, 600).await.unwrap();
+        let session = db
+            .create_approval_session(b.id, a.id, 600, &[7u8; 32])
+            .await
+            .unwrap();
         let wraps = vec![
             StoreGroupKeyEntry {
                 device_id: a.id.to_string(),
@@ -898,7 +901,7 @@ async fn approval_sessions_are_single_and_expire() {
         assert!(db.get_approval_session(pending.id).await.unwrap().is_none());
 
         let session = db
-            .create_approval_session(pending.id, approver.id, 300)
+            .create_approval_session(pending.id, approver.id, 300, &[7u8; 32])
             .await
             .unwrap();
         assert_eq!(session.pending_device_id, pending.id);
@@ -916,7 +919,7 @@ async fn approval_sessions_are_single_and_expire() {
 
         // Starting again replaces the previous session for that device
         let replacement = db
-            .create_approval_session(pending.id, approver.id, 300)
+            .create_approval_session(pending.id, approver.id, 300, &[7u8; 32])
             .await
             .unwrap();
         assert_ne!(replacement.id, session.id);
@@ -933,7 +936,7 @@ async fn approval_sessions_are_single_and_expire() {
         assert!(db.get_approval_session(pending.id).await.unwrap().is_none());
 
         // An already-expired session is not returned
-        db.create_approval_session(pending.id, approver.id, -10)
+        db.create_approval_session(pending.id, approver.id, -10, &[7u8; 32])
             .await
             .unwrap();
         assert!(db.get_approval_session(pending.id).await.unwrap().is_none());

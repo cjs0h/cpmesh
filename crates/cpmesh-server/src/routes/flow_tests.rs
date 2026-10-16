@@ -193,8 +193,10 @@ type TestSocket =
 async fn open_socket(address: std::net::SocketAddr, token: &str) -> TestSocket {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let mut req = format!("ws://{address}/ws").into_client_request().unwrap();
-    req.headers_mut()
-        .insert("x-cpmesh-protocol", "2".parse().unwrap());
+    req.headers_mut().insert(
+        "x-cpmesh-protocol",
+        cpmesh_proto::models::PROTOCOL_VERSION.parse().unwrap(),
+    );
     req.headers_mut()
         .insert("authorization", format!("Bearer {token}").parse().unwrap());
     tokio_tungstenite::connect_async(req).await.unwrap().0
@@ -233,13 +235,47 @@ async fn socket_closed(socket: &mut TestSocket) {
     .expect("revoked socket remained open");
 }
 
+/// A protocol-v3 push: the entry context and both ciphertexts are signed by the
+/// sender's identity key.
+fn signed_push(
+    key: &aws_lc_rs::signature::EcdsaKeyPair,
+    device_id: uuid::Uuid,
+    request_id: &str,
+    key_version: i32,
+    encrypted_data: &[u8],
+    sent_at: i64,
+) -> Value {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let transcript = cpmesh_proto::models::clipboard_signature_transcript(
+        key_version,
+        &cpmesh_proto::models::ContentType::Text,
+        &device_id.to_string(),
+        request_id,
+        sent_at,
+        encrypted_data,
+        b"",
+    );
+    let signature = key
+        .sign(&aws_lc_rs::rand::SystemRandom::new(), &transcript)
+        .unwrap();
+    json!({"type": "clipboard_push", "payload": {
+        "request_id": request_id, "content_type": "text",
+        "encrypted_data": b64.encode(encrypted_data),
+        "key_version": key_version, "sent_at": sent_at,
+        "sender_signature": b64.encode(signature.as_ref()),
+    }})
+}
+
 #[tokio::test]
 async fn live_sockets_acknowledge_commit_reconcile_ids_and_stop_after_revocation() {
+    use aws_lc_rs::signature::KeyPair as _;
     use futures_util::SinkExt;
     use tokio_tungstenite::tungstenite::Message;
     with_app(Options::default(), |app| async move {
         let user = app.member("live-relay").await;
-        let a = app.state.db.create_device(user.id, "A", &[4; 65], None, "approved", None).await.unwrap();
+        let a_key = device_key();
+        let a = app.state.db.create_device(user.id, "A", a_key.public_key().as_ref(), None, "approved", None).await.unwrap();
         let b = app.state.db.create_device(user.id, "B", &[4; 65], None, "approved", None).await.unwrap();
         app.state.db.rotate_group_key(user.id, a.id, 0, 1, &[(a.id, vec![1; 60]), (b.id, vec![2; 60])], 24).await.unwrap();
         let grant = SessionGrant::signed_in(user.id, true);
@@ -256,18 +292,36 @@ async fn live_sockets_acknowledge_commit_reconcile_ids_and_stop_after_revocation
         let mut b_socket = open_socket(address, &b_access).await;
         let mut browser = open_socket(address, &web_access).await;
         let request_id = uuid::Uuid::new_v4().to_string();
-        let payload = json!({
-            "request_id": request_id, "content_type": "text",
-            "encrypted_data": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [7; 48]),
-            "key_version": 1,
-        });
-        let push = json!({"type": "clipboard_push", "payload": payload});
+        let now = chrono::Utc::now().timestamp_millis();
+        let push = signed_push(&a_key, a.id, &request_id, 1, &[7; 48], now);
+
+        // Unsigned, relabelled, mis-signed and stale-clock pushes are refused.
+        let mut unsigned = push.clone();
+        unsigned["payload"].as_object_mut().unwrap().remove("sender_signature");
+        a_socket.send(Message::Text(unsigned.to_string().into())).await.unwrap();
+        assert_eq!(socket_message(&mut a_socket, "clipboard_ack").await["code"], "signature_required");
+        let mut relabelled = push.clone();
+        relabelled["payload"]["content_type"] = json!("file");
+        a_socket.send(Message::Text(relabelled.to_string().into())).await.unwrap();
+        assert_eq!(socket_message(&mut a_socket, "clipboard_ack").await["code"], "invalid_signature");
+        let forged = signed_push(&device_key(), a.id, &request_id, 1, &[7; 48], now);
+        a_socket.send(Message::Text(forged.to_string().into())).await.unwrap();
+        assert_eq!(socket_message(&mut a_socket, "clipboard_ack").await["code"], "invalid_signature");
+        let stale_clock = signed_push(&a_key, a.id, &request_id, 1, &[7; 48], now - 2 * 24 * 60 * 60 * 1000);
+        a_socket.send(Message::Text(stale_clock.to_string().into())).await.unwrap();
+        assert_eq!(socket_message(&mut a_socket, "clipboard_ack").await["code"], "clock_skew");
+
         a_socket.send(Message::Text(push.to_string().into())).await.unwrap();
         let ack = socket_message(&mut a_socket, "clipboard_ack").await;
         assert_eq!(ack["status"], "accepted");
         assert_eq!(ack["request_id"], request_id);
         let received = socket_message(&mut b_socket, "clipboard_new").await;
         assert_eq!(received["entry"]["id"], ack["entry_id"]);
+        // Receivers get everything they need to verify the sender themselves.
+        assert_eq!(received["entry"]["request_id"], request_id);
+        assert_eq!(received["entry"]["sent_at"], now);
+        assert_eq!(received["entry"]["sender_signature"], push["payload"]["sender_signature"]);
+        assert_eq!(received["entry"]["device_id"], a.id.to_string());
         let metadata = socket_message(&mut browser, "clipboard_new").await;
         assert_eq!(metadata["entry"]["encrypted_size"], 48);
         assert!(metadata["entry"].get("encrypted_data").is_none());
@@ -278,6 +332,11 @@ async fn live_sockets_acknowledge_commit_reconcile_ids_and_stop_after_revocation
         let (status, history) = app.call("GET", "/api/clipboard?metadata_only=true", Some(&web_access), None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(history["entries"][0].get("encrypted_data").is_none());
+        let (status, history) = app.call("GET", "/api/clipboard", Some(&a_access), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(history["entries"][0]["sender_signature"], push["payload"]["sender_signature"]);
+        assert_eq!(history["entries"][0]["sent_at"], now);
+        assert_eq!(history["entries"][0]["request_id"], request_id);
         let mut invalid = push.clone();
         let invalid_id = uuid::Uuid::new_v4().to_string();
         invalid["payload"]["request_id"] = json!(invalid_id);
@@ -288,8 +347,7 @@ async fn live_sockets_acknowledge_commit_reconcile_ids_and_stop_after_revocation
         assert_eq!(rejection["code"], "invalid_payload");
         sqlx::query("ALTER TABLE clipboard_entries ADD CONSTRAINT fail_clipboard_test CHECK (key_version <> 1) NOT VALID")
             .execute(&app.state.db.pool).await.unwrap();
-        let mut failed = push.clone();
-        failed["payload"]["request_id"] = json!(uuid::Uuid::new_v4());
+        let failed = signed_push(&a_key, a.id, &uuid::Uuid::new_v4().to_string(), 1, &[7; 48], now);
         a_socket.send(Message::Text(failed.to_string().into())).await.unwrap();
         assert_eq!(socket_message(&mut a_socket, "clipboard_ack").await["code"], "temporarily_unavailable");
         sqlx::query("ALTER TABLE clipboard_entries DROP CONSTRAINT fail_clipboard_test")
@@ -303,13 +361,13 @@ async fn live_sockets_acknowledge_commit_reconcile_ids_and_stop_after_revocation
         assert_eq!(status, StatusCode::NO_CONTENT);
         socket_closed(&mut b_socket).await;
         assert!(!app.state.hub.is_device_online(&user.id.to_string(), &b.id.to_string()).await);
-        let mut stale = push.clone();
-        stale["payload"]["request_id"] = json!(uuid::Uuid::new_v4());
+        let stale_id = uuid::Uuid::new_v4().to_string();
+        let stale = signed_push(&a_key, a.id, &stale_id, 1, &[7; 48], now);
         a_socket.send(Message::Text(stale.to_string().into())).await.unwrap();
         assert_eq!(socket_message(&mut a_socket, "clipboard_ack").await["code"], "rotation_required");
         app.state.db.rotate_group_key(user.id, a.id, 1, 2, &[(a.id, vec![3; 60])], 24).await.unwrap();
-        stale["payload"]["key_version"] = json!(2);
-        a_socket.send(Message::Text(stale.to_string().into())).await.unwrap();
+        let rotated = signed_push(&a_key, a.id, &stale_id, 2, &[7; 48], now);
+        a_socket.send(Message::Text(rotated.to_string().into())).await.unwrap();
         assert_eq!(socket_message(&mut a_socket, "clipboard_ack").await["status"], "accepted");
 
         let (status, changed) = app.call("PUT", "/api/me/password", Some(&web_access),
@@ -325,6 +383,156 @@ async fn live_sockets_acknowledge_commit_reconcile_ids_and_stop_after_revocation
         assert_eq!(app.call("POST", "/api/auth/refresh", None, Some(json!({"refresh_token": late_refresh}))).await.0, StatusCode::UNAUTHORIZED);
         server.abort();
         let _ = server.await;
+    }).await;
+}
+
+/// Signs `message` with a device identity key (DER ECDSA).
+fn device_sign(key: &aws_lc_rs::signature::EcdsaKeyPair, message: &[u8]) -> Vec<u8> {
+    key.sign(&aws_lc_rs::rand::SystemRandom::new(), message)
+        .unwrap()
+        .as_ref()
+        .to_vec()
+}
+
+#[tokio::test]
+async fn pairing_uses_committed_short_codes_and_certified_encryption_keys() {
+    use aws_lc_rs::signature::KeyPair as _;
+    use base64::Engine;
+    use cpmesh_proto::models as proto;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    with_app(Options::default(), |app| async move {
+        let user = app.member("pairing-v3").await;
+        let grant = SessionGrant::signed_in(user.id, true);
+
+        // Approver A exists already; it publishes an identity-certified encryption key.
+        let a_key = device_key();
+        let a_enc = device_key();
+        let a = app.state.db.create_device(user.id, "A", a_key.public_key().as_ref(), None, "approved", None).await.unwrap();
+        let a_access = app.state.auth.issue_access(&grant.with_device(Some(a.id))).unwrap();
+        let a_cert = device_sign(&a_key, &proto::encryption_key_transcript(a_key.public_key().as_ref(), a_enc.public_key().as_ref()));
+        let publish = |key: &[u8], sig: &[u8]| json!({"encryption_key": b64.encode(key), "encryption_key_sig": b64.encode(sig)});
+        // Wrong certification, an identity key reused as encryption key, then a valid one.
+        let (status, _) = app.call("PUT", "/api/devices/me/encryption-key", Some(&a_access),
+            Some(publish(a_enc.public_key().as_ref(), &device_sign(&device_key(), b"x")))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = app.call("PUT", "/api/devices/me/encryption-key", Some(&a_access),
+            Some(publish(a_key.public_key().as_ref(), &a_cert))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = app.call("PUT", "/api/devices/me/encryption-key", Some(&a_access),
+            Some(publish(a_enc.public_key().as_ref(), &a_cert))).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // Pending B registers with its encryption key in one step.
+        let b_key = device_key();
+        let b_enc = device_key();
+        let web = app.state.auth.issue_access(&grant).unwrap();
+        let (status, challenge) = app.call("POST", "/api/devices/challenge", Some(&web), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let mut registration = device_registration(&b_key, challenge["challenge"].as_str().unwrap(), "fp-b");
+        registration["encryption_key"] = json!(b64.encode(b_enc.public_key().as_ref()));
+        registration["encryption_key_sig"] = json!(b64.encode(device_sign(&b_key, b"not the transcript")));
+        let (status, _) = app.call("POST", "/api/devices", Some(&web), Some(registration.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "a forged certification is refused before the proof is consumed");
+        let (status, challenge) = app.call("POST", "/api/devices/challenge", Some(&web), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let mut registration = device_registration(&b_key, challenge["challenge"].as_str().unwrap(), "fp-b");
+        registration["encryption_key"] = json!(b64.encode(b_enc.public_key().as_ref()));
+        registration["encryption_key_sig"] = json!(b64.encode(device_sign(&b_key,
+            &proto::encryption_key_transcript(b_key.public_key().as_ref(), b_enc.public_key().as_ref()))));
+        let (status, registered) = app.call("POST", "/api/devices", Some(&web), Some(registration)).await;
+        assert_eq!(status, StatusCode::CREATED, "{registered}");
+        assert_eq!(registered["device"]["status"], "pending");
+        let b_id: uuid::Uuid = registered["device"]["id"].as_str().unwrap().parse().unwrap();
+        let b_access = registered["access_token"].as_str().unwrap().to_string();
+
+        let (status, keys) = app.call("GET", "/api/devices/keys", Some(&a_access), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let listed_b = keys["devices"].as_array().unwrap().iter().find(|d| d["id"] == b_id.to_string()).unwrap();
+        assert_eq!(listed_b["encryption_key"], b64.encode(b_enc.public_key().as_ref()));
+        assert!(listed_b["encryption_key_sig"].is_string());
+
+        // Pairing: the approver commits first.
+        let begin_uri = format!("/api/device-approvals/{b_id}/begin");
+        let nonce_a = [0xA5u8; 32];
+        let commit = proto::sas_commitment(&nonce_a);
+        let (status, _) = app.call("POST", &begin_uri, Some(&a_access), Some(json!({"commit": b64.encode(commit)}))).await;
+        assert_eq!(status, StatusCode::UPGRADE_REQUIRED, "pairing version header is required");
+        let (status, _) = app.call_with_headers("POST", &begin_uri, Some(&a_access), &[("x-cpmesh-pairing", "3")], None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "a commitment is required");
+        let (status, session) = app.call_with_headers("POST", &begin_uri, Some(&a_access), &[("x-cpmesh-pairing", "3")],
+            Some(json!({"commit": b64.encode(commit)}))).await;
+        assert_eq!(status, StatusCode::OK, "{session}");
+        assert_eq!(session["pairing_version"], 3);
+        assert_eq!(session["pending_encryption_key"], b64.encode(b_enc.public_key().as_ref()));
+        let session_id = session["session_id"].as_str().unwrap().to_string();
+
+        // The pending device sees the commitment but no nonce yet.
+        let (status, me) = app.call("GET", "/api/device-approvals/me", Some(&b_access), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(me["approver_commit"], b64.encode(commit));
+        assert!(me.get("approver_nonce").is_none());
+        // The approver cannot open its commitment before the pending nonce exists.
+        let reveal_uri = format!("/api/device-approvals/{b_id}/reveal");
+        let (status, _) = app.call("POST", &reveal_uri, Some(&a_access),
+            Some(json!({"session_id": session_id, "nonce": b64.encode(nonce_a)}))).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let nonce_b = [0x5Au8; 32];
+        let (status, _) = app.call("POST", "/api/device-approvals/me/nonce", Some(&b_access),
+            Some(json!({"session_id": session_id, "nonce": b64.encode(nonce_b)}))).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = app.call("POST", "/api/device-approvals/me/nonce", Some(&b_access),
+            Some(json!({"session_id": session_id, "nonce": b64.encode([1u8; 32])}))).await;
+        assert_eq!(status, StatusCode::CONFLICT, "the nonce cannot be changed afterwards");
+
+        let (status, state) = app.call("GET", &format!("/api/device-approvals/{b_id}/session"), Some(&a_access), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(state["pending_nonce"], b64.encode(nonce_b));
+        let (status, _) = app.call("POST", &reveal_uri, Some(&a_access),
+            Some(json!({"session_id": session_id, "nonce": b64.encode([9u8; 32])}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "a nonce that does not open the commitment is refused");
+        let (status, _) = app.call("POST", &reveal_uri, Some(&a_access),
+            Some(json!({"session_id": session_id, "nonce": b64.encode(nonce_a)}))).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, me) = app.call("GET", "/api/device-approvals/me", Some(&b_access), None).await;
+        let revealed: [u8; 32] = b64.decode(me["approver_nonce"].as_str().unwrap()).unwrap().try_into().unwrap();
+        assert_eq!(proto::sas_commitment(&revealed), commit);
+        let sas_a = proto::sas_code(&nonce_a, &nonce_b, a_key.public_key().as_ref(), b_key.public_key().as_ref());
+        let sas_b = proto::sas_code(&revealed, &nonce_b, b_key.public_key().as_ref(), a_key.public_key().as_ref());
+        assert_eq!(sas_a, sas_b);
+        assert_eq!(sas_a.len(), 9);
+
+        // Approval: v3 wraps are 125 bytes and committed to by the signed transcript.
+        let members = vec![
+            proto::DeviceIdentity { id: a.id.to_string(), public_key: a_key.public_key().as_ref().to_vec() },
+            proto::DeviceIdentity { id: b_id.to_string(), public_key: b_key.public_key().as_ref().to_vec() },
+        ];
+        let approve = |wrap_len: usize| {
+            let wraps = [(a.id.to_string(), vec![1u8; wrap_len]), (b_id.to_string(), vec![2u8; wrap_len])];
+            let hashes: std::collections::BTreeMap<String, String> = wraps.iter()
+                .map(|(id, wrap)| (id.clone(), proto::wrapped_key_hash(wrap))).collect();
+            let transcript = proto::membership_transcript(1, &a.id.to_string(), &members, &hashes).unwrap();
+            let signature = device_sign(&a_key, &transcript);
+            json!({
+                "session_id": session_id, "expected_current_version": 0, "new_version": 1,
+                "wrapped_keys": [
+                    {"device_id": wraps[0].0, "encrypted_key": b64.encode(&wraps[0].1), "membership": {
+                        "members": members, "wrapped_key_hashes": hashes, "signature": b64.encode(signature)}},
+                    {"device_id": wraps[1].0, "encrypted_key": b64.encode(&wraps[1].1)},
+                ],
+            })
+        };
+        let approve_uri = format!("/api/device-approvals/{b_id}/approve");
+        let (status, _) = app.call("POST", &approve_uri, Some(&a_access), Some(approve(60))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "legacy static-static wraps are no longer accepted");
+        let (status, body) = app.call("POST", &approve_uri, Some(&a_access), Some(approve(proto::WRAP_V3_LEN))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, current) = app.call("GET", "/api/group-keys/current", Some(&b_access), None).await;
+        assert_eq!(status, StatusCode::OK, "{current}");
+        assert_eq!(current["current_version"], 1);
+        assert_eq!(b64.decode(current["keys"][0]["encrypted_key"].as_str().unwrap()).unwrap().len(), proto::WRAP_V3_LEN);
+        assert!(current["keys"][0]["membership"].is_object());
     }).await;
 }
 
@@ -437,9 +645,23 @@ impl TestApp {
         token: Option<&str>,
         body: Option<Value>,
     ) -> (StatusCode, Value) {
+        self.call_with_headers(method, uri, token, &[], body).await
+    }
+
+    async fn call_with_headers(
+        &self,
+        method: &str,
+        uri: &str,
+        token: Option<&str>,
+        headers: &[(&str, &str)],
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
         let mut req = request(method, uri);
         if let Some(token) = token {
             req = req.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        for (name, value) in headers {
+            req = req.header(*name, *value);
         }
         let req = match body {
             Some(body) => req

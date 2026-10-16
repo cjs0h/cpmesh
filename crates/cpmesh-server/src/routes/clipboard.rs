@@ -99,6 +99,9 @@ pub async fn handle_get_clipboard_history(
             "metadata": e.metadata.unwrap_or_default(),
             "created_at": e.created_at.to_rfc3339(),
             "key_version": e.key_version,
+            "request_id": e.request_id.map(|id| id.to_string()),
+            "sent_at": e.sent_at,
+            "sender_signature": e.sender_signature.map(|sig| base64::engine::general_purpose::STANDARD.encode(sig)),
         })
     }).collect();
 

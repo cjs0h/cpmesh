@@ -7,6 +7,15 @@
  */
 import { z } from "zod";
 
+/** WebSocket protocol: `X-Cpmesh-Protocol` in both directions; old peers get HTTP 426. */
+export const PROTOCOL_VERSION = "3";
+/** Pairing protocol: committed short authentication string (see crypto `sas*`). */
+export const PAIRING_VERSION = 3;
+/** Length of a v3 group-key wrap: ephemeral key(65) || nonce(12) || key(32) || tag(16). */
+export const WRAP_V3_LEN = 65 + 12 + 32 + 16;
+/** Length of a legacy static-static wrap: nonce(12) || key(32) || tag(16). */
+export const WRAP_LEGACY_LEN = 12 + 32 + 16;
+
 // === WebSocket message types ===
 
 export const MSG_CLIPBOARD_PUSH = "clipboard_push";
@@ -34,6 +43,10 @@ export interface ClipboardPushPayload {
   encrypted_data: string; // base64
   metadata?: string; // base64 of encrypted metadata JSON
   key_version: number;
+  /** Sender clock, Unix milliseconds. Bound into the AAD and the signature. */
+  sent_at?: number;
+  /** base64 DER ECDSA by the sender identity key over the clipboard signature transcript. */
+  sender_signature?: string;
 }
 
 /** Server → Client: new clipboard entry broadcast. */
@@ -77,8 +90,17 @@ export interface RegisterDeviceRequest {
   name: string;
   public_key: string; // base64 SEC1 uncompressed
   public_key_sig?: string; // base64 DER ECDSA signature
+  /** Static ECDH key, certified by the identity key (encryption key transcript). */
+  encryption_key?: string; // base64 SEC1 uncompressed
+  encryption_key_sig?: string; // base64 DER ECDSA signature
   fingerprint?: string;
   proof?: { challenge: string; signature: string };
+}
+
+/** Request body for PUT /api/devices/me/encryption-key. */
+export interface PublishEncryptionKeyRequest {
+  encryption_key: string; // base64
+  encryption_key_sig: string; // base64
 }
 
 export interface DeviceInfo {
@@ -86,6 +108,8 @@ export interface DeviceInfo {
   name: string;
   public_key?: string; // base64
   public_key_sig?: string; // base64
+  encryption_key?: string; // base64
+  encryption_key_sig?: string; // base64
   last_seen?: string;
   online: boolean;
   status: DeviceStatus;
@@ -108,6 +132,10 @@ export interface ClipboardEntry {
   metadata: string; // base64 of encrypted metadata JSON, may be empty
   created_at: string; // RFC3339
   key_version: number;
+  /** Sender-chosen request ID; part of the signed context. Absent on legacy entries. */
+  request_id?: string;
+  sent_at?: number;
+  sender_signature?: string; // base64
 }
 
 export interface ClipboardHistoryResponse {
@@ -133,6 +161,8 @@ export interface PlainEntry {
   data: Uint8Array;
   metadata: Metadata;
   created_at: string;
+  /** False for legacy (pre-v3) entries whose sender could not be authenticated. */
+  authenticated: boolean;
 }
 
 // === Group keys ===
@@ -179,7 +209,29 @@ export interface PendingDeviceInfo {
   name: string;
   public_key: string; // base64
   public_key_sig?: string; // base64
+  encryption_key?: string; // base64
+  encryption_key_sig?: string; // base64
   created_at: string;
+}
+
+/** Request body for POST /api/device-approvals/{id}/begin. */
+export interface BeginApprovalRequest {
+  /** SAS commitment of the approver's nonce (base64). */
+  commit: string;
+}
+
+/** Response for GET /api/device-approvals/{id}/session (approver polls for the pending nonce). */
+export interface ApprovalSessionState {
+  session_id: string;
+  pending_nonce?: string; // base64
+  approver_nonce?: string; // base64
+  expires_at: string;
+}
+
+/** Request body for POST /api/device-approvals/me/nonce and /{id}/reveal. */
+export interface SasNonceRequest {
+  session_id: string;
+  nonce: string; // base64, 32 bytes
 }
 
 export interface ApprovalStatusResponse {
@@ -189,6 +241,10 @@ export interface ApprovalStatusResponse {
   approver_public_key?: string; // base64
   approver_public_key_sig?: string; // base64
   session_id?: string;
+  /** SAS commitment of the approver's nonce (base64, 32 bytes). */
+  approver_commit?: string;
+  pending_nonce?: string; // base64
+  approver_nonce?: string; // base64
 }
 
 export interface UserInfo {
@@ -214,6 +270,16 @@ export const groupKeysSchema = z.object({
     from_public_key_sig: base64.nullish(), membership: membershipSchema.nullish(),
   })).max(100),
 });
+const canonicalUuid = z.string().uuid().refine((id) => id === id.toLowerCase());
+/** Relay-delivered entry (history or `clipboard_new` broadcast). */
+export const clipboardEntrySchema = z.object({
+  id: z.string(), user_id: z.string().default(""), device_id: canonicalUuid, device_name: z.string().default(""),
+  content_type: z.enum(["text", "image", "file"]), encrypted_data: z.string().max(48 * 1024 * 1024),
+  metadata: z.string().max(65536).default(""), created_at: z.string(), key_version: z.number().int().positive(),
+  request_id: canonicalUuid.optional(), sent_at: z.number().int().positive().optional(),
+  sender_signature: base64.optional(),
+});
+export const clipboardNewSchema = z.object({ entry: clipboardEntrySchema });
 export const clipboardReceiptSchema = z.object({
     status: z.literal("accepted"), request_id: z.string().uuid(), entry_id: z.string().uuid(),
     created_at: z.string().datetime({ offset: true }),

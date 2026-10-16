@@ -6,6 +6,7 @@
 		removeDevice,
 		getPendingDevices,
 		beginDeviceApproval,
+		pollDeviceApproval,
 		confirmDeviceApproval,
 		rejectPendingDevice,
 		getOwnIdentity,
@@ -25,6 +26,7 @@
 	import EmptyState from '#lib/components/ui/EmptyState.svelte';
 	import Field from '#lib/components/ui/Field.svelte';
 	import Fingerprint from '#lib/components/ui/Fingerprint.svelte';
+	import PairingCode from '#lib/components/ui/PairingCode.svelte';
 	import Icon from '#lib/components/ui/Icon.svelte';
 	import PageHeader from '#lib/components/ui/PageHeader.svelte';
 	import Skeleton from '#lib/components/ui/Skeleton.svelte';
@@ -103,6 +105,29 @@
 		}
 	}
 
+	let sasPollTimer: ReturnType<typeof setInterval> | null = null;
+
+	function stopSasPolling() {
+		if (sasPollTimer) {
+			clearInterval(sasPollTimer);
+			sasPollTimer = null;
+		}
+	}
+
+	// The 8-digit code exists only after the new device contributed its nonce and
+	// we opened our commitment; poll until then.
+	async function pollSas() {
+		if (!approvingDevice || !approvalSession) return;
+		try {
+			const updated = await pollDeviceApproval(approvingDevice.id, approvalSession.session_id);
+			approvalSession = updated;
+			if (updated.sas) stopSasPolling();
+		} catch (e) {
+			approvalError = friendlyError(e);
+			stopSasPolling();
+		}
+	}
+
 	async function handleBeginApproval(device: PendingDevice) {
 		approvalError = '';
 		approvalSession = null;
@@ -110,17 +135,19 @@
 		approvalOpen = true;
 		try {
 			approvalSession = await beginDeviceApproval(device.id);
+			stopSasPolling();
+			sasPollTimer = setInterval(pollSas, 1500);
 		} catch (e) {
 			approvalError = friendlyError(e);
 		}
 	}
 
 	async function handleConfirmApproval() {
-		if (!approvingDevice || !approvalSession || confirming) return;
+		if (!approvingDevice || !approvalSession?.sas || confirming) return;
 		approvalError = '';
 		confirming = true;
 		try {
-			await confirmDeviceApproval(approvingDevice.id, approvalSession.session_id, approvalSession.approval_code);
+			await confirmDeviceApproval(approvingDevice.id, approvalSession.session_id, approvalSession.sas);
 			const name = approvingDevice.name;
 			confirming = false;
 			approvalOpen = false;
@@ -134,6 +161,7 @@
 	}
 
 	function onApprovalClosed() {
+		stopSasPolling();
 		approvalSession = null;
 		approvingDevice = null;
 		approvalError = '';
@@ -196,6 +224,7 @@
 		return () => {
 			disposed = true;
 			unlisten?.();
+			stopSasPolling();
 		};
 	});
 </script>
@@ -380,14 +409,19 @@
 	bind:open={approvalOpen}
 	locked={confirming}
 	title={approvingDevice ? `Approve “${approvingDevice.name}”` : 'Approve device'}
-	description="Compare every group with the fingerprint on the new device, or over a channel you trust. Both devices must confirm."
+	description="The new device shows an 8-digit pairing code too. Approve only if both screens show the same code."
 	onclose={onApprovalClosed}
 >
-	{#if approvalSession}
-		<Fingerprint value={approvalSession.approval_code} label="Pairing fingerprint" />
+	{#if approvalSession?.sas}
+		<PairingCode code={approvalSession.sas} fullCode={approvalSession.approval_code} />
 		<p class="mt-3 flex items-start gap-2 text-xs leading-relaxed text-muted">
 			<Icon name="alert-triangle" size={13} class="mt-0.5 text-warning" />
-			If even one character differs, don’t approve: someone may be impersonating your device.
+			If even one digit differs, don’t approve: someone may be impersonating your device.
+		</p>
+	{:else if approvalSession}
+		<p class="flex items-center gap-2.5 text-[13px] text-muted" role="status">
+			<span class="status-dot text-accent" data-live="true"></span>
+			Exchanging pairing codes with “{approvingDevice?.name}”. Keep its waiting screen open.
 		</p>
 	{:else if !approvalError}
 		<div class="space-y-2" aria-busy="true" aria-label="Starting approval">
@@ -401,7 +435,9 @@
 	{#snippet footer()}
 		<Button variant="ghost" disabled={confirming} onclick={() => (approvalOpen = false)}>Cancel</Button>
 		{#if approvalSession}
-			<Button variant="primary" icon="check" loading={confirming} onclick={handleConfirmApproval}>Every group matches — approve</Button>
+			<Button variant="primary" icon="check" loading={confirming} disabled={!approvalSession.sas} onclick={handleConfirmApproval}>
+				Both devices show this code — approve
+			</Button>
 		{/if}
 	{/snippet}
 </Dialog>

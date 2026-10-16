@@ -3,7 +3,12 @@ use std::path::Path;
 
 use crate::api::client::{ApiClient, ApiError};
 use crate::config::AppConfig;
-use crate::crypto::{exchange::KeyExchange, keys::KeyPair, membership, verify::KeyVerifier};
+use crate::crypto::{
+    exchange::KeyExchange,
+    keys::{DeviceKeys, KeyPair},
+    membership::{self, WrapTarget},
+    verify::KeyVerifier,
+};
 use crate::proto::models::*;
 
 pub fn bind_account(
@@ -37,8 +42,8 @@ pub fn bind_account(
     Ok(())
 }
 
-pub fn restore(pair: KeyPair, directory: &Path) -> Result<KeyExchange, String> {
-    let mut exchange = KeyExchange::new(pair);
+pub fn restore(keys: DeviceKeys, directory: &Path) -> Result<KeyExchange, String> {
+    let mut exchange = KeyExchange::new(keys);
     let path = AppConfig::keyring_path(directory);
     if path.exists() {
         exchange
@@ -48,12 +53,36 @@ pub fn restore(pair: KeyPair, directory: &Path) -> Result<KeyExchange, String> {
     Ok(exchange)
 }
 
+/// Makes sure the relay publishes this device's current certified encryption key,
+/// so peers can wrap new group keys to it. Idempotent.
+pub async fn publish_encryption_key(
+    exchange: &KeyExchange,
+    api: &ApiClient,
+    own_id: &str,
+) -> Result<(), String> {
+    let devices = api.get_device_keys().await.map_err(|e| e.to_string())?;
+    let published = devices
+        .devices
+        .iter()
+        .find(|d| d.id == own_id)
+        .and_then(|d| d.encryption_key.as_deref());
+    if published == Some(exchange.keys().encryption.public_key_bytes().as_slice()) {
+        return Ok(());
+    }
+    api.publish_encryption_key(exchange.keys())
+        .await
+        .map_err(|e| format!("Could not publish the device encryption key: {e}"))
+}
+
+/// Approved members whose identity key is pinned locally and whose encryption key
+/// that identity certified. Only these receive wraps; the relay's listing alone
+/// authorizes nothing.
 pub async fn trusted_members(
     exchange: &KeyExchange,
     api: &ApiClient,
     own_id: &str,
     directory: &Path,
-) -> Result<Vec<DeviceIdentity>, String> {
+) -> Result<Vec<WrapTarget>, String> {
     let mut verifier = KeyVerifier::new(directory).map_err(|e| e.to_string())?;
     verifier
         .pin_after_approval(own_id, &exchange.key_pair().public)
@@ -72,10 +101,22 @@ pub async fn trusted_members(
                     d.name
                 )
             })?;
-            Ok(DeviceIdentity {
+            let identity = DeviceIdentity {
                 id: d.id,
                 public_key,
-            })
+            };
+            if identity.id == own_id {
+                // Our own encryption key comes from local storage, never from the relay.
+                return Ok(WrapTarget {
+                    identity,
+                    encryption_key: exchange.keys().encryption.public,
+                });
+            }
+            membership::certified_target(
+                identity,
+                d.encryption_key.as_deref(),
+                d.encryption_key_sig.as_deref(),
+            )
         })
         .collect()
 }
@@ -99,7 +140,10 @@ pub async fn synchronize(
         Ok(response) => response,
         Err(ApiError::Server { status: 404, .. }) => {
             let members = trusted_members(&candidate, api, own_id, directory).await?;
-            if members.len() != 1 || members[0].id != own_id || candidate.current_version > 1 {
+            if members.len() != 1
+                || members[0].identity.id != own_id
+                || candidate.current_version > 1
+            {
                 return Err("Mesh key state is missing; restore your keyring or verify an existing device. Refusing to create replacement keys.".into());
             }
             let (version, wrapped_keys) = if let Some(key) = candidate.keys_by_version.get(&1) {
@@ -197,25 +241,25 @@ mod tests {
     #[test]
     fn startup_and_relogin_restore_all_saved_versions_without_regenerating_version_one() {
         let dir = tempfile::tempdir().unwrap();
-        let pair = KeyPair::generate();
-        let mut original = KeyExchange::new(pair.clone());
+        let keys = DeviceKeys::generate();
+        let mut original = KeyExchange::new(keys.clone());
         original.add_key_version(1, vec![11; 32]).unwrap();
-        let (old_clip, _) = original.encrypt_payload(b"old clipboard").unwrap();
+        let (old_clip, _) = original.encrypt_payload(b"old clipboard", b"").unwrap();
         original.add_key_version(2, vec![22; 32]).unwrap();
         original
             .save_keyring(&AppConfig::keyring_path(dir.path()))
             .unwrap();
         for _ in 0..2 {
-            let restored = restore(pair.clone(), dir.path()).unwrap();
+            let restored = restore(keys.clone(), dir.path()).unwrap();
             assert_eq!(restored.current_version, 2);
             assert_eq!(
-                restored.decrypt_payload(&old_clip, 1).unwrap(),
+                restored.decrypt_payload(&old_clip, 1, b"").unwrap(),
                 b"old clipboard"
             );
         }
         std::fs::write(AppConfig::keyring_path(dir.path()), "invalid keyring").unwrap();
         assert!(
-            restore(pair, dir.path()).is_err(),
+            restore(keys, dir.path()).is_err(),
             "corruption must not create replacement key material"
         );
     }

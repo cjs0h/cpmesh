@@ -146,7 +146,7 @@
   const agentAbilities = [
     { icon: 'send', text: 'Sends commands, links and snippets straight to your phone or desktop clipboard' },
     { icon: 'clipboard', text: 'Reads and searches what you copied, decrypted only on your machine' },
-    { icon: 'key', text: 'Joins as its own device after full-fingerprint verification on both ends' },
+    { icon: 'key', text: 'Joins as its own device after pairing-code verification on both ends' },
   ];
 
   const protocols = [

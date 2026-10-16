@@ -5,12 +5,14 @@ end-to-end-encrypted clipboard sync: share text to the user's devices, read
 and search clipboard history, and manage devices — all through the standard
 Model Context Protocol.
 
-The server behaves as a first-class cpmesh **device**: it generates its own
-ECDH P-256 key pair, goes through the same full-fingerprint device pairing as
-the desktop app, and keeps the group key locally. Content stays end-to-end
-encrypted between the agent and the user's other devices — the cpmesh server
-only ever sees ciphertext. The crypto is a byte-compatible port of the desktop
-client's Rust implementation, pinned by golden-vector tests.
+The server behaves as a first-class cpmesh **device** speaking protocol 3: it
+generates its own P-256 identity (signing) and encryption (ECDH) key pairs,
+goes through the same committed short-code device pairing as the desktop app,
+signs every clipboard entry it pushes, verifies the sender of every entry it
+reads, and keeps the group key locally. Content stays end-to-end encrypted
+between the agent and the user's other devices — the cpmesh server only ever
+sees ciphertext. The crypto is a byte-compatible port of the desktop client's
+Rust implementation, pinned by golden-vector tests.
 
 ## Install (for AI agents and humans)
 
@@ -45,19 +47,19 @@ at runtime via the `cpmesh_skill` MCP prompt.
 | `CPMESH_SERVER_URL` | — | Server base URL, e.g. `https://cpmesh.com` (can also be passed to the `cpmesh_login` tool) |
 | `CPMESH_USERNAME` | — | With `CPMESH_PASSWORD`, auto-login at startup (the agent still asks the user for the two-factor code) |
 | `CPMESH_PASSWORD` | — | See above |
-| `CPMESH_HOME` | `~/.cpmesh/mcp` | Directory for device key, keyring, session, key pins |
+| `CPMESH_HOME` | `~/.cpmesh/mcp` | Directory for device keys, keyring, session, key pins, replay guard |
 
 ## Tools
 
 | Tool | What it does |
 |---|---|
-| `cpmesh_status` | Login/approval state, pairing code if pending, group-key version, and the exact next step |
-| `cpmesh_login` | Log in with the second factor when asked, then register with proof of key possession |
-| `cpmesh_confirm_pairing` | Confirm the full pairing fingerprint independently compared on the trusted device |
-| `cpmesh_verify_device` | Explicitly verify an existing peer's full public-key fingerprint after upgrade/recovery |
+| `cpmesh_status` | Login/approval state, the 8-digit pairing code and session while pending, group-key version, and the exact next step |
+| `cpmesh_login` | Log in with the second factor when asked, then register with proof of key possession and a certified encryption key |
+| `cpmesh_confirm_pairing` | Confirm the 8-digit pairing code (or the 64-character full code) the user compared on the trusted device |
+| `cpmesh_verify_device` | Explicitly verify an existing peer's full identity-key fingerprint after upgrade/recovery |
 | `cpmesh_wait_for_approval` | Poll until the user approves the device; syncs the group key on approval |
-| `cpmesh_push_clipboard` | E2E-encrypt text and await persistence; returns the canonical entry ID, not a delivery guarantee |
-| `cpmesh_get_clipboard` | Decrypted clipboard history (newest first, paginated) |
+| `cpmesh_push_clipboard` | E2E-encrypt and sign text, await persistence; returns the canonical entry ID, not a delivery guarantee |
+| `cpmesh_get_clipboard` | Decrypted, sender-verified clipboard history (newest first, paginated) |
 | `cpmesh_get_latest_clipboard` | Single latest entry (`skip_own` to ignore the agent's own pushes) |
 | `cpmesh_search_clipboard` | Case-insensitive substring search over history |
 | `cpmesh_delete_clipboard_entry` | Delete one history entry by ID |
@@ -76,12 +78,17 @@ Plus the `cpmesh_skill` prompt with install/usage instructions.
    their authenticator app (or a recovery code) and calls `cpmesh_login` again
    with `code` (see [Two-factor authentication](#two-factor-authentication)).
 3. The device registers as **pending**. The user starts approval on a trusted
-   device, then the agent calls `cpmesh_status` to obtain `pairing_session_id`
-   and a full 64-character `approval_code` (a 256-bit fingerprint, not a short code).
-4. The user compares **every character** on both devices through an independent
-   trusted channel and confirms on the trusted device. The agent must obtain that
-   independent confirmation, then call `cpmesh_confirm_pairing` with the session ID
-   and full fingerprint; never automatically echo a relay/MCP value as confirmation.
+   device; both devices then run the committed short-authentication-string
+   exchange and show the same **8-digit pairing code**. The agent calls
+   `cpmesh_status` to obtain `pairing_session_id`, `pairing_code` and
+   `pairing_full_code` (a 64-character code over both identity keys, for a
+   stronger manual check).
+4. The user compares the 8-digit code on both devices (or every character of
+   the full code) and confirms on the trusted device. The agent asks the user
+   for the code **as shown on the trusted device**, then calls
+   `cpmesh_confirm_pairing` with the session ID and that code; it never echoes
+   a relay/MCP value as confirmation. Neither side pins the other before its
+   own code exists, and a changed or non-opening commitment aborts the session.
 5. Agent calls `cpmesh_wait_for_approval` → the authenticated group key is unwrapped and cached;
    clipboard tools go live.
 
@@ -120,15 +127,22 @@ with the configured password again if the ticket has expired).
 
 State lives in `CPMESH_HOME` (default `~/.cpmesh/mcp`, files `0600` on Unix):
 
-- `device.key` — device ECDH private key (same PEM format as the desktop app)
-- `keyring.enc` — encrypted group-key keyring (same file format as the desktop app)
+- `device.key` — identity private key (P-256, PEM; signs only: registration proofs,
+  encryption-key certification, membership transitions and clipboard entries)
+- `encryption.key` — static encryption private key (P-256, PEM; only receives ECDH
+  group-key wraps). Created on first use for installs that predate protocol 3 and
+  published to the relay with a certification by the identity key.
+- `keyring.enc` — encrypted group-key keyring (same file format as the desktop app;
+  KEK derived from the identity key)
 - `session.json` — server URL, device identity, JWT tokens. Refresh tokens are
   single-use: each refresh rotates them and writes the new pair back here, so
   several MCP processes can share one state directory.
 - `verified_keys.json` — independently verified identities, authenticated membership
   epochs and revocation records. Legacy `pinned_keys.json` is not imported automatically.
-- `clipboard_requests.json` — at most 32 encrypted pushes and persistence receipts,
-  so a retry can use the same ciphertext and request ID after a restart
+- `clipboard_requests.json` — at most 32 signed, encrypted pushes and persistence receipts,
+  so a retry can use the same ciphertext, signature and request ID after a restart
+- `sender_clocks.json` — replay guard: the newest accepted `sent_at` per sender device,
+  for entries received live over the WebSocket
 - `.state.lock` — a cross-process lock with a heartbeat, held during profile mutations;
   do not remove it while an MCP process is running
 
@@ -142,9 +156,28 @@ Revoked IDs cannot be silently re-admitted; historical identities remain usable 
 for earlier epochs. Keyring restoration is strict and never replaces existing-version
 key material or treats corrupt files as an empty mesh.
 
-Device WebSockets require protocol 2 in both directions. Update the relay and all
-clients together; no insecure fallback to short-code pairing or unbound refresh binding
-is provided. Existing meshes must explicitly verify peers with `cpmesh_verify_device`
+**Protocol 3.** Device WebSockets require `X-Cpmesh-Protocol: 3` in both directions and
+pairing requires `pairing_version` 3; the relay, the desktop app and this package must be
+upgraded together (old peers get HTTP 426, and there is no fallback). What changed:
+
+- Every clipboard entry is bound to its context — key version, content type, sender,
+  request ID and sender clock — through AES-GCM associated data (separately for data and
+  metadata), and the sender's identity key signs that context plus both ciphertexts. The
+  MCP server signs everything it pushes and, before decrypting anything it reads, checks
+  that the sender is a locally verified member and that its signature is valid. Entries
+  pushed by devices before the upgrade carry no signature: they are still readable from
+  history but reported with `authenticated: false`, and are rejected on the live path.
+  Live entries must also carry a strictly increasing `sent_at` per sender (replay guard).
+- Group keys are wrapped per recipient with a fresh ephemeral key against the recipient's
+  **certified encryption key** (125-byte wraps), so compromising a device's long-term keys
+  later does not open past wraps. The identity key only signs. A member without a
+  certified encryption key cannot receive new keys: update or remove that device. Wraps
+  created before the upgrade (60 bytes) remain importable for catch-up.
+- Pairing compares an 8-digit code derived from nonces both sides commit to before
+  revealing, so a relay that substitutes a key succeeds with probability 1e-8 per attempt
+  and every failed attempt is visible. The 64-character full code is still available.
+
+Existing meshes must explicitly verify peers with `cpmesh_verify_device`
 (get the fingerprint from the peer's own identity display, not from the relay).
 Automatic/required rotation then uses authenticated membership and retains historical keys.
 

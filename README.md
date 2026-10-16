@@ -15,7 +15,7 @@ Cross-platform encrypted clipboard sharing. Copy on one device, paste on any oth
 
 cpmesh is a self-hosted clipboard sync tool with end-to-end encryption. It lets you share clipboard content (text, images, files) across your devices in real time over WebSocket, with the server never seeing your plaintext data.
 
-- **End-to-end encrypted** — AES-256-GCM encryption with ECDH P-256 key exchange. The relay server stores only ciphertext.
+- **End-to-end encrypted** — AES-256-GCM with per-entry keys, every entry bound to its context and signed by the sending device. Group keys travel in ephemeral ECDH P-256 wraps to identity-certified encryption keys. The relay server stores only ciphertext.
 - **Real-time sync** — WebSocket push delivery. Copy on one device, paste on another in under a second.
 - **Cross-platform** — Desktop app (Tauri) for Windows, macOS, and Linux, plus a web dashboard.
 - **Self-hosted** — Run the relay server on your own infrastructure. Single binary + PostgreSQL. Docker Compose ready.
@@ -37,11 +37,11 @@ Desktop App                  Browser
 (Tauri+SvelteKit)            (Web dashboard)
 ```
 
-**Encryption flow:**
-1. Each device generates an ECDH P-256 key pair and proves possession with a single-use, session-bound challenge before receiving device-bound access and refresh tokens.
-2. The first device creates a random 256-bit group key and stores an encrypted copy to itself. Other devices join only after full-fingerprint verification on both ends; an authenticated membership transition rotates the key and wraps it for the approved members.
-3. All clipboard data is encrypted with the group key (AES-256-GCM via HKDF derivation) before leaving the device.
-4. Clients authenticate key senders and signed membership locally, not from relay-provided approval flags or self-signatures. The relay stores ciphertext; content type, encrypted size, device identity and timing remain visible to it.
+**Encryption flow (protocol 3):**
+1. Each device has two P-256 keys: an **identity key** that only signs, and an **encryption key** that only does ECDH and is certified by the identity key. The identity key proves possession with a single-use, session-bound challenge before the device receives device-bound access and refresh tokens; the identity and encryption private keys live in the OS credential store on desktop.
+2. The first device creates a random 256-bit group key. Other devices join through committed short-code pairing: both devices show the same 8-digit code (derived from nonces each side commits to before seeing the other's, plus both identity keys) and the user confirms on both; a 64-character full code is available for a stronger manual check. An authenticated membership transition then rotates the key and wraps it for every approved member using a fresh ephemeral key per recipient, so a later theft of long-term keys does not open past wraps.
+3. Clipboard data and metadata are encrypted with a per-entry key derived from the group key (AES-256-GCM via HKDF). The ciphertexts are bound to the key version, content type, sender, request ID and sender clock, and the sending device signs that context together with both ciphertexts.
+4. Receivers accept an entry only from a member they pinned themselves, only with a valid sender signature, and only with a strictly increasing sender clock; the relay can neither relabel, splice, re-attribute nor replay entries. The relay still sees content type, encrypted size, device identity and timing.
 
 ## Quick Start
 
@@ -155,9 +155,10 @@ server if you self-host.
 On first use the agent asks for your credentials and the 6-digit code from your
 authenticator app (or a recovery code; the MCP server cannot use passkeys, so add
 an authenticator app under **Settings → Two-factor authentication** if a passkey
-is your only second factor), then walks you through full-fingerprint device pairing.
-Compare all 64 hexadecimal characters through an independent trusted channel and confirm on
-both devices; the agent uses `cpmesh_confirm_pairing` before waiting for approval.
+is your only second factor), then walks you through device pairing. Both devices show the
+same 8-digit pairing code (the full 64-character code is available for a stronger check);
+confirm on both devices only if the codes are identical. The agent uses `cpmesh_confirm_pairing`
+before waiting for approval.
 Full agent instructions live in
 [`mcp/cpmesh-mcp/SKILL.md`](mcp/cpmesh-mcp/SKILL.md) — install that file into
 your agent's skills directory (e.g. `~/.agents/skills/cpmesh/`), or let the
@@ -193,10 +194,10 @@ and step-up preserve the original session issuance time, so an in-flight refresh
 ## Secure-sync upgrade and compatibility
 
 Upgrade the relay, desktop apps and MCP package together, and reload the web dashboard. This is an
-intentional protocol boundary, not a transparent mixed-version rollout. Existing ciphertext, ECDH
-wrapping and encrypted-keyring byte formats are unchanged, but unsafe authorization paths are not retained.
+intentional protocol boundary, not a transparent mixed-version rollout. Existing ciphertext and
+encrypted-keyring byte formats stay readable, but unsafe authorization paths are not retained.
 
-Before upgrading, back up each device's private key, encrypted keyring and local history. Legacy
+Before upgrading, back up each device's private keys, encrypted keyring and local history. Legacy
 `pinned_keys.json` files were trust-on-first-use and are **not** silently promoted to authenticated
 membership. On an existing mesh, use the desktop **Devices** page or MCP `cpmesh_verify_device` to
 compare a peer's complete public-key fingerprint directly with that peer's own identity display.
@@ -204,17 +205,30 @@ After verification, clients rotate to an authenticated membership and learn late
 through signed transitions. Do not delete keyring files to bypass a verification error: a missing
 wrapped copy is not evidence of a new mesh, and lost historical key material cannot be regenerated.
 
-Device WebSockets negotiate `X-Cpmesh-Protocol: 2` in both directions. Older devices receive HTTP 426;
+Device WebSockets negotiate `X-Cpmesh-Protocol: 3` in both directions. Older devices receive HTTP 426;
 updated clients refuse relays that do not confirm this version. Browser metadata sockets and the public
 download/update endpoints remain available, including to apps downloading an upgrade. Registration and
 reconnection require a session-bound proof; an unbound refresh token cannot select an approved device ID.
-The legacy group-key GET remains readable, but legacy writes and short-code approval return HTTP 426.
+The legacy group-key GET remains readable, but legacy writes and non-committed pairing return HTTP 426.
+
+**Protocol 3 changes.** On first start, each updated device moves its `device.key` into the OS
+credential store (Keychain, Credential Manager or Secret Service; a 0600 file when none is available),
+generates a separate encryption key certified by its identity key, and publishes that certification.
+Key rotation now wraps only to certified encryption keys, so a mesh cannot rotate until every approved
+member has been updated — remove devices you no longer use. New wraps are 125 bytes (ephemeral key,
+nonce, ciphertext, tag); wraps created before the upgrade remain importable for catch-up. Clipboard
+pushes carry `sent_at` and `sender_signature`; the relay verifies the signature against the sending
+device's identity key and refuses unsigned pushes, and receivers verify it again themselves. Entries
+stored before the upgrade are unsigned: they still decrypt for history display, are marked
+unauthenticated, and are never written to the clipboard.
 
 Removing a device closes its socket and blocks old-key writes until rotation. Clients persist verified
 epochs and revocation records, reject known rollbacks/re-admissions, and retain historical keys. Removal
 cannot erase plaintext or keys a device already copied. For a lost or compromised device, use fresh
 private keys when enrolling its replacement; do not reuse the compromised profile. A relay can still
-withhold traffic, and this protocol is not a ratcheting protocol with retroactive erasure.
+withhold traffic, and this protocol is not a ratcheting protocol with retroactive erasure: ephemeral
+wraps protect past key distribution against a later theft of long-term keys, but the encrypted keyring
+on each device still holds every historical group key so that history stays readable.
 
 Clipboard pushes carry a UUID `request_id`. A `clipboard_ack` confirms database persistence and returns
 the canonical entry ID, or reports rejection/uncertain persistence. It is **not** proof that another device

@@ -2,8 +2,8 @@
 	import type { MyApprovalStatus } from '#lib/api.js';
 	import Alert from './ui/Alert.svelte';
 	import Button from './ui/Button.svelte';
-	import Fingerprint from './ui/Fingerprint.svelte';
 	import Icon from './ui/Icon.svelte';
+	import PairingCode from './ui/PairingCode.svelte';
 	import Logo from './ui/Logo.svelte';
 
 	/** Shown while this device waits for approval, and when it was rejected. */
@@ -22,7 +22,7 @@
 	const steps = [
 		'Open cpmesh on a device you already use',
 		'Go to Devices and find this device under Waiting for approval',
-		'Choose Approve and compare the fingerprint on both screens',
+		'Choose Approve and compare the 8-digit pairing code on both screens',
 	];
 </script>
 
@@ -62,14 +62,13 @@
 							<Button size="sm" icon="refresh" onclick={onretry}>Try again</Button>
 						{/snippet}
 					</Alert>
-				{:else if approval?.approval_code}
+				{:else if approval?.sas}
 					<div class="mt-6 rounded-xl border border-border bg-surface p-5 shadow-xs">
-						<p class="text-[13px] font-medium text-fg">Compare this fingerprint</p>
+						<p class="text-[13px] font-medium text-fg">Compare this pairing code</p>
 						<p class="mt-0.5 text-xs leading-relaxed text-muted">
-							Check every group against the approving device's screen, or over a channel you trust. Both devices must
-							confirm.
+							The approving device shows a code too. Confirm on both devices only if all eight digits are identical.
 						</p>
-						<Fingerprint class="mt-4" value={approval.approval_code} label="Pairing fingerprint" />
+						<PairingCode class="mt-4" code={approval.sas} fullCode={approval.approval_code} />
 						{#if approval.locally_verified}
 							<p class="mt-4 flex items-center gap-2 text-[13px] font-medium text-success-fg">
 								<Icon name="check-circle" size={15} />
@@ -77,9 +76,20 @@
 							</p>
 						{:else}
 							<Button variant="primary" class="mt-4 w-full" icon="check" loading={confirming} onclick={onconfirm}>
-								Every group matches — trust the approver
+								Both devices show this code — trust the approver
 							</Button>
 						{/if}
+					</div>
+				{:else if approval?.approval_code}
+					<div class="mt-6 rounded-xl border border-border bg-surface p-5 shadow-xs">
+						<p class="text-[13px] font-medium text-fg">Exchanging pairing codes…</p>
+						<p class="mt-0.5 text-xs leading-relaxed text-muted">
+							Keep this screen open. The 8-digit code appears on both devices in a moment.
+						</p>
+						<p class="mt-4 flex items-center gap-2.5 text-[13px] text-muted" role="status">
+							<span class="status-dot text-accent" data-live="true"></span>
+							Waiting for the approving device
+						</p>
 					</div>
 				{:else}
 					<ol class="mt-6 space-y-3">

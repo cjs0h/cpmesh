@@ -17,7 +17,7 @@ afterEach(async () => {
 });
 async function peer() {
   const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
-  server.on("headers", (headers) => { headers.push("X-Cpmesh-Protocol: 2"); });
+  server.on("headers", (headers) => { headers.push("X-Cpmesh-Protocol: 3"); });
   servers.push(server);
   await once(server, "listening");
   return { server, url: `http://127.0.0.1:${(server.address() as AddressInfo).port}` };
@@ -28,14 +28,40 @@ function payload() {
 }
 
 describe("real WebSocket lifecycle and persistence acknowledgements", () => {
-  it("refuses a legacy relay before sending any clipboard payload", async () => {
+  it("announces protocol 3 and refuses a relay that does not confirm it before sending any payload", async () => {
     const { server, url } = await peer();
+    let announced: string | undefined;
     server.removeAllListeners("headers");
+    server.on("headers", (headers, request) => {
+      announced = request.headers["x-cpmesh-protocol"] as string | undefined;
+      headers.push("X-Cpmesh-Protocol: 2");
+    });
     let messages = 0;
     server.on("connection", (socket) => socket.on("message", () => { messages++; }));
     await expect(client().pushClipboard(url, "token", undefined, payload()))
       .rejects.toMatchObject({ code: "protocol_upgrade_required" });
+    expect(announced).toBe("3");
     expect(messages).toBe(0);
+  });
+
+  it("hands well-formed clipboard_new broadcasts to the live handler and drops malformed ones", async () => {
+    const { server, url } = await peer();
+    const socket = client();
+    const seen: string[] = [];
+    socket.onClipboardNew = vi.fn(async (entry) => { seen.push(entry.id); if (entry.id === "boom") throw new Error("rejected"); });
+    const connected = once(server, "connection");
+    await socket.ensureConnected(url, "token");
+    const [remote] = await connected as [WebSocket];
+    const entry = {
+      id: "e1", user_id: "u1", device_id: "00000000-0000-4000-8000-000000000001", device_name: "A", content_type: "text",
+      encrypted_data: "AA==", metadata: "", created_at: "2026-01-01T00:00:00Z", key_version: 1,
+      request_id: "00000000-0000-4000-8000-000000000009", sent_at: 1_700_000_000_123, sender_signature: "AA==",
+    };
+    remote.send(JSON.stringify({ type: "clipboard_new", payload: { entry: { ...entry, sent_at: "soon" } } }));
+    remote.send(JSON.stringify({ type: "clipboard_new", payload: { entry: { ...entry, id: "boom" } } }));
+    remote.send(JSON.stringify({ type: "clipboard_new", payload: { entry } }));
+    await vi.waitFor(() => expect(seen).toEqual(["boom", "e1"]));
+    expect(socket.isConnected).toBe(true);
   });
   it("close releases the transport and stale callbacks cannot clear a replacement", async () => {
     const { server, url } = await peer();
