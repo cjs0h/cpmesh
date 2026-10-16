@@ -259,6 +259,22 @@ pub fn run() {
                 }
             });
 
+            // Packages register the cpmesh:// handler (used by browser sign-in) through their
+            // .desktop file, but an AppImage is never installed, so it registers itself on
+            // every start, which also keeps the handler pointing at it after it's moved
+            #[cfg(target_os = "linux")]
+            {
+                if app.env().appimage.is_some() {
+                    let handle = app.handle().clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        use tauri_plugin_deep_link::DeepLinkExt;
+                        if let Err(e) = handle.deep_link().register_all() {
+                            log::error!("Failed to register the cpmesh:// URL scheme: {e}");
+                        }
+                    });
+                }
+            }
+
             #[cfg(desktop)]
             {
                 // Setup system tray (non-fatal if it fails)
