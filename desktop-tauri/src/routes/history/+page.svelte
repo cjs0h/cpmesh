@@ -1,45 +1,72 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { getHistory, searchHistory, copyEntry, deleteEntry, clearHistory, syncHistory, type HistoryEntry, type HistoryPage } from '#lib/api.js';
 	import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-	import { getAppStateValue } from '#lib/store.svelte.js';
+	import { getHistory, searchHistory, copyEntry, deleteEntry, clearHistory, syncHistory, type HistoryEntry } from '#lib/api.js';
+	import { getAppStateValue, getStatusValue } from '#lib/store.svelte.js';
+	import { confirmAction } from '#lib/confirm.svelte.js';
+	import { toast } from '#lib/toast.svelte.js';
+	import { contentKind, dayLabel, errorMessage, formatClock, formatSize, hasModKey, type ContentKind } from '#lib/ui.js';
+	import Alert from '#lib/components/ui/Alert.svelte';
+	import Button from '#lib/components/ui/Button.svelte';
+	import EmptyState from '#lib/components/ui/EmptyState.svelte';
+	import Field from '#lib/components/ui/Field.svelte';
+	import Icon from '#lib/components/ui/Icon.svelte';
+	import Kbd from '#lib/components/ui/Kbd.svelte';
+	import PageHeader from '#lib/components/ui/PageHeader.svelte';
+	import Segmented from '#lib/components/ui/Segmented.svelte';
+	import Skeleton from '#lib/components/ui/Skeleton.svelte';
 
 	let entries = $state<HistoryEntry[]>([]);
 	let hasMore = $state(false);
 	let page = $state(0);
 	let query = $state('');
-	let loading = $state(false);
+	let loading = $state(true);
+	let loadingMore = $state(false);
 	let error = $state('');
 	let searchTimeout: ReturnType<typeof setTimeout>;
 	let syncing = $state(false);
-	let syncMsg = $state('');
-	let copyingId = $state<string | null>(null);
+	let copiedId = $state<string | null>(null);
+	let copiedTimer: ReturnType<typeof setTimeout> | undefined;
 	let deletingId = $state<string | null>(null);
 	let clearing = $state(false);
+	let filter = $state<'all' | ContentKind>('all');
+	let searchInput = $state<HTMLInputElement | null>(null);
 
 	const appState = $derived(getAppStateValue());
+	const status = $derived(getStatusValue());
+	const searching = $derived(query.trim().length > 0);
+
+	const visible = $derived(filter === 'all' ? entries : entries.filter((e) => contentKind(e.content_type) === filter));
+
+	const groups = $derived.by(() => {
+		const out: { label: string; items: HistoryEntry[] }[] = [];
+		for (const entry of visible) {
+			const label = dayLabel(entry.created_at);
+			const last = out.at(-1);
+			if (last && last.label === label) last.items.push(entry);
+			else out.push({ label, items: [entry] });
+		}
+		return out;
+	});
 
 	async function loadHistory() {
-		loading = true;
+		if (page === 0) loading = true;
+		else loadingMore = true;
 		error = '';
 		try {
 			const result = await getHistory(page);
-			if (page === 0) {
-				entries = result.entries;
-			} else {
-				entries = [...entries, ...result.entries];
-			}
+			entries = page === 0 ? result.entries : [...entries, ...result.entries];
 			hasMore = result.has_more;
 		} catch (e) {
-			error = 'Failed to load history.';
-			console.error('loadHistory:', e);
+			error = `Couldn’t load your history. ${errorMessage(e)}`;
 		} finally {
 			loading = false;
+			loadingMore = false;
 		}
 	}
 
 	async function doSearch() {
-		if (!query.trim()) {
+		if (!searching) {
 			page = 0;
 			await loadHistory();
 			return;
@@ -50,8 +77,7 @@
 			entries = await searchHistory(query);
 			hasMore = false;
 		} catch (e) {
-			error = 'Search failed.';
-			console.error('doSearch:', e);
+			error = `Search failed. ${errorMessage(e)}`;
 		} finally {
 			loading = false;
 		}
@@ -59,45 +85,56 @@
 
 	function onSearchInput() {
 		clearTimeout(searchTimeout);
-		searchTimeout = setTimeout(doSearch, 300);
+		searchTimeout = setTimeout(doSearch, 250);
 	}
 
-	async function handleCopy(id: string) {
-		if (copyingId) return;
-		copyingId = id;
+	function clearSearch() {
+		query = '';
+		clearTimeout(searchTimeout);
+		doSearch();
+		searchInput?.focus();
+	}
+
+	async function handleCopy(entry: HistoryEntry) {
 		try {
-			await copyEntry(id);
+			await copyEntry(entry.id);
+			copiedId = entry.id;
+			clearTimeout(copiedTimer);
+			copiedTimer = setTimeout(() => (copiedId = null), 1600);
 		} catch (e) {
-			error = 'Failed to copy to clipboard.';
-			console.error('handleCopy:', e);
-		} finally {
-			copyingId = null;
+			toast.error('Couldn’t copy to the clipboard', errorMessage(e));
 		}
 	}
 
-	async function handleDelete(id: string) {
+	async function handleDelete(entry: HistoryEntry) {
 		if (deletingId) return;
-		deletingId = id;
+		deletingId = entry.id;
 		try {
-			await deleteEntry(id);
-			entries = entries.filter((e) => e.id !== id);
+			await deleteEntry(entry.id);
+			entries = entries.filter((e) => e.id !== entry.id);
 		} catch (e) {
-			error = 'Failed to delete entry.';
-			console.error('handleDelete:', e);
+			toast.error('Couldn’t delete the clip', errorMessage(e));
 		} finally {
 			deletingId = null;
 		}
 	}
 
 	async function handleClear() {
-		if (!confirm('Clear all clipboard history? This cannot be undone.')) return;
+		const confirmed = await confirmAction({
+			title: 'Clear clipboard history?',
+			description: 'Every clip in this history is deleted. This can’t be undone.',
+			confirmLabel: 'Clear history',
+			tone: 'danger',
+		});
+		if (!confirmed) return;
 		clearing = true;
 		try {
 			await clearHistory();
 			entries = [];
+			hasMore = false;
+			toast.success('History cleared');
 		} catch (e) {
-			error = 'Failed to clear history.';
-			console.error('handleClear:', e);
+			toast.error('Couldn’t clear history', errorMessage(e));
 		} finally {
 			clearing = false;
 		}
@@ -110,42 +147,30 @@
 
 	async function handleSync() {
 		syncing = true;
-		syncMsg = '';
 		try {
 			const count = await syncHistory();
-			syncMsg = `Synced ${count} entries from server`;
+			toast.success(count === 0 ? 'Already up to date' : `Synced ${count} ${count === 1 ? 'clip' : 'clips'} from your server`);
 			page = 0;
-			await loadHistory();
-			setTimeout(() => { syncMsg = ''; }, 3000);
+			if (searching) await doSearch();
+			else await loadHistory();
 		} catch (e) {
-			syncMsg = `Sync failed: ${e}`;
-			setTimeout(() => { syncMsg = ''; }, 5000);
+			toast.error('Sync failed', errorMessage(e));
 		} finally {
 			syncing = false;
 		}
 	}
 
-	function formatTime(iso: string): string {
-		const d = new Date(iso);
-		const now = new Date();
-		const diff = now.getTime() - d.getTime();
-		if (diff < 60000) return 'Just now';
-		if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
-		if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
-		return d.toLocaleDateString();
-	}
-
-	function formatSize(bytes: number): string {
-		if (bytes < 1024) return `${bytes} B`;
-		if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
-		return `${(bytes / 1048576).toFixed(1)} MB`;
-	}
-
-	function iconForType(type: string): string {
-		switch (type) {
-			case 'image': return '🖼';
-			case 'file': return '📄';
-			default: return '📋';
+	// ⌘/Ctrl+F or "/" jumps to search; Escape clears it
+	function onKeydown(event: KeyboardEvent) {
+		const target = event.target as HTMLElement | null;
+		const typing = target?.closest('input, textarea, select, [contenteditable="true"]');
+		if ((hasModKey(event) && event.key.toLowerCase() === 'f') || (event.key === '/' && !typing)) {
+			event.preventDefault();
+			searchInput?.focus();
+			searchInput?.select();
+		} else if (event.key === 'Escape' && target === searchInput && query) {
+			event.preventDefault();
+			clearSearch();
 		}
 	}
 
@@ -156,234 +181,193 @@
 		for (const event of ['clipboard-new', 'history-synced']) {
 			listen(event, () => {
 				page = 0;
-				if (query.trim()) doSearch(); else loadHistory();
-			}).then((unlisten) => {
-				if (disposed) unlisten(); else unlisteners.push(unlisten);
-			}).catch((cause) => { error = `History notifications unavailable: ${cause}`; });
+				if (searching) doSearch();
+				else loadHistory();
+			})
+				.then((unlisten) => {
+					if (disposed) unlisten();
+					else unlisteners.push(unlisten);
+				})
+				.catch((cause) => {
+					error = `Live updates are unavailable: ${errorMessage(cause)}`;
+				});
 		}
 		return () => {
 			disposed = true;
 			clearTimeout(searchTimeout);
+			clearTimeout(copiedTimer);
 			unlisteners.forEach((unlisten) => unlisten());
 		};
 	});
+
+	const kindIcon = { text: 'type', image: 'image', file: 'file' } as const;
 </script>
 
-<div class="history-page">
-	<div class="header">
-		<h1>Clipboard History</h1>
-		<div class="header-actions">
-			{#if appState === 'connected'}
-				<button onclick={handleSync} disabled={syncing}>
-					{syncing ? 'Syncing...' : 'Sync from Server'}
+<svelte:window onkeydown={onKeydown} />
+
+<svelte:head>
+	<title>History · cpmesh</title>
+</svelte:head>
+
+<PageHeader title="History" description="Everything copied across your devices. Click a clip to copy it again.">
+	{#snippet actions()}
+		{#if appState === 'connected'}
+			<Button size="sm" icon="refresh" loading={syncing} onclick={handleSync}>{syncing ? 'Syncing…' : 'Sync from server'}</Button>
+		{/if}
+		{#if entries.length > 0 && !searching}
+			<Button size="sm" variant="ghost" icon="trash" loading={clearing} onclick={handleClear}>Clear all</Button>
+		{/if}
+	{/snippet}
+</PageHeader>
+
+<div class="sticky top-0 z-10 -mx-2 mb-2 flex flex-wrap items-center gap-3 bg-bg/90 px-2 py-2 backdrop-blur-md">
+	<Field
+		class="min-w-[220px] flex-1"
+		type="search"
+		icon="search"
+		placeholder="Search clips"
+		aria-label="Search clipboard history"
+		autocomplete="off"
+		spellcheck={false}
+		bind:value={query}
+		bind:input={searchInput}
+		oninput={onSearchInput}
+	>
+		{#snippet trailing()}
+			{#if query}
+				<button
+					type="button"
+					class="flex h-6 w-6 items-center justify-center rounded text-dim hover:bg-surface-2 hover:text-fg"
+					aria-label="Clear search"
+					onclick={clearSearch}
+				>
+					<Icon name="x" size={13} />
 				</button>
+			{:else}
+				<Kbd keys={['mod', 'F']} class="pointer-events-none" />
 			{/if}
-			{#if entries.length > 0}
-				<button class="danger" onclick={handleClear} disabled={clearing}>
-					{clearing ? 'Clearing...' : 'Clear All'}
-				</button>
-			{/if}
-		</div>
-	</div>
+		{/snippet}
+	</Field>
+	<Segmented
+		label="Clip type"
+		bind:value={filter}
+		options={[
+			{ value: 'all', label: 'All' },
+			{ value: 'text', label: 'Text' },
+			{ value: 'image', label: 'Images' },
+			{ value: 'file', label: 'Files' },
+		]}
+	/>
+</div>
 
-	{#if syncMsg}
-		<p class="sync-msg">{syncMsg}</p>
-	{/if}
+{#if error}
+	<Alert tone="danger" class="mb-4" ondismiss={() => (error = '')}>{error}</Alert>
+{/if}
 
-	{#if error}
-		<p class="error-msg">{error}</p>
-	{/if}
-
-	<div class="search">
-		<input type="text" placeholder="Search clipboard history..." bind:value={query} oninput={onSearchInput} />
-	</div>
-
-	<div class="entries">
-		{#each entries as entry (entry.id)}
-			<div class="entry card">
-				<div class="entry-icon">{iconForType(entry.content_type)}</div>
-				<div class="entry-content">
-					<div class="entry-preview">{entry.preview}</div>
-					<div class="entry-meta">
-						<span>{entry.device_name}</span>
-						<span>·</span>
-						<span>{formatTime(entry.created_at)}</span>
-						{#if entry.size > 0}
-							<span>·</span>
-							<span>{formatSize(entry.size)}</span>
-						{/if}
-					</div>
-				</div>
-				<div class="entry-actions">
-					<button
-						onclick={() => handleCopy(entry.id)}
-						title="Copy"
-						disabled={copyingId === entry.id}
-					>
-						{copyingId === entry.id ? '⏳' : '📋'}
-					</button>
-					<button
-						onclick={() => handleDelete(entry.id)}
-						title="Delete"
-						disabled={deletingId === entry.id}
-					>
-						{deletingId === entry.id ? '⏳' : '🗑'}
-					</button>
+{#if loading}
+	<div class="divide-y divide-border rounded-xl border border-border" aria-busy="true" aria-label="Loading history">
+		{#each [0, 1, 2, 3, 4] as i (i)}
+			<div class="flex items-start gap-3 px-4 py-3.5">
+				<Skeleton class="h-8 w-8 rounded-md" />
+				<div class="flex-1 space-y-2 pt-0.5">
+					<Skeleton class="h-3.5 {i % 2 ? 'w-2/3' : 'w-4/5'}" />
+					<Skeleton class="h-3 w-1/3" />
 				</div>
 			</div>
 		{/each}
-
-		{#if entries.length === 0 && !loading}
-			<p class="empty">No clipboard history yet</p>
-		{/if}
-
-		{#if loading}
-			<p class="empty">Loading...</p>
-		{/if}
-
-		{#if hasMore && !loading}
-			<button class="load-more" onclick={loadMore} disabled={loading}>
-				Load More
-			</button>
+	</div>
+{:else if visible.length === 0}
+	<div class="rounded-xl border border-dashed border-border-strong">
+		{#if searching}
+			<EmptyState icon="search" title="No clips match “{query.trim()}”" description="Search looks through text, file names and device names.">
+				<Button size="sm" onclick={clearSearch}>Clear search</Button>
+			</EmptyState>
+		{:else if filter !== 'all' && entries.length > 0}
+			<EmptyState
+				icon={kindIcon[filter]}
+				title="No {filter === 'image' ? 'images' : filter === 'file' ? 'files' : 'text clips'} loaded"
+				description={hasMore ? 'Older clips may match — load more or show everything.' : undefined}
+			>
+				<Button size="sm" onclick={() => (filter = 'all')}>Show all clips</Button>
+			</EmptyState>
+		{:else}
+			<EmptyState
+				icon="clipboard"
+				title="Your history is empty"
+				description="Copy text, an image or a file on any approved device and it appears here, ready to copy again."
+			>
+				{#if appState === 'connected'}
+					<Button size="sm" icon="refresh" loading={syncing} onclick={handleSync}>Sync from server</Button>
+				{/if}
+			</EmptyState>
 		{/if}
 	</div>
-</div>
+{:else}
+	{#each groups as group (group.label)}
+		<h2 class="mt-5 mb-2 px-1 text-[11px] font-medium tracking-wide text-dim uppercase first:mt-2">{group.label}</h2>
+		<ul class="divide-y divide-border overflow-hidden rounded-xl border border-border bg-surface">
+			{#each group.items as entry (entry.id)}
+				{@const kind = contentKind(entry.content_type)}
+				{@const copied = copiedId === entry.id}
+				<li class="group relative flex items-start transition-colors hover:bg-bg-deep">
+					<button
+						type="button"
+						class="flex min-w-0 flex-1 items-start gap-3 px-4 py-3 text-left outline-none focus-visible:bg-bg-deep focus-visible:shadow-[inset_2px_0_0_var(--color-ink)]"
+						onclick={() => handleCopy(entry)}
+						aria-label="Copy {kind} from {entry.device_name}: {entry.preview}"
+					>
+						<span class="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-border bg-bg-deep text-muted">
+							<Icon name={kindIcon[kind]} size={14} />
+						</span>
+						<span class="min-w-0 flex-1">
+							<span
+								class="line-clamp-3 text-[13px] leading-snug break-words whitespace-pre-wrap text-fg {kind === 'text' ? '' : 'font-medium'}"
+								>{entry.preview || 'Empty clip'}</span
+							>
+							<span class="mt-1 flex items-center gap-1.5 text-xs text-dim">
+								<span class="truncate">{entry.device_name === status?.device_name ? 'This device' : entry.device_name}</span>
+								<span aria-hidden="true">·</span>
+								<span class="shrink-0 tabular-nums">{formatClock(entry.created_at)}</span>
+								{#if entry.size > 0}
+									<span aria-hidden="true">·</span>
+									<span class="shrink-0 tabular-nums">{formatSize(entry.size)}</span>
+								{/if}
+							</span>
+						</span>
+					</button>
+					<div class="flex shrink-0 items-center gap-0.5 py-2.5 pr-3">
+						<span
+							class="flex items-center gap-1 px-1.5 text-xs font-medium transition-opacity {copied
+								? 'text-success-fg opacity-100'
+								: 'pointer-events-none text-muted opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:hidden'}"
+							aria-live="polite"
+						>
+							<Icon name={copied ? 'check' : 'copy'} size={13} />
+							{copied ? 'Copied' : 'Copy'}
+						</span>
+						<button
+							type="button"
+							class="flex h-7 w-7 items-center justify-center rounded-md text-dim opacity-0 transition-[opacity,color,background-color] group-hover:opacity-100 group-focus-within:opacity-100 hover:bg-danger-soft hover:text-danger focus-visible:opacity-100 disabled:opacity-40 pointer-coarse:opacity-100"
+							aria-label="Delete clip"
+							title="Delete"
+							disabled={deletingId === entry.id}
+							onclick={() => handleDelete(entry)}
+						>
+							<Icon
+								name={deletingId === entry.id ? 'loader' : 'trash'}
+								size={14}
+								class={deletingId === entry.id ? 'animate-[spin_0.8s_linear_infinite]' : ''}
+							/>
+						</button>
+					</div>
+				</li>
+			{/each}
+		</ul>
+	{/each}
 
-<style>
-	.history-page h1 {
-		font-size: 1.25rem;
-	}
-
-	.header {
-		display: flex;
-		justify-content: space-between;
-		align-items: center;
-		margin-bottom: 1rem;
-	}
-
-	.header-actions {
-		display: flex;
-		gap: 0.5rem;
-	}
-
-	.sync-msg {
-		font-size: 0.8125rem;
-		color: var(--text-secondary);
-		margin-bottom: 0.75rem;
-	}
-
-	.error-msg {
-		color: var(--danger, #ef4444);
-		font-size: 0.8rem;
-		margin-bottom: 0.75rem;
-		padding: 0.5rem;
-		background: rgba(239, 68, 68, 0.1);
-		border-radius: var(--radius, 0.5rem);
-	}
-
-	.search {
-		margin-bottom: 1rem;
-	}
-
-	.entries {
-		display: flex;
-		flex-direction: column;
-		gap: 0.5rem;
-	}
-
-	.entry {
-		display: flex;
-		align-items: flex-start;
-		gap: 0.75rem;
-		padding: 0.75rem;
-	}
-
-	.entry-icon {
-		font-size: 1.25rem;
-		flex-shrink: 0;
-		margin-top: 2px;
-	}
-
-	.entry-content {
-		flex: 1;
-		min-width: 0;
-	}
-
-	.entry-preview {
-		font-size: 0.875rem;
-		white-space: pre-wrap;
-		word-break: break-word;
-		max-height: 4.5em;
-		overflow: hidden;
-	}
-
-	.entry-meta {
-		display: flex;
-		gap: 0.375rem;
-		font-size: 0.75rem;
-		color: var(--text-secondary);
-		margin-top: 0.25rem;
-	}
-
-	.entry-actions {
-		display: flex;
-		gap: 0.25rem;
-		flex-shrink: 0;
-	}
-
-	.entry-actions button {
-		border: none;
-		background: none;
-		padding: 0.25rem;
-		font-size: 0.875rem;
-		opacity: 0.5;
-	}
-
-	.entry-actions button:hover:not(:disabled) {
-		opacity: 1;
-	}
-
-	.entry-actions button:disabled {
-		opacity: 0.3;
-		cursor: not-allowed;
-	}
-
-	.empty {
-		text-align: center;
-		color: var(--text-secondary);
-		padding: 3rem 0;
-	}
-
-	.load-more {
-		width: 100%;
-		margin-top: 0.5rem;
-	}
-
-	@media (max-width: 768px) {
-		.header {
-			flex-direction: column;
-			align-items: flex-start;
-			gap: 0.5rem;
-		}
-
-		.header-actions {
-			width: 100%;
-		}
-
-		.header-actions button {
-			flex: 1;
-		}
-
-		.entry-actions {
-			opacity: 1;
-		}
-
-		.entry-actions button {
-			min-width: 44px;
-			min-height: 44px;
-			display: flex;
-			align-items: center;
-			justify-content: center;
-		}
-	}
-</style>
+	{#if hasMore}
+		<div class="mt-4 flex justify-center">
+			<Button size="sm" loading={loadingMore} onclick={loadMore}>Load older clips</Button>
+		</div>
+	{/if}
+{/if}

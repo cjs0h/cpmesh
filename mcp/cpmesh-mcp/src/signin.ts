@@ -113,7 +113,8 @@ export class SignInFlow {
           ? "The sign-in waiting for the two-factor code has expired (it lasts 10 minutes). " +
               "Call cpmesh_login again with the password and a new code."
           : code
-            ? `No sign-in for "${req.username}" is waiting for a two-factor code: call cpmesh_login with the password and the code.`
+            ? // The account stays out of the message: tool errors are also written to the log
+              "No sign-in for this account is waiting for a two-factor code: call cpmesh_login with the password and the code."
             : "No password: ask the user for their cpmesh password and pass it to cpmesh_login.",
       );
     }

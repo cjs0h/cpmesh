@@ -367,7 +367,13 @@ fn notification_body(entry: &PlainEntry) -> String {
 // === Tauri Commands ===
 
 #[tauri::command]
-pub async fn get_status(ctx: State<'_, AppContext>) -> Result<StatusInfo, String> {
+pub async fn get_status(
+    #[allow(unused)] app_handle: tauri::AppHandle,
+    ctx: State<'_, AppContext>,
+) -> Result<StatusInfo, String> {
+    // The window asks after every change it sees, including sign-ins, which emit nothing
+    #[cfg(desktop)]
+    crate::tray::schedule_refresh(&app_handle);
     let state = ctx.state.read().await.clone();
     let config = ctx.config.read().await;
     let devices = ctx.devices.read().await;
@@ -2289,6 +2295,7 @@ pub async fn update_config(
         config.global_hotkey = v;
     }
     config.save(&ctx.config_dir).map_err(|e| e.to_string())?;
+    let _ = app_handle.emit("config-changed", ());
     Ok(())
 }
 
