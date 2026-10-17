@@ -212,13 +212,11 @@
 		if (!updateInfo) return;
 		downloading = true;
 		try {
+			// Once installed, the new version starts in place of this one
 			await downloadAndInstallUpdate(updateInfo.download_url);
-			dismissUpdate();
-			toast.info('Finish installing the update', 'cpmesh offers to restart once the new version is in place.', 8000);
 		} catch (e) {
-			toast.error('Update failed', errorMessage(e));
-		} finally {
 			downloading = false;
+			toast.error('Update failed', errorMessage(e));
 		}
 	}
 
@@ -356,7 +354,7 @@
 						<span class="font-medium text-fg">cpmesh {updateInfo.version} is available</span>
 						{#if updateInfo.release_notes}<span class="text-muted"> — {updateInfo.release_notes}</span>{/if}
 					</p>
-					<Button size="xs" variant="ghost" onclick={dismissUpdate}>Later</Button>
+					<Button size="xs" variant="ghost" disabled={downloading} onclick={dismissUpdate}>Later</Button>
 					<Button size="xs" variant="primary" icon="download" loading={downloading} onclick={handleDownloadUpdate}>
 						Install update
 					</Button>

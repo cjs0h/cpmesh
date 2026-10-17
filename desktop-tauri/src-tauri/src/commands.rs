@@ -3322,17 +3322,29 @@ pub async fn check_update(ctx: State<'_, AppContext>) -> Result<Option<UpdateInf
 }
 
 /// Largest installer the updater downloads.
+#[cfg(desktop)]
 const MAX_INSTALLER_BYTES: usize = 512 * 1024 * 1024;
 /// Largest signature file the updater downloads.
+#[cfg(desktop)]
 const MAX_SIGNATURE_BYTES: usize = 16 * 1024;
 
+/// Downloads the update, checks its signature, installs it and starts the new version:
+/// cpmesh restarts into it, or on Windows exits for the installer, which starts it.
+#[cfg(desktop)]
 #[tauri::command]
 pub async fn download_and_install_update(
+    app_handle: tauri::AppHandle,
     ctx: State<'_, AppContext>,
     download_url: String,
 ) -> Result<(), String> {
+    use crate::install::{Installation, Installing};
+
+    let installing = Installing::start()?;
+    // How this copy was installed decides which installer it takes, and how
+    let installation = Installation::detect(&app_handle.env())?;
     let server_url = ctx.config.read().await.server_url.clone();
-    let installer_url = resolve_download_url(&server_url, &download_url)?;
+    let installer_url =
+        installation.installer_url(&resolve_download_url(&server_url, &download_url)?)?;
     let client = reqwest::Client::new();
 
     info!("Downloading update from: {installer_url}");
@@ -3341,7 +3353,7 @@ pub async fn download_and_install_update(
         .await
         .map_err(|e| format!("The update's signature could not be downloaded: {e}"))?;
 
-    // Never launch an installer that does not verify against the key built into the app
+    // Never install an update that does not verify against the key built into the app
     let update = crate::updater::verify_update(
         &installer,
         &String::from_utf8_lossy(&signature),
@@ -3349,27 +3361,47 @@ pub async fn download_and_install_update(
         crate::updater::installer_platform(),
     )
     .map_err(|e| format!("The update was not installed: {e}"))?;
+    installation.check_installer(&update.file_name)?;
 
     let dir = private_temp_dir().map_err(|e| format!("Failed to save the update: {e}"))?;
     let file_path = dir.join(&update.file_name);
-    std::fs::write(&file_path, &installer)
-        .map_err(|e| format!("Failed to save the update: {e}"))?;
-    info!(
-        "Verified update v{} saved to: {}",
-        update.version,
-        file_path.display()
-    );
-
-    // Launch the installer
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    {
-        open::that(&file_path).map_err(|e| format!("Failed to open installer: {e}"))?;
+    let installed = match std::fs::write(&file_path, &installer) {
+        Ok(()) => {
+            drop(installer);
+            info!(
+                "Verified update v{} saved to: {}",
+                update.version,
+                file_path.display()
+            );
+            // Blocks while the user authenticates, where installing needs that
+            tauri::async_runtime::spawn_blocking(move || installation.install(&file_path))
+                .await
+                .unwrap_or_else(|e| Err(format!("The update was not installed: {e}")))
+        }
+        Err(e) => Err(format!("Failed to save the update: {e}")),
+    };
+    // The Windows installer runs on from there once it started
+    if installed.is_err() || cfg!(not(windows)) {
+        let _ = std::fs::remove_dir_all(&dir);
     }
+    installed?;
+    info!("Installed cpmesh {}", update.version);
 
+    installing.finish();
+    crate::install::hand_over(&app_handle);
     Ok(())
 }
 
+/// Phones and tablets get updates from the website or their app store.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub async fn download_and_install_update(download_url: String) -> Result<(), String> {
+    let _ = download_url;
+    Err("Download the new version of cpmesh from the website".into())
+}
+
 /// Resolves an update download URL, which may be relative to the server, to http(s).
+#[cfg(desktop)]
 fn resolve_download_url(server_url: &str, download_url: &str) -> Result<url::Url, String> {
     let base = url::Url::parse(server_url).map_err(|e| format!("Invalid server URL: {e}"))?;
     let resolved = base
@@ -3382,6 +3414,7 @@ fn resolve_download_url(server_url: &str, download_url: &str) -> Result<url::Url
 }
 
 /// Each release installer has its signature next to it, at `<installer URL>.sig`.
+#[cfg(desktop)]
 fn signature_url(installer_url: &url::Url) -> url::Url {
     let mut url = installer_url.clone();
     url.set_path(&format!("{}.sig", installer_url.path()));
@@ -3389,6 +3422,7 @@ fn signature_url(installer_url: &url::Url) -> url::Url {
 }
 
 /// Downloads `url` into memory, refusing bodies larger than `limit` bytes.
+#[cfg(desktop)]
 async fn download(
     client: &reqwest::Client,
     url: url::Url,
@@ -3420,7 +3454,8 @@ async fn download(
 }
 
 /// A new directory only this user can access, so the verified installer cannot be
-/// swapped before it is launched.
+/// swapped before it is installed.
+#[cfg(desktop)]
 fn private_temp_dir() -> std::io::Result<PathBuf> {
     let dir = std::env::temp_dir().join(format!("cpmesh-update-{}", uuid::Uuid::new_v4()));
     let mut builder = std::fs::DirBuilder::new();
@@ -3640,6 +3675,7 @@ mod tests {
         assert_eq!(notification_body(&entry), "the next event still works");
     }
 
+    #[cfg(desktop)]
     #[test]
     fn update_urls_resolve_against_the_server_and_must_be_http() {
         let url = resolve_download_url(
@@ -3671,6 +3707,7 @@ mod tests {
         }
     }
 
+    #[cfg(desktop)]
     #[test]
     fn signature_sits_next_to_the_installer() {
         let installer = url::Url::parse(
@@ -3683,6 +3720,7 @@ mod tests {
         );
     }
 
+    #[cfg(desktop)]
     #[test]
     fn update_directory_is_new_and_private() {
         let a = private_temp_dir().unwrap();

@@ -79,7 +79,6 @@ tauri-plugin-global-shortcut = "2"
 tauri-plugin-autostart = "2"
 tauri-plugin-single-instance = "2"
 arboard = "3"
-open = "5"
 keyring = "4"
 
 [dev-dependencies]

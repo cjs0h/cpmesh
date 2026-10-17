@@ -846,7 +846,6 @@ dependencies = [
  "keyring",
  "log",
  "minisign-verify",
- "open",
  "p256",
  "pem",
  "rand 0.10.3",

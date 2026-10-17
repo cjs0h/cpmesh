@@ -283,7 +283,8 @@ published release, which its update check would otherwise offer as an update.
 | Android (arm64, armv7, x86_64) | `cpmesh-<version>-android.apk` |
 
 Each desktop installer is accompanied by `<installer>.sig`, the signature the in-app updater checks (see
-[Signing updates](#signing-updates)).
+[Signing updates](#signing-updates)). The update check offers one installer per platform, the `.deb` for Linux; an
+AppImage downloads the `.AppImage` next to it instead, so both keep the same name apart from the extension.
 
 The release stays a draft until every build succeeds; re-running failed jobs replaces the installers. Once it
 is published, `scripts/release/publish-website.mjs` uses the server's admin API, authenticated with an API token,
