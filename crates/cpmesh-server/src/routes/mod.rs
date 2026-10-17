@@ -22,6 +22,7 @@ use std::sync::Arc;
 use tower_http::cors::{AllowHeaders, Any, CorsLayer};
 
 use crate::AppState;
+use crate::oauth;
 use crate::spa::spa_handler;
 
 /// Body limit of the installer upload route: room for an installer, its signature
@@ -420,6 +421,70 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             middleware::release_admin_middleware,
         ));
 
+    // OAuth for agents: the authorization server's endpoints, which take no bearer
+    // token. They limit their own rates: device polling must not use up the address's
+    // sign-in budget.
+    let oauth_server = Router::new()
+        .route(
+            "/.well-known/oauth-authorization-server",
+            axum::routing::get(oauth::server::handle_metadata),
+        )
+        .route(
+            "/oauth/authorize",
+            axum::routing::get(oauth::server::handle_authorize),
+        )
+        .route(
+            "/oauth/token",
+            axum::routing::post(oauth::server::handle_token),
+        )
+        .route(
+            "/oauth/revoke",
+            axum::routing::post(oauth::server::handle_revoke),
+        )
+        .route(
+            "/oauth/device_authorization",
+            axum::routing::post(oauth::server::handle_device_authorization),
+        )
+        .route(
+            "/activate",
+            axum::routing::get(oauth::server::handle_activate),
+        );
+
+    // Approving agents and the "Connected agents" list: first-party sessions
+    let oauth_consent = Router::new()
+        .route(
+            "/api/oauth/authorize",
+            axum::routing::post(oauth::consent::handle_authorize_decision),
+        )
+        .route(
+            "/api/oauth/device",
+            axum::routing::get(oauth::consent::handle_device_lookup),
+        )
+        .route(
+            "/api/oauth/device/approve",
+            axum::routing::post(oauth::consent::handle_device_approve),
+        )
+        .route(
+            "/api/oauth/device/deny",
+            axum::routing::post(oauth::consent::handle_device_deny),
+        )
+        .route(
+            "/api/oauth/grants",
+            axum::routing::get(oauth::consent::handle_list_grants),
+        )
+        .route(
+            "/api/oauth/grants/{id}",
+            axum::routing::delete(oauth::consent::handle_revoke_grant),
+        )
+        .route_layer(axum_mw::from_fn_with_state(
+            state.clone(),
+            middleware::approved_device_middleware,
+        ))
+        .route_layer(axum_mw::from_fn_with_state(
+            state.clone(),
+            middleware::auth_middleware,
+        ));
+
     Router::new()
         .merge(public)
         .merge(protected_any_device)
@@ -429,7 +494,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(release_routes)
         .merge(mfa_routes)
         .merge(mfa_code_routes)
+        .merge(oauth_server)
+        .merge(oauth_consent)
         .fallback(spa_handler)
+        // Default-deny for agent tokens. It wraps only the routes merged above, and sees
+        // which one matched.
+        .layer(axum_mw::from_fn_with_state(
+            state.clone(),
+            crate::oauth::policy::agent_policy_middleware,
+        ))
         .layer(axum_mw::from_fn(middleware::security_headers))
         .layer(cors)
         .with_state(state)

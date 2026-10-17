@@ -166,6 +166,9 @@ async fn main() {
         register: routes::middleware::build_rate_limiter(3), // 3 per minute
         refresh: routes::middleware::build_rate_limiter(10), // 10 per minute
         mfa: routes::middleware::build_rate_limiter(10),  // 10 per minute
+        oauth_device: routes::middleware::build_rate_limiter(10), // 10 per minute
+        user_code_ip: routes::middleware::build_rate_limiter(20), // 20 per minute
+        user_code_user: routes::middleware::build_user_rate_limiter(10), // 10 per minute
     };
 
     let state = Arc::new(AppState {

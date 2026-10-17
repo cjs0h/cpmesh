@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { loginPageUrl, parseAppSignIn, setTokens } from '../lib/auth';
+  import { loginPageUrl, parseAppSignIn, setTokens, takeReturnPath } from '../lib/auth';
   import {
     challengeFromStatus,
     completeSignIn,
@@ -21,6 +21,9 @@
   const params = new URLSearchParams(window.location.hash.split('?')[1] || '');
   // Single sign-on started by the desktop app: the finished sign-in goes to the app
   const appSignIn = parseAppSignIn(params.toString());
+  // Started on an AI agent's consent page: it continues there
+  const remembered = takeReturnPath();
+  const returnTo = appSignIn ? null : remembered;
 
   /** Second step, when the account needs two-factor authentication. */
   let challenge = $state<MfaChallenge | null>(null);
@@ -35,13 +38,13 @@
 
     if (accessToken && refreshToken) {
       setTokens(accessToken, refreshToken);
-      window.location.hash = '#/';
+      window.location.hash = returnTo ?? '#/';
       window.location.reload();
       return;
     }
     if (!ticket) {
       // No tokens, redirect to login
-      window.location.hash = '#/login';
+      window.location.hash = returnTo ?? '#/login';
       return;
     }
 
@@ -62,7 +65,7 @@
         window.location.href = url;
         return;
       }
-      window.location.hash = '#/';
+      window.location.hash = returnTo ?? '#/';
       window.location.reload();
     } catch (err) {
       challenge = null;
@@ -71,7 +74,8 @@
   }
 
   function startOver() {
-    window.location.hash = loginPageUrl(appSignIn);
+    // An agent's consent page shows the sign-in form again, and keeps the request
+    window.location.hash = returnTo ?? loginPageUrl(appSignIn);
   }
 </script>
 
@@ -100,6 +104,10 @@
         {#if appSignIn && !appUrl}
           <div class="mb-4 flex justify-center">
             <Badge size="md" icon="monitor">Signing in to the cpmesh app</Badge>
+          </div>
+        {:else if returnTo}
+          <div class="mb-4 flex justify-center">
+            <Badge size="md" icon="sparkles">Sign in to approve an AI agent</Badge>
           </div>
         {/if}
         <div class="mb-6 text-center">

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { setTokens } from '../../lib/auth';
+  import { setTokens, signInLocation } from '../../lib/auth';
   import { sessionTransport, type EnrollResult } from '../../lib/mfa';
   import { publicSettings } from '../../lib/stores/settings.svelte';
   import { toast } from '../../lib/stores/toast.svelte';
@@ -29,7 +29,8 @@
   function signOut() {
     disconnectWS();
     resetUserState();
-    window.location.hash = '#/login';
+    // On an AI agent's consent page, signing in again continues there
+    window.location.hash = signInLocation();
     window.location.reload();
   }
 </script>

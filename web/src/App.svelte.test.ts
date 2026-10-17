@@ -59,3 +59,55 @@ it('mounts the public login route and clears every account snapshot when refresh
   expect(socket.close).toHaveBeenCalledOnce();
   expect(document.body.textContent).not.toContain('Page not found');
 });
+
+const AUTHORIZE =
+  '#/authorize?client_id=cpmesh-mcp&redirect_uri=http%3A%2F%2F127.0.0.1%3A53682%2Fcallback&response_type=code&state=s&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&scope=clipboard%3Aread%20clipboard%3Awrite&agent_name=Claude%20Code';
+
+function mountAt(hash: string) {
+  history.replaceState(null, '', hash);
+  window.dispatchEvent(new HashChangeEvent('hashchange'));
+  const target = document.createElement('main');
+  document.body.append(target);
+  app = mount(App, { target });
+}
+
+it("asks signed-out users to sign in on an AI agent's consent page, keeping the request", async () => {
+  vi.mocked(fetch).mockImplementation(async (input) =>
+    String(input) === '/api/auth/social/status' ? jsonResponse(200, { enabled: false }) : jsonResponse(200, {}),
+  );
+  mountAt(AUTHORIZE);
+
+  await vi.waitFor(async () => {
+    await tick();
+    expect(document.querySelector('input[type="password"]')).not.toBeNull();
+  });
+  expect(document.body.textContent).toContain('Sign in to approve an AI agent');
+  expect(window.location.hash).toBe(AUTHORIZE);
+});
+
+it('shows the consent page on its own to signed-in users', async () => {
+  setTokens('access', 'refresh');
+  vi.mocked(fetch).mockImplementation(async (input) => {
+    const path = String(input);
+    if (path === '/api/me') {
+      return jsonResponse(200, {
+        id: 'user-1', username: 'hayder', email: 'h@example.org', full_name: 'Hayder', email_verified: true,
+        auth_provider: 'local', is_admin: false, mfa: { enabled: true, required: true, session_verified: true },
+      });
+    }
+    if (path === '/api/ws/ticket') return jsonResponse(200, { ticket: 'ticket' });
+    return jsonResponse(200, {});
+  });
+  mountAt(AUTHORIZE);
+
+  await vi.waitFor(async () => {
+    await tick();
+    expect(document.body.textContent).toContain('Approve cpmesh MCP');
+  });
+  const text = document.body.textContent ?? '';
+  expect(text).toContain('Claude Code');
+  expect(text).toContain('@hayder');
+  // Without the dashboard's navigation around it
+  expect(text).not.toContain('Overview');
+  expect(window.location.hash).toBe(AUTHORIZE);
+});

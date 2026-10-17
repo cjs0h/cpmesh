@@ -23,7 +23,7 @@ use crate::email::EmailService;
 use crate::pii::PiiService;
 use crate::routes::auth::PkceCodeStore;
 use crate::routes::auth_service::AuthService;
-use crate::routes::middleware::build_rate_limiter;
+use crate::routes::middleware::{build_rate_limiter, build_user_rate_limiter};
 use crate::settings::SettingsCache;
 use crate::ws::Hub;
 use crate::{AppState, RateLimiters};
@@ -147,6 +147,9 @@ async fn build_test_state(
             register: build_rate_limiter(limit("register")),
             refresh: build_rate_limiter(limit("refresh")),
             mfa: build_rate_limiter(limit("mfa")),
+            oauth_device: build_rate_limiter(limit("oauth_device")),
+            user_code_ip: build_rate_limiter(limit("user_code_ip")),
+            user_code_user: build_user_rate_limiter(limit("user_code_user")),
         },
         settings: SettingsCache::new(),
     })

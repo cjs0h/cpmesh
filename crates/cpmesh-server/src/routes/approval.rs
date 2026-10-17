@@ -471,16 +471,19 @@ pub async fn handle_reject_device(
         return json_error("invalid pending device", StatusCode::BAD_REQUEST);
     }
 
-    if let Err(e) = state
+    let revoked_grant = match state
         .db
         .update_device_status(pending_device_id, claims.user_id, "rejected", None)
         .await
     {
-        return json_error(
-            &format!("failed to reject device: {e}"),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        );
-    }
+        Ok(revoked_grant) => revoked_grant,
+        Err(e) => {
+            return json_error(
+                &format!("failed to reject device: {e}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        }
+    };
 
     // Audit log
     let ip = extract_client_ip(&headers, &addr, state.config.trust_proxy_headers);
@@ -501,6 +504,22 @@ pub async fn handle_reject_device(
         .bind(json!({"pending_device_id": pending_device_id.to_string()}))
         .execute(&pool)
         .await { tracing::warn!("Failed to persist audit entry: {error}"); }
+    // A rejected agent device takes its grant with it
+    if let Some(grant_id) = revoked_grant {
+        let meta = crate::audit::RequestMeta {
+            ip: ip_str,
+            user_agent: ua,
+        };
+        crate::oauth::grants::record_revocation(
+            &state,
+            claims.user_id,
+            grant_id,
+            pending_device_id,
+            crate::oauth::grants::RevokeReason::DeviceRejected,
+            &meta,
+        )
+        .await;
+    }
 
     json_response(StatusCode::OK, json!({"message": "device rejected"}))
 }

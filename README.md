@@ -154,13 +154,18 @@ Add it to any stdio MCP client (Claude Desktop, Cursor, ZCode, ...):
 `https://cpmesh.com` is the hosted service; point `CPMESH_SERVER_URL` at your own
 server if you self-host.
 
-On first use the agent asks for your credentials and the 6-digit code from your
-authenticator app (or a recovery code; the MCP server cannot use passkeys, so add
-an authenticator app under **Settings → Two-factor authentication** if a passkey
-is your only second factor), then walks you through device pairing. Both devices show the
-same 8-digit pairing code (the full 64-character code is available for a stronger check);
-confirm on both devices only if the codes are identical. The agent uses `cpmesh_confirm_pairing`
-before waiting for approval.
+On first use the agent signs in through your browser: it opens the cpmesh approval page
+on your computer (or, over SSH, in a container or without a display, gives you a link and
+a code to confirm in any browser). You sign in there as usual — password, passkey or SSO,
+with your second factor — and choose what the agent may do: read the clipboard, send to
+it, delete entries, manage devices. The agent never sees your password or codes. It then
+walks you through device pairing: both devices show the same 8-digit pairing code (the full
+64-character code is available for a stronger check); confirm on both devices only if the
+codes are identical. The agent uses `cpmesh_confirm_pairing` before waiting for approval.
+The dashboard lists your agents under **Connected agents**, where you can revoke one;
+`cpmesh_logout` revokes the agent itself, which also removes its device. The server must have
+`BASE_URL` set for agents to sign in. Agents signed in by `cpmesh-mcp` 0.2 with a password
+sign in once more with the browser and keep their pairing.
 Full agent instructions live in
 [`mcp/cpmesh-mcp/SKILL.md`](mcp/cpmesh-mcp/SKILL.md) — install that file into
 your agent's skills directory (e.g. `~/.agents/skills/cpmesh/`), or let the
@@ -173,7 +178,7 @@ reference.
 Signing in takes a password (or SSO) plus a second factor:
 
 - **Authenticator app (TOTP)** — any RFC 6238 app (1Password, Google Authenticator, Aegis, ...). Works everywhere:
-  the web dashboard, the desktop app and the MCP server.
+  the web dashboard and the desktop app.
 - **Passkey** — a WebAuthn credential (Touch ID, Windows Hello, a security key, a synced passkey). Passkeys belong to
   the site's domain, so they are used in the browser; the desktop app's **Sign in with browser** button hands a browser
   sign-in back to the app.
@@ -189,6 +194,9 @@ After 10 wrong codes in a row the account's second factor locks for 15 minutes. 
 sensitive admin actions, need a recent sign-in: the dashboard asks you to confirm your second factor again.
 Administrators can reset a member's two-factor authentication (for a lost phone); the member sets it up again at their
 next sign-in and gets an email about it.
+
+The MCP server never handles a password or a code: the member approves each AI agent on the website, where any of these
+factors (and SSO) work, so agents need no TOTP and also work for passkey-only and SSO accounts.
 
 Changing a password ends all sessions, including the initiating session and live sockets. Refresh
 and step-up preserve the original session issuance time, so an in-flight refresh cannot evade revocation.
@@ -316,13 +324,14 @@ cargo test --workspace                       # server + shared proto (unit, rout
 cd desktop-tauri/src-tauri && cargo test     # desktop crypto, history, config and protocol tests
 cd web && npm test                           # web dashboard (Vitest)
 cd desktop-tauri && npm test                 # desktop frontend (Vitest)
-cd mcp/cpmesh-mcp && npm test                # MCP server crypto, API client and two-factor sign-in (Vitest)
+cd mcp/cpmesh-mcp && npm test                # MCP server crypto, API client and OAuth sign-in (Vitest)
 ```
 
 The PostgreSQL-backed integration tests in `crates/cpmesh-server/tests/db.rs` run only when
 `TEST_DATABASE_URL` points at a database you can create schemas in; otherwise they are skipped.
-MCP CI also runs the published executable against the real relay, including mandatory MFA, proof of
-possession, acknowledgements, idempotent retry, restart and bounded streaming downloads.
+MCP CI also runs the published executable against the real relay: a user with mandatory MFA approves the agent's
+device-code and browser sign-ins through the web API, then it checks proof of possession, acknowledgements, idempotent
+retry, restart, scopes, revocation on sign-out and bounded streaming downloads.
 
 ## Configuration
 
@@ -351,7 +360,7 @@ JWT signing uses explicit RS256 key material in every environment. `JWT_PUBLIC_K
 | `SMTP_PASSWORD` | `""` | SMTP password |
 | `SMTP_FROM` | `""` | Sender address for emails |
 | `SMTP_TLS` | `true` | Use TLS for SMTP |
-| `BASE_URL` | `""` | Public base URL for email links and redirects (for example `https://cpmesh.example.com`) |
+| `BASE_URL` | `""` | Public base URL for email links and redirects (for example `https://cpmesh.example.com`); also the issuer AI agents sign in with, so the MCP server needs it |
 | `REGISTRATION_OPEN` | `true` | Allow self-service registration |
 | `OIDC_ISSUER_URL` | `""` | OIDC issuer URL (empty = disabled) |
 | `OIDC_CLIENT_ID` | `""` | OIDC client ID |

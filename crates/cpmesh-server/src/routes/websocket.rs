@@ -117,6 +117,10 @@ pub async fn ws_auth_middleware(
         let Some(claims) = redeem_ticket(&ticket, client_ip).await else {
             return json_error("invalid or expired ticket", StatusCode::UNAUTHORIZED);
         };
+        // Tickets are for the web dashboard; agents cannot obtain them
+        if claims.agent.is_some() {
+            return json_error("invalid or expired ticket", StatusCode::UNAUTHORIZED);
+        }
         // The account may have been deleted or signed out everywhere since issuance
         if let Err(rejection) = check_session(&state, &claims).await {
             return rejection.into_response();
@@ -239,6 +243,15 @@ async fn handle_ws_connection(
     };
 
     let kick = tokio_util::sync::CancellationToken::new();
+    // Agents without clipboard:read only get acknowledgements and key and device events
+    let reads_clipboard = crate::oauth::policy::reads_clipboard(claims.agent.as_ref());
+    let send = |tx: &mpsc::Sender<Arc<QueuedMessage>>, msg: &WsMessage| {
+        if !reads_clipboard && !crate::oauth::policy::delivered_without_read(&msg.msg_type) {
+            return Ok(());
+        }
+        let text = serde_json::to_string(msg).expect("serializable message");
+        tx.try_send(QueuedMessage::control(text)).map_err(|_| ())
+    };
     let registered = state
         .hub
         .register(Client {
@@ -247,6 +260,7 @@ async fn handle_ws_connection(
             device_name,
             conn_id,
             announce: device_id.is_some(),
+            reads_clipboard,
             tx: tx.clone(),
             kick: kick.clone(),
         })
@@ -267,12 +281,13 @@ async fn handle_ws_connection(
     if device_id.is_some()
         && let Ok(true) = state.db.is_rotation_due(user_id).await
     {
-        let rotation_msg = serde_json::to_string(&WsMessage {
-            msg_type: MSG_ROTATION_NEEDED.to_string(),
-            payload: json!({"reason": "rotation_due"}),
-        })
-        .unwrap_or_default();
-        let _ = tx.try_send(QueuedMessage::control(rotation_msg));
+        let _ = send(
+            &tx,
+            &WsMessage {
+                msg_type: MSG_ROTATION_NEEDED.to_string(),
+                payload: json!({"reason": "rotation_due"}),
+            },
+        );
     }
 
     // Write pump: forward messages from hub to WebSocket, then close the socket once
@@ -338,7 +353,10 @@ async fn handle_ws_connection(
                             .chars()
                             .take(64)
                             .collect::<String>();
-                        let ack = if let Err(code) = validate_push_wire(&ws_msg.payload) {
+                        let ack = if !crate::oauth::policy::writes_clipboard(claims.agent.as_ref())
+                        {
+                            rejected(&request_id, "insufficient_scope")
+                        } else if let Err(code) = validate_push_wire(&ws_msg.payload) {
                             rejected(&request_id, code)
                         } else if let Some(device_id) = device_id {
                             match serde_json::from_value::<ClipboardPushPayload>(ws_msg.payload) {
@@ -354,22 +372,16 @@ async fn handle_ws_connection(
                             msg_type: MSG_CLIPBOARD_ACK.into(),
                             payload: json!(ack),
                         };
-                        if tx
-                            .try_send(QueuedMessage::control(
-                                serde_json::to_string(&response).expect("serializable ack"),
-                            ))
-                            .is_err()
-                        {
+                        if send(&tx, &response).is_err() {
                             kick.cancel();
                         }
                     }
                     MSG_PING => {
-                        let pong = serde_json::to_string(&WsMessage {
+                        let pong = WsMessage {
                             msg_type: MSG_PONG.to_string(),
                             payload: json!({}),
-                        })
-                        .unwrap_or_default();
-                        if tx.try_send(QueuedMessage::control(pong)).is_err() {
+                        };
+                        if send(&tx, &pong).is_err() {
                             kick.cancel();
                         }
                     }

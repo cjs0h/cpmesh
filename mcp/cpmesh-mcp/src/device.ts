@@ -4,9 +4,13 @@
  * committed-SAS approval pairing, group-key sync, and signed, context-bound
  * clipboard read/write over the E2E-encrypted channel.
  *
+ * The account sign-in is OAuth (see authorization.ts): the user approves the
+ * agent on the cpmesh website, then the device registers with proof of
+ * possession and pairs with a trusted device exactly as before.
+ *
  * Mirrors the flows in desktop-tauri/src-tauri/src/commands.rs
- * (setup_and_login / get_my_approval_status / confirm_pairing /
- * send_local_clipboard / authenticate_entry / sync_history) and key_sync.rs.
+ * (get_my_approval_status / confirm_pairing / send_local_clipboard /
+ * authenticate_entry / sync_history) and key_sync.rs.
  */
 
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -15,9 +19,20 @@ import { hostname } from "node:os";
 import {
   ApiError,
   CpmeshApi,
-  SESSION_EXPIRED_MESSAGE,
+  ScopeError,
   SessionExpiredError,
+  TemporarilyUnavailableError,
+  signedOutMessage,
+  type TokenStore,
 } from "./api.js";
+import {
+  Authorizer,
+  revokeWithRetry,
+  type AuthorizationFailed,
+  type PendingAuthorization,
+  type SignInProgress,
+} from "./authorization.js";
+import type { SignInMode } from "./browser.js";
 import {
   DeviceKeys,
   KeyPair,
@@ -32,6 +47,15 @@ import {
 } from "./crypto.js";
 import { type EntryContext, openEntry, sealEntry, verifyEntrySignature } from "./entry.js";
 import {
+  CLIENT_ID,
+  agentName,
+  grants,
+  normalizeServerUrl,
+  sameServer,
+  type Scope,
+  type TokenSet,
+} from "./oauth.js";
+import {
   loadPinnedKeys,
   loadMembership,
   loadSession,
@@ -39,6 +63,11 @@ import {
   statePaths,
   updateSession,
   clearAllState,
+  clearAuthorization,
+  clearDeviceState,
+  isSignedIn,
+  loadAuthorization,
+  saveAuthorization,
   loadPushes,
   savePushes,
   ReplayGuard,
@@ -53,10 +82,10 @@ import type {
   DeviceInfo,
   PlainEntry,
   RegisterDeviceRequest,
+  RegisterDeviceResponse,
   ClipboardReceipt,
 } from "./protocol.js";
 import { PAIRING_VERSION } from "./protocol.js";
-import { SignInFlow, type Account } from "./signin.js";
 import { WsClient, WsError } from "./ws.js";
 import {
   pinVerified, revokeDevice, rotateKeys, senderIdentityKey, synchronizeKeys, SecurityError,
@@ -107,6 +136,66 @@ export class DeviceNotReadyError extends Error {
   }
 }
 
+/** This device registered with an approved sign-in. */
+export interface SignedIn {
+  status: "approved" | "pending";
+  pairing?: PairingView;
+  message: string;
+}
+
+/** What cpmesh_login answers: a sign-in waiting for approval, or (finishing an approved one) the device's state. */
+export type LoginResult = (PendingAuthorization & { message: string }) | SignedIn;
+
+/** Where a sign-in in progress stands after being advanced. Null when none is in progress. */
+type AdvanceResult = PendingAuthorization | AuthorizationFailed | SignedIn | null;
+
+const isFailed = (value: AdvanceResult | SignInProgress): value is AuthorizationFailed =>
+  value !== null && (value.status === "access_denied" || value.status === "expired_token" || value.status === "failed");
+
+function minutesLeft(expiresAt: string): string {
+  const minutes = Math.max(1, Math.round((Date.parse(expiresAt) - Date.now()) / 60_000));
+  return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+}
+
+/** How the user gets to the approval page of a pending sign-in. */
+export function approvalInstructions(pending: PendingAuthorization): string {
+  if (pending.mode === "device") {
+    const link = pending.verification_uri_complete ?? pending.verification_uri;
+    return (
+      `Ask the user to open ${link} in any browser (or to go to ${pending.verification_uri} and enter the code ${pending.user_code}), ` +
+      `sign in to cpmesh and approve this agent after checking that the page shows the code ${pending.user_code}.`
+    );
+  }
+  return pending.browser_opened
+    ? "A browser tab on this computer asks the user to sign in to cpmesh and approve this agent " +
+        `(if no tab opened, ask them to open ${pending.verification_uri} in a browser on this computer).`
+    : `Ask the user to open ${pending.verification_uri} in a browser on this computer, sign in to cpmesh and approve this agent.`;
+}
+
+/** What the agent should do to sign in, or to finish the sign-in in progress. */
+function signInRequired(session: Session | null, progress: SignInProgress | AdvanceResult): string {
+  if (progress?.status === "authorization_pending") {
+    return `${approvalInstructions(progress)} Then call cpmesh_wait_for_approval.`;
+  }
+  if (progress?.status === "authorized") {
+    return "The user approved the sign-in: call cpmesh_wait_for_approval to finish registering this device.";
+  }
+  if (progress && isFailed(progress)) return `${progress.message} Call cpmesh_login to start again.`;
+  if (session && !session.grant_id) {
+    return (
+      "This profile was signed in by cpmesh-mcp 0.2 with a password, which is no longer supported. Call cpmesh_login " +
+      "to sign in with the browser; this device keeps its keys and pairing."
+    );
+  }
+  if (session) {
+    return `${signedOutMessage(session.signed_out)} This device keeps its keys and pairing, unless it was removed from the account.`;
+  }
+  return (
+    "Call cpmesh_login to sign in with the browser (pass server_url, https://cpmesh.com unless the user self-hosts, " +
+    "or set CPMESH_SERVER_URL)."
+  );
+}
+
 export interface ReadyState {
   session: Session;
   api: CpmeshApi;
@@ -149,8 +238,10 @@ export interface PushResult {
 export class CpmeshDevice {
   readonly ws = new WsClient();
   private cached: ReadyState | null = null;
-  /** Keeps a sign-in that waits for its two-factor code (in memory only). */
-  private readonly signIns = new SignInFlow();
+  /** The account sign-in (OAuth) in progress, if any. */
+  private readonly authorizer: Authorizer;
+  /** The sign-in being advanced (waiting, polling or registering), so calls take turns. */
+  private advancing: Promise<unknown> | null = null;
   private pairing = new Map<string, PairingCandidate>();
   private keyWork: Promise<unknown> = Promise.resolve();
   private loading: Promise<ReadyState> | null = null;
@@ -159,8 +250,11 @@ export class CpmeshDevice {
   private pushes = new Map<string, SavedPush>();
   /** Live entries accepted over the WebSocket (signature + replay guard), newest last. */
   private liveFeed: ClipboardItem[] = [];
+  /** Called when the user approved a sign-in (the MCP client may still show its link). */
+  onAuthorized: (() => void) | null = null;
 
-  constructor() {
+  constructor(options: { authorizer?: Authorizer } = {}) {
+    this.authorizer = options.authorizer ?? new Authorizer();
     this.ws.onKeyChange = async () => { await this.refreshGroupKeys(); };
     this.ws.onClipboardNew = async (entry) => { await this.acceptLiveEntry(entry); };
   }
@@ -201,102 +295,181 @@ export class CpmeshDevice {
 
   // === Onboarding ===
 
-  /** The account whose sign-in waits for a two-factor code (see {@link SignInFlow.waiting}). */
-  waitingSignIn(serverUrl?: string, username?: string): Account | null {
-    return this.signIns.waiting(serverUrl, username);
+  /**
+   * Starts signing this agent in to cpmesh (OAuth) and returns at once with the
+   * link for the user, without waiting for the approval: cpmesh_wait_for_approval
+   * finishes the sign-in, then registers and pairs the device. Signing in again
+   * while signed in re-authorizes the agent (e.g. with other scopes); the device
+   * keeps its keys and pairing.
+   */
+  async login(request: { serverUrl?: string; mode?: "auto" | SignInMode; clientName?: string } = {}): Promise<LoginResult> {
+    const profile = loadSession();
+    const configured = (request.serverUrl?.trim() || undefined) ?? (process.env.CPMESH_SERVER_URL || undefined) ?? profile?.server_url;
+    if (!configured) {
+      throw new Error(
+        "No server URL: pass server_url (https://cpmesh.com for the hosted service, or the user's own server) " +
+          "or set CPMESH_SERVER_URL in the MCP server environment.",
+      );
+    }
+    const serverUrl = normalizeServerUrl(configured);
+    if (profile && !sameServer(profile.server_url, serverUrl)) {
+      throw new Error(
+        `This agent's cpmesh profile belongs to ${profile.server_url}. To sign in to ${serverUrl} instead, ` +
+          "call cpmesh_logout first: it signs this agent out and wipes its local profile.",
+      );
+    }
+
+    // An approved sign-in whose device registration did not finish needs no new approval
+    const progress = this.authorizer.peek();
+    if (progress?.status === "authorized" && sameServer(progress.server_url, serverUrl)) {
+      try {
+        const finished = await this.advanceAuthorization(Date.now());
+        if (finished?.status === "approved" || finished?.status === "pending") return finished;
+      } catch (error) {
+        console.error("[cpmesh-mcp] Finishing the approved sign-in failed, starting a new one:", errorMessage(error));
+      }
+    }
+
+    const pending = await this.authorizer.start({
+      serverUrl,
+      mode: request.mode ?? "auto",
+      agentName: agentName(request.clientName, hostname()),
+    });
+    const why = pending.reason ? ` (device sign-in: ${pending.reason})` : "";
+    const current = isSignedIn(profile)
+      ? " Until the user approves, the current authorization keeps working; once approved, it is replaced."
+      : profile
+        ? " This device keeps its keys and pairing."
+        : "";
+    return {
+      ...pending,
+      message:
+        `Sign-in started${why}. ${approvalInstructions(pending)} The request expires in ${minutesLeft(pending.expires_at)}. ` +
+        `Then call cpmesh_wait_for_approval.${current}`,
+    };
   }
 
   /**
-   * Signs in and registers this device. With two-factor authentication the first
-   * call (password, no code) resolves `mfa_required`; a later call with the code
-   * finishes the sign-in, with or without the password.
+   * Advances the sign-in in progress until `deadline` (Unix ms; now = no
+   * waiting): the browser callback or device-code approval, then the device
+   * registration. Calls take turns, so one approval registers once.
    */
-  async login(
-    serverUrl: string,
-    username: string,
-    password?: string,
-    mfaCode?: string,
-  ): Promise<{
-    status: string;
-    pairing?: PairingView;
-    methods?: string[];
-    message: string;
-  }> {
-    if (!/^https?:\/\//i.test(serverUrl)) {
-      throw new Error("Server URL must start with https:// or http://");
-    }
-
-    const deviceName = this.deviceName();
-    const api = new CpmeshApi(serverUrl);
-    const signedIn = await this.signIns.signIn(api, {
-      serverUrl,
-      username,
-      password,
-      code: mfaCode,
-      deviceName,
-    });
-    if (signedIn.status === "mfa_required") {
-      return { status: "mfa_required", methods: signedIn.methods, message: signedIn.message };
-    }
-    const { auth } = signedIn;
-    api.setTokens(auth.access_token, auth.refresh_token);
-    // Tokens from the second-factor step come without the user ID
-    const userId = auth.user_id ?? (await api.getMe()).id;
-    return withStateLock(async () => {
-    const previous = loadSession();
-    if (previous && (previous.user_id !== userId || previous.server_url.replace(/\/+$/, "") !== serverUrl.replace(/\/+$/, ""))) {
-      throw new Error("Log out before switching accounts; do not reuse another account's keyring");
-    }
-    this.sessionGeneration++;
-    this.ws.close();
-    const fingerprint = this.fingerprintFor(userId);
-    const recoveryNote =
-      signedIn.recoveryCodesRemaining === undefined
-        ? ""
-        : `Signed in with a recovery code (${signedIn.recoveryCodesRemaining} left). `;
-
-    const paths = statePaths();
-    const keys = DeviceKeys.loadOrGenerate(paths.deviceKey, paths.encryptionKey);
-
-    const reg = await api.registerDevice(
-      this.registrationFor(keys, deviceName, fingerprint),
-      (challenge) => keys.identity.signDeviceChallenge(challenge),
+  private advanceAuthorization(deadline: number): Promise<AdvanceResult> {
+    const run = (this.advancing ?? Promise.resolve()).then(
+      () => this.runAdvance(deadline),
+      () => this.runAdvance(deadline),
     );
+    const marker = run.then(() => undefined, () => undefined);
+    this.advancing = marker;
+    void marker.then(() => {
+      if (this.advancing === marker) this.advancing = null;
+    });
+    return run;
+  }
 
-    const deviceId = reg.device.id;
-    const deviceStatus = reg.device.status;
-    const session: Session = {
-      server_url: serverUrl,
-      user_id: userId,
-      device_id: deviceId,
-      device_name: deviceName,
-      device_status: deviceStatus,
-      fingerprint,
-      access_token: api.access ?? "",
-      refresh_token: api.refresh ?? auth.refresh_token,
-      created_at: new Date().toISOString(),
-    };
-    saveSession(session);
-    this.cached = null;
+  private async runAdvance(deadline: number): Promise<AdvanceResult> {
+    const state = await this.authorizer.complete(deadline);
+    if (state?.status !== "authorized") return state;
+    this.onAuthorized?.();
+    return this.register(state.server_url, state.tokens);
+  }
 
-    if (deviceStatus === "approved") {
-      return {
-        status: "approved",
-        message: `${recoveryNote}Logged in as "${deviceName}". Keys are restored and authenticated on the next clipboard call. Existing meshes may require cpmesh_verify_device.`,
+  /**
+   * Registers this device with the approved tokens (proof of possession, as
+   * before) and saves the session. An existing profile keeps its keys: the
+   * server finds its device by key and moves it to the new grant, so it needs
+   * no new pairing. The tokens stay saved until this succeeds.
+   */
+  private register(serverUrl: string, tokens: TokenSet): Promise<SignedIn> {
+    return withStateLock(async () => {
+      const stored = loadAuthorization();
+      if (stored?.stage !== "authorized" || stored.grant_id !== tokens.grant_id) {
+        // Registered (or cancelled) by another call or process meanwhile
+        const current = loadSession();
+        if (isSignedIn(current) && current.grant_id === tokens.grant_id) {
+          return { status: current.device_status === "approved" ? "approved" : "pending", message: `Signed in as "${current.device_name}".` };
+        }
+        throw new Error("The sign-in was cancelled. Call cpmesh_login to start again.");
+      }
+      const previous = loadSession();
+      if (previous && (previous.user_id !== tokens.user_id || !sameServer(previous.server_url, serverUrl))) {
+        await revokeWithRetry(serverUrl, stored.refresh_token).catch(() => undefined);
+        clearAuthorization();
+        throw new Error(
+          "The user approved the sign-in with a different cpmesh account than the one this agent's profile belongs to, " +
+            "so it was revoked. Ask the user to sign in to the cpmesh website with the agent's account and call cpmesh_login " +
+            "again, or call cpmesh_logout first to switch accounts.",
+        );
+      }
+      this.sessionGeneration++;
+      this.ws.close();
+      this.cached = null;
+
+      const paths = statePaths();
+      const keys = DeviceKeys.loadOrGenerate(paths.deviceKey, paths.encryptionKey);
+      const fingerprint = previous?.fingerprint ?? this.fingerprintFor(tokens.user_id);
+      const name = previous?.device_name ?? this.deviceName();
+      const api = new CpmeshApi(serverUrl);
+      api.setTokens(stored.access_token, stored.refresh_token);
+      api.tokenStore = approvedTokenStore(tokens.grant_id);
+      let reg: RegisterDeviceResponse;
+      try {
+        reg = await api.registerDevice(
+          this.registrationFor(keys, name, fingerprint),
+          (challenge) => keys.identity.signDeviceChallenge(challenge),
+        );
+      } catch (error) {
+        throw registrationError(error);
+      }
+
+      // The server registered a new device (the old one was removed): its unsent pushes are void
+      const replaced = previous !== null && previous.device_id !== reg.device.id;
+      if (replaced) {
+        clearDeviceState();
+        this.pairing.clear();
+        this.pushes.clear();
+      }
+      const scope = stored.scope ?? tokens.scope;
+      const session: Session = {
+        server_url: serverUrl,
+        user_id: tokens.user_id,
+        device_id: reg.device.id,
+        device_name: name,
+        device_status: reg.device.status,
+        fingerprint,
+        access_token: api.access ?? "",
+        refresh_token: api.refresh ?? "",
+        created_at: previous && !replaced ? previous.created_at : new Date().toISOString(),
+        grant_id: tokens.grant_id,
+        client_id: CLIENT_ID,
+        ...(scope !== undefined && { scope }),
       };
-    }
+      saveSession(session);
+      clearAuthorization();
+      this.cached = null;
+      const allowed = scope === undefined ? "" : ` The user allowed: ${scope || "nothing"}.`;
 
-    // Pending: join the pairing session if an approver has already started one.
-    // (Already under the state lock here, so the nonce goes out directly.)
-    const status = await api.getMyApprovalStatus();
-    const pairing = await this.updatePairing(keys, status, (id, nonce) => api.submitPendingNonce(id, nonce));
-    return {
-      status: "pending",
-      pairing,
-      message:
-        `${recoveryNote}Logged in. Device "${deviceName}" is PENDING approval. ` +
-        (pairing ? pairingNextStep(pairing) : APPROVAL_NOT_STARTED),
-    };
+      if (reg.device.status === "approved") {
+        return {
+          status: "approved",
+          message:
+            `Signed in as "${session.device_name}".${allowed} Keys are restored and authenticated on the next clipboard call. ` +
+            "Existing meshes may require cpmesh_verify_device.",
+        };
+      }
+
+      // Pending: join the pairing session if an approver has already started one.
+      // (Already under the state lock here, so the nonce goes out directly.)
+      const sessionApi = this.buildApi(session);
+      const status = await sessionApi.getMyApprovalStatus();
+      const pairing = await this.updatePairing(keys, status, (id, nonce) => sessionApi.submitPendingNonce(id, nonce));
+      return {
+        status: "pending",
+        pairing,
+        message:
+          `Signed in.${allowed} Device "${session.device_name}" is PENDING approval. ` +
+          (pairing ? pairingNextStep(pairing) : APPROVAL_NOT_STARTED),
+      };
     });
   }
 
@@ -362,19 +535,32 @@ export class CpmeshDevice {
   }
 
   /**
-   * Polls until this device is approved (or rejected/revoked), then syncs the
-   * group key. Returns the final state.
+   * Finishes whichever step is pending, in order: the sign-in (browser callback
+   * or device-code approval), the device registration, then the pairing, which
+   * is polled until this device is approved (or rejected/revoked) and the group
+   * key synced. Returns the state reached by `timeoutMs`.
    */
   async waitForApproval(
     timeoutMs = 180_000,
     onProgress?: (info: { status: string; pairing?: PairingView }) => void,
-  ): Promise<{ approved: boolean; status: string; pairing?: PairingView; message: string }> {
-    const { api, keys, session } = await this.requireSession();
-
+  ): Promise<{
+    approved: boolean; status: string; pairing?: PairingView; authorization?: PendingAuthorization; message: string;
+  }> {
     const deadline = Date.now() + timeoutMs;
-    let pairing: PairingView | undefined;
+    const signIn = await this.advanceAuthorization(deadline);
+    if (signIn?.status === "authorization_pending") {
+      return {
+        approved: false, status: "authorization_pending", authorization: signIn,
+        message: `Still waiting for the user to approve the sign-in. ${approvalInstructions(signIn)} Then call cpmesh_wait_for_approval again.`,
+      };
+    }
+    if (isFailed(signIn)) {
+      return { approved: false, status: signIn.status, message: `${signIn.message} Call cpmesh_login to start again.` };
+    }
 
-    while (Date.now() < deadline) {
+    const { api, keys, session } = await this.requireSession();
+    let pairing: PairingView | undefined;
+    for (;;) {
       if (this.closing) throw new Error("MCP connection closed");
       const status = await this.withSession(session, () => api.getMyApprovalStatus());
 
@@ -400,14 +586,16 @@ export class CpmeshDevice {
         return {
           approved: false,
           status: status.status,
-          message: `Device was ${status.status}. Ask the user to re-approve this device or log in again with cpmesh_login.`,
+          message: `Device was ${status.status}. Ask the user to re-approve this device, or call cpmesh_logout and then cpmesh_login to start over with fresh keys.`,
         };
       }
 
       pairing = await this.updatePairing(keys, status, (id, nonce) =>
         this.withSession(session, () => api.submitPendingNonce(id, nonce)));
       onProgress?.({ status: status.status, pairing });
-      await sleep(2500);
+      const left = deadline - Date.now();
+      if (left <= 0) break;
+      await sleep(Math.min(2500, left));
     }
 
     return {
@@ -420,12 +608,9 @@ export class CpmeshDevice {
 
   // === Readiness ===
 
-  private twoFactorNextStep(): string | null {
-    const waiting = this.signIns.waiting();
-    return waiting
-      ? `The sign-in as "${waiting.username}" is waiting for its two-factor code: ask the user for the current ` +
-          "6-digit code from their authenticator app (or a recovery code) and call cpmesh_login with it."
-      : null;
+  /** What to do to (finish) signing in, for errors and status. */
+  private signInNextStep(session: Session | null): string {
+    return signInRequired(session, this.authorizer.peek());
   }
 
   private async requireSession(): Promise<{
@@ -434,62 +619,63 @@ export class CpmeshDevice {
     session: Session;
   }> {
     const session = loadSession();
-    if (!session) {
-      throw new DeviceNotReadyError(
-        "cpmesh is not logged in",
-        this.twoFactorNextStep() ??
-          "Call cpmesh_login with the user's server URL and credentials (or set CPMESH_SERVER_URL / CPMESH_USERNAME / CPMESH_PASSWORD).",
-      );
+    if (!isSignedIn(session)) {
+      throw new DeviceNotReadyError("cpmesh is not signed in", this.signInNextStep(session));
     }
     const paths = statePaths();
     // The encryption key is created on first use for installs that predate protocol 3.
     const keys = DeviceKeys.load(paths.deviceKey, paths.encryptionKey);
-    const api = this.buildApi(session, keys);
+    const api = this.buildApi(session);
     return { api, keys, session };
   }
 
   /**
-   * API client for a stored session. Refreshed tokens are persisted to the
-   * session file (shared with other MCP processes using the same state
-   * directory) and re-bound to this device: the server issues refreshed access
-   * tokens without a device, and re-registering with the same key and
-   * fingerprint is a plain reconnect that returns a device-bound token.
+   * API client for a stored session. Rotated tokens are written back to the
+   * session file, shared with other MCP processes using the same profile; a
+   * refresh the server refuses ends the session there (the profile is kept, so
+   * signing in again needs no new pairing). Refreshed agent tokens stay bound
+   * to this device.
    */
-  private buildApi(session: Session, keys: DeviceKeys): CpmeshApi {
+  private buildApi(session: Session): CpmeshApi {
     const api = new CpmeshApi(session.server_url);
     api.setTokens(session.access_token, session.refresh_token);
-    const sameDevice = (s: Session | null): s is Session =>
-      s?.device_id === session.device_id;
+    const sameDevice = (s: Session | null): s is Session => s?.device_id === session.device_id;
     api.tokenStore = {
       load: () => {
         const s = loadSession();
-        return sameDevice(s) ? { access: s.access_token, refresh: s.refresh_token } : null;
+        return sameDevice(s) && s.refresh_token ? { access: s.access_token, refresh: s.refresh_token } : null;
       },
-      save: (access, refresh) => {
+      save: ({ access, refresh, scope }) => {
         const s = loadSession();
-        if (sameDevice(s)) saveSession({ ...s, access_token: access, refresh_token: refresh });
+        if (sameDevice(s)) {
+          saveSession({ ...s, access_token: access, refresh_token: refresh, ...(scope !== undefined && { scope }), signed_out: undefined });
+        }
       },
-    };
-    api.rebind = async (a) => {
-      const reg = await a.registerDevice(
-        this.registrationFor(keys, session.device_name, this.fingerprintOf(session)),
-        (challenge) => keys.identity.signDeviceChallenge(challenge),
-        { retryOnExpiry: false },
-      );
-      if (reg.device.id !== session.device_id) {
-        throw new Error("the server registered a different device while re-binding the session");
-      }
+      signedOut: (refresh, reason) => {
+        const s = loadSession();
+        if (sameDevice(s) && s.refresh_token === refresh) {
+          saveSession({ ...s, access_token: "", refresh_token: "", signed_out: reason });
+        }
+      },
     };
     return api;
   }
 
+  /** Refuses early what the user did not allow this agent (the server enforces it too). */
+  private requireScope(scope: Scope): void {
+    const session = loadSession();
+    if (isSignedIn(session) && !grants(session.scope, scope)) throw new ScopeError(scope);
+  }
+
   private async loadReady(): Promise<ReadyState> {
     const stored = loadSession();
-    if (!stored) {
+    if (!isSignedIn(stored)) {
       this.ws.close();
       this.cached = null;
     } else if (this.cached && (stored.device_id !== this.cached.session.device_id ||
-        stored.user_id !== this.cached.session.user_id || stored.server_url !== this.cached.session.server_url)) {
+        stored.user_id !== this.cached.session.user_id || stored.server_url !== this.cached.session.server_url ||
+        stored.grant_id !== this.cached.session.grant_id)) {
+      // Another account, device or authorization (signed in again): start from the stored session
       this.ws.close();
       this.cached = null;
     }
@@ -547,16 +733,18 @@ export class CpmeshDevice {
   private sequenceKeys<T>(operation: () => Promise<T> | T): Promise<T> {
     if (this.closing) return Promise.reject(new Error("Signing out"));
     const session = loadSession();
-    if (!session) {
+    if (!isSignedIn(session)) {
       this.ws.close();
       this.cached = null;
-      return Promise.reject(new DeviceNotReadyError("cpmesh is not logged in", this.twoFactorNextStep() ?? "Call cpmesh_login."));
+      return Promise.reject(new DeviceNotReadyError("cpmesh is not signed in", this.signInNextStep(session)));
     }
     const generation = this.sessionGeneration;
     const work = this.keyWork.then(() => withStateLock(async () => {
-      if (this.closing || generation !== this.sessionGeneration || !sameDeviceSession(loadSession(), session)) {
+      const current = loadSession();
+      if (this.closing || generation !== this.sessionGeneration || !sameDeviceSession(current, session)) {
         throw new Error("Session changed");
       }
+      if (!isSignedIn(current)) throw new SessionExpiredError(signedOutMessage(current?.signed_out));
       const result = await operation();
       if (this.closing || generation !== this.sessionGeneration) throw new Error("Session changed");
       return result;
@@ -572,6 +760,8 @@ export class CpmeshDevice {
       if (this.closing || !sameDeviceSession(current, session)) {
         throw new Error("Session changed");
       }
+      // A session that ended meanwhile must not send its tokens again
+      if (!isSignedIn(current)) throw new SessionExpiredError(signedOutMessage(current?.signed_out));
       return operation();
     });
   }
@@ -639,6 +829,7 @@ export class CpmeshDevice {
 
   async pushText(text: string, requestId: string = randomUUID()): Promise<PushResult> {
     requestId = requestId.toLowerCase();
+    this.requireScope("clipboard:write");
     const generation = this.sessionGeneration;
     const state = await this.ensureReady();
     if (this.closing || generation !== this.sessionGeneration) throw new Error("Session changed");
@@ -649,6 +840,8 @@ export class CpmeshDevice {
         await this.refreshGroupKeys();
         throw new WsError(`Keys changed before acceptance; retry request_id ${requestId}`, "rotation_required");
       }
+      // The relay refused the push: this agent was authorized without clipboard:write
+      if (error instanceof WsError && error.code === "insufficient_scope") throw new ScopeError("clipboard:write");
       throw error;
     }
   }
@@ -734,7 +927,7 @@ export class CpmeshDevice {
     } catch (e) {
       if (!(e instanceof WsError) || !/\b401\b/.test(e.message)) throw e;
       if (!(await api.refreshSession(api.access))) {
-        throw new SessionExpiredError(SESSION_EXPIRED_MESSAGE);
+        throw new SessionExpiredError(signedOutMessage(api.signedOutReason));
       }
       return await this.ws.pushClipboard(session.server_url, api.access ?? "", fingerprint, payload);
     }
@@ -744,6 +937,7 @@ export class CpmeshDevice {
     limit = 20,
     offset = 0,
   ): Promise<{ items: ClipboardItem[]; has_more: boolean }> {
+    this.requireScope("clipboard:read");
     const state = await this.ensureReady();
     const resp = await this.withSession(state.session, () => state.api.getClipboardHistory(limit, offset));
     const items: ClipboardItem[] = [];
@@ -752,6 +946,7 @@ export class CpmeshDevice {
   }
 
   async getLatestClipboard(skipOwn = false): Promise<ClipboardItem | null> {
+    this.requireScope("clipboard:read");
     const { session } = await this.ensureReady();
     const { items } = await this.getClipboard(20, 0);
     const filtered = skipOwn
@@ -872,6 +1067,7 @@ export class CpmeshDevice {
   }
 
   async deleteClipboardEntry(id: string): Promise<void> {
+    this.requireScope("clipboard:delete");
     const { api, session } = await this.requireSession();
     await this.withSession(session, () => api.deleteClipboardEntry(id));
   }
@@ -879,60 +1075,71 @@ export class CpmeshDevice {
   async removeDevice(deviceId: string, force = false): Promise<string> {
     const generation = this.sessionGeneration;
     const { session, api } = await this.requireSession();
-    if (deviceId === session.device_id && !force) {
-      throw new Error(
-        "Refusing to remove this MCP device's own registration (that would log the agent out). " +
-          "Pass force=true if you really mean it, or tell the user to use cpmesh_logout instead.",
-      );
+    if (deviceId === session.device_id) {
+      if (!force) {
+        throw new Error(
+          "Refusing to remove this MCP device's own registration (that would sign the agent out). " +
+            "Pass force=true if you really mean it, or tell the user to use cpmesh_logout instead.",
+        );
+      }
+      // Signing out revokes this agent's grant, which removes its device
+      return this.logout();
     }
+    this.requireScope("devices:manage");
     if (generation !== this.sessionGeneration) throw new Error("Session changed");
     await this.sequenceKeys(async () => {
       revokeDevice(deviceId);
       await api.deleteDevice(deviceId);
-      if (deviceId !== session.device_id) {
-        const state = await this.loadReady();
-        const due = await synchronizeKeys(state.api, state.keyring, state.keys, session.device_id);
-        if (due) await rotateKeys(state.api, state.keyring, state.keys, session.device_id);
-      }
+      const state = await this.loadReady();
+      const due = await synchronizeKeys(state.api, state.keyring, state.keys, session.device_id);
+      if (due) await rotateKeys(state.api, state.keyring, state.keys, session.device_id);
     });
-    if (deviceId === session.device_id) await this.logout();
     return `Device ${deviceId} removed.`;
   }
 
   async status(): Promise<Record<string, unknown>> {
-    const session = loadSession();
-    if (!session) {
-      this.ws.close();
-      this.cached = null;
-      const twoFactor = this.twoFactorNextStep();
-      return {
-        logged_in: false,
-        ...(twoFactor && { two_factor_code_needed: true }),
-        next_step:
-          twoFactor ??
-          "Call cpmesh_login with the user's server URL and credentials (or set CPMESH_SERVER_URL / CPMESH_USERNAME / CPMESH_PASSWORD environment variables).",
-      };
+    // Move a sign-in in progress forward without waiting (one poll when due), unless a call is waiting on it
+    let progress: SignInProgress | AdvanceResult;
+    let signInError: string | undefined;
+    if (this.advancing) {
+      progress = this.authorizer.peek();
+    } else {
+      try {
+        progress = await this.advanceAuthorization(Date.now());
+      } catch (error) {
+        signInError = errorMessage(error);
+        progress = this.authorizer.peek();
+      }
     }
+    const signIn = {
+      ...(progress?.status === "authorization_pending" && { authorization: progress }),
+      ...(isFailed(progress) && { authorization_result: progress.status }),
+      ...(signInError !== undefined && { authorization_error: signInError }),
+    };
+
+    let session = loadSession();
+    if (!isSignedIn(session)) return this.signedOutStatus(session, progress, signInError, signIn);
     const paths = statePaths();
     const keys = DeviceKeys.load(paths.deviceKey, paths.encryptionKey);
-    const api = this.buildApi(session, keys);
+    const api = this.buildApi(session);
 
     let approval: ApprovalStatusResponse | string;
     try {
       approval = await this.withSession(session, () => api.getMyApprovalStatus());
     } catch (e) {
-      approval =
-        e instanceof ApiError || e instanceof SessionExpiredError
-          ? `unavailable: ${e.message}`
-          : "unavailable";
+      session = loadSession();
+      // The server ended the session meanwhile
+      if (e instanceof SessionExpiredError || !isSignedIn(session)) return this.signedOutStatus(session, progress, signInError, signIn);
+      approval = e instanceof ApiError || e instanceof TemporarilyUnavailableError ? `unavailable: ${e.message}` : "unavailable";
     }
 
     let pairing: PairingView | undefined;
     if (typeof approval === "string") {
       pairing = this.lastPairing();
     } else if (approval.status !== "approved") {
+      const current = session;
       pairing = await this.updatePairing(keys, approval, (id, nonce) =>
-        this.withSession(session, () => api.submitPendingNonce(id, nonce)));
+        this.withSession(current, () => api.submitPendingNonce(id, nonce)));
     }
 
     const ring = existsSync(paths.keyring) ? Keyring.load(paths.keyring, keys.identity.privateKey) : new Keyring();
@@ -944,6 +1151,8 @@ export class CpmeshDevice {
       protocol_version: PAIRING_VERSION,
       server_url: session.server_url,
       user_id: session.user_id,
+      grant_id: session.grant_id,
+      scope: session.scope,
       device_id: session.device_id,
       device_name: session.device_name,
       device_status:
@@ -957,9 +1166,10 @@ export class CpmeshDevice {
       group_key_available: keyringOk,
       live_entries_received: this.liveFeed.length,
       state_dir: paths.root,
+      ...signIn,
       next_step:
         typeof approval === "string"
-          ? "Session exists but the server could not be reached or the session expired — try cpmesh_login again."
+          ? `The cpmesh server could not be reached (${approval.replace(/^unavailable: ?/, "") || "no answer"}); try again shortly.`
         : approval.status !== "approved"
           ? (pairing ? pairingNextStep(pairing) : APPROVAL_NOT_STARTED)
           : !keyringOk || loadMembership().version < keyVersion || loadMembership().rotation_required
@@ -968,21 +1178,58 @@ export class CpmeshDevice {
     };
   }
 
+  private signedOutStatus(
+    session: Session | null,
+    progress: SignInProgress | AdvanceResult,
+    signInError: string | undefined,
+    signIn: Record<string, unknown>,
+  ): Record<string, unknown> {
+    this.ws.close();
+    this.cached = null;
+    const profile = session && {
+      server_url: session.server_url,
+      device_id: session.device_id,
+      device_name: session.device_name,
+      signed_out: session.grant_id ? session.signed_out ?? "signed out" : "signed in by cpmesh-mcp 0.2 with a password",
+    };
+    return {
+      logged_in: false,
+      ...(profile && { profile }),
+      ...signIn,
+      next_step:
+        signInError !== undefined && progress?.status === "authorized"
+          ? `${signInError} Then call cpmesh_wait_for_approval to finish signing in.`
+          : signInRequired(session, progress),
+    };
+  }
+
+  /**
+   * Signs this agent out: revokes its authorization on the server (which also
+   * removes its device; the user's other devices rotate the group key) and
+   * wipes the local profile. 0.2 kept the server enrollment instead.
+   */
   async logout(): Promise<string> {
     this.closing = true;
     this.sessionGeneration++;
     this.ws.close();
+    this.authorizer.stop();
     await this.keyWork;
-    await withStateLock(() => {
-    this.cached = null;
-    this.signIns.clear();
-    this.pairing.clear();
-    this.pushes.clear();
-    this.liveFeed = [];
-    clearAllState();
-    });
-    this.closing = false;
-    return "Logged out. Local keys, keyring and session were wiped.";
+    try {
+      const note = await withStateLock(async () => {
+        this.cached = null;
+        this.pairing.clear();
+        this.pushes.clear();
+        this.liveFeed = [];
+        const session = loadSession();
+        await this.authorizer.cancel({ locked: true });
+        const revoked = await revokeSession(session);
+        clearAllState();
+        return revoked;
+      });
+      return `Signed out.${note ? ` ${note}` : ""} Local keys, keyring and session were wiped.`;
+    } finally {
+      this.closing = false;
+    }
   }
 
   stop(): void {
@@ -990,10 +1237,78 @@ export class CpmeshDevice {
     this.closing = true;
     this.sessionGeneration++;
     this.ws.close();
-    this.signIns.clear();
+    this.authorizer.stop();
     this.cached = null;
   }
 
+}
+
+/** Revokes a session's grant for cpmesh_logout and says what happened on the server. */
+async function revokeSession(session: Session | null): Promise<string> {
+  if (!session) return "";
+  if (!session.grant_id) {
+    return `The device that cpmesh-mcp 0.2 registered ("${session.device_name}") stays on the account: remove it in the device ` +
+      "list on a trusted device or on the cpmesh dashboard.";
+  }
+  if (!session.refresh_token) {
+    return "This agent was already signed out, so its authorization could not be revoked from here: if it is still listed " +
+      "under Connected agents on the cpmesh dashboard, revoke it there (that also removes its device).";
+  }
+  try {
+    await revokeWithRetry(session.server_url, session.refresh_token);
+    return "This agent's authorization was revoked on the server, which also removed its device from the account " +
+      "(the user's other devices rotate the group key).";
+  } catch (error) {
+    return `The server could not revoke this agent's authorization (${errorMessage(error)}): revoke it under Connected ` +
+      "agents on the cpmesh dashboard, which also removes its device.";
+  }
+}
+
+/** Keeps tokens rotated while the device registers with them in the saved approval. */
+function approvedTokenStore(grantId: string): TokenStore {
+  const current = () => {
+    const stored = loadAuthorization();
+    return stored?.stage === "authorized" && stored.grant_id === grantId ? stored : null;
+  };
+  return {
+    load: () => {
+      const stored = current();
+      return stored ? { access: stored.access_token, refresh: stored.refresh_token } : null;
+    },
+    save: ({ access, refresh, scope }) => {
+      const stored = current();
+      if (stored) saveAuthorization({ ...stored, access_token: access, refresh_token: refresh, ...(scope !== undefined && { scope }) });
+    },
+    signedOut: (refresh) => {
+      if (current()?.refresh_token === refresh) clearAuthorization();
+    },
+  };
+}
+
+/** What to tell the agent when the device could not register with an approved sign-in. */
+function registrationError(error: unknown): unknown {
+  if (error instanceof ApiError && error.code === "grant_device_mismatch") {
+    clearAuthorization();
+    return new Error(
+      "This approval belongs to another cpmesh device (this agent's keys changed since). Call cpmesh_login to approve this device again.",
+    );
+  }
+  if (error instanceof ApiError && error.status === 409) {
+    return new Error(
+      `The device could not register: ${error.message}. Once that is fixed, call cpmesh_wait_for_approval to finish signing in ` +
+        "(the approval is kept).",
+    );
+  }
+  if (error instanceof ApiError && error.status === 403 && /revoked or rejected/.test(error.message)) {
+    return new Error(
+      "This device's keys were rejected or revoked on the account. Call cpmesh_logout to start over with fresh keys, then cpmesh_login.",
+    );
+  }
+  return error;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function normalizeFingerprint(value: string): string { return value.replace(/[\s:-]/g, "").toUpperCase(); }

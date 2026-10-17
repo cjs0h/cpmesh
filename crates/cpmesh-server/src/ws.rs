@@ -40,6 +40,9 @@ pub struct Client {
     /// Whether the user's other devices are told when this client goes on- or offline.
     /// True for devices, false for browser sessions.
     pub announce: bool,
+    /// Whether the connection receives clipboard entries. False for agents without
+    /// `clipboard:read`, which only get `oauth::policy::SEND_ONLY_MESSAGES`.
+    pub reads_clipboard: bool,
     pub tx: mpsc::Sender<Arc<QueuedMessage>>,
     /// Signalled to close the connection (account suspended, deleted or signed out).
     pub kick: CancellationToken,
@@ -186,9 +189,12 @@ impl Hub {
             _permit: Some(permit),
         });
         let mut overflowed = Vec::new();
+        let withheld_without_read = !crate::oauth::policy::delivered_without_read(&msg.msg_type);
         if let Some(user_clients) = clients.get(user_id) {
             for (device_id, client) in user_clients {
-                if device_id == exclude_device_id {
+                if device_id == exclude_device_id
+                    || (withheld_without_read && !client.reads_clipboard)
+                {
                     continue;
                 }
                 let outgoing = if !client.announce {
@@ -271,6 +277,7 @@ impl Hub {
     }
 }
 
+/// Hourly housekeeping: idle send budgets, old request receipts and expired OAuth codes.
 pub fn start_hub_cleanup(state: Arc<AppState>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
@@ -290,6 +297,9 @@ pub fn start_hub_cleanup(state: Arc<AppState>) {
             {
                 warn!("Failed to expire clipboard request receipts: {error}");
             }
+            if let Err(error) = state.db.delete_expired_oauth_codes().await {
+                warn!("Failed to delete expired OAuth codes: {error}");
+            }
         }
     });
 }
@@ -308,6 +318,7 @@ mod tests {
                 device_name: format!("{device}-name"),
                 conn_id: uuid::Uuid::new_v4(),
                 announce: true,
+                reads_clipboard: true,
                 tx,
                 kick: CancellationToken::new(),
             },
@@ -451,6 +462,38 @@ mod tests {
             parse(rx_new.try_recv().unwrap()).payload["entry"]["id"],
             "e1"
         );
+    }
+
+    #[tokio::test]
+    async fn connections_without_clipboard_read_get_no_entries() {
+        let hub = Hub::new();
+        let (device, _rx_device) = client("u1", "a");
+        let (mut agent, mut rx_agent) = client("u1", "agent");
+        agent.reads_clipboard = false;
+        hub.register(agent).await;
+        hub.register(device).await;
+        // Device events still reach it
+        assert_eq!(
+            parse(rx_agent.try_recv().unwrap()).msg_type,
+            MSG_DEVICE_STATUS
+        );
+
+        for (kind, delivered) in [
+            (MSG_CLIPBOARD_NEW, false),
+            ("clipboard_history", false),
+            (MSG_GROUP_KEY_UPDATED, true),
+            (MSG_ROTATION_NEEDED, true),
+        ] {
+            let msg = WsMessage {
+                msg_type: kind.into(),
+                payload: json!({"entry": {"id": "e1"}}),
+            };
+            hub.broadcast_to_user("u1", "a", &msg).await;
+            match rx_agent.try_recv() {
+                Ok(msg) => assert!(delivered, "{kind} was delivered: {}", msg.text),
+                Err(_) => assert!(!delivered, "{kind} was withheld"),
+            }
+        }
     }
 
     #[tokio::test]
