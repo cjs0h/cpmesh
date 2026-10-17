@@ -300,7 +300,7 @@ release that leaves the MCP version alone doesn't touch npm. To ship a new MCP v
 
 ```bash
 cd mcp/cpmesh-mcp
-npm version 0.3.0 --no-git-tag-version
+npm version 0.4.0 --no-git-tag-version
 # then set the same version in src/index.ts (const VERSION); test/version.test.ts checks that they match
 ```
 
