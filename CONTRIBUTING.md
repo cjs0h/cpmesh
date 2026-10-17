@@ -242,7 +242,8 @@ graph on future Tauri updates and exercise Linux builds when a compatible fix be
 
 Maintainers publish releases with the [Release workflow](.github/workflows/release.yml). It builds every
 app, attaches the installers to a GitHub Release, then registers that release on the website so the
-Downloads section on cpmesh.com and the apps' update check offer the new version.
+Downloads section on cpmesh.com and the apps' update check offer the new version. It also publishes a new
+version of the MCP package to npm (see [Publishing the MCP package](#publishing-the-mcp-package)).
 
 ### Cutting a release
 
@@ -289,6 +290,25 @@ Re-publishing a version is safe, and the script refuses to replace a newer versi
 `--force`. Use `--dry-run` to preview what a release JSON (from `gh release view <tag> --json tagName,url,isDraft,assets`)
 would publish. The release scripts have tests: `node --test "scripts/release/*.test.mjs"`.
 
+### Publishing the MCP package
+
+Once the builds succeed, the same run publishes `mcp/cpmesh-mcp` to npm if npm doesn't have that version yet, so a
+release that leaves the MCP version alone doesn't touch npm. To ship a new MCP version, bump it before tagging:
+
+```bash
+cd mcp/cpmesh-mcp
+npm version 0.3.0 --no-git-tag-version
+# then set the same version in src/index.ts (const VERSION); test/version.test.ts checks that they match
+```
+
+`npm publish` runs the package's `prepublishOnly` script first (typecheck, build and tests), and the package is
+published with provenance. npm has to trust the workflow once, in one of two ways:
+
+- **Trusted publishing** (no secret): on npmjs.com, open the `cpmesh-mcp` package's **Settings → Trusted Publisher**,
+  choose **GitHub Actions** and enter this repository (`cjs0h`/`cpmesh`) and the workflow `release.yml`, leaving
+  the environment empty.
+- **A token**: add an `NPM_TOKEN` secret holding an npm access token that can publish `cpmesh-mcp`.
+
 ### Signing updates
 
 The desktop apps install an update only when its signature verifies against the public key compiled into them
@@ -328,6 +348,7 @@ key secret is missing, and every signature is checked against the public key bef
 | `ANDROID_KEY_PASSWORD` | Optional | Key password, when it differs from the keystore password |
 | `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY` | Optional | Developer ID signing for macOS (base64 `.p12`) |
 | `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` | Optional | Notarization for macOS (app-specific password) |
+| `NPM_TOKEN` | Optional | npm access token that can publish `cpmesh-mcp`; not needed with trusted publishing (see [Publishing the MCP package](#publishing-the-mcp-package)) |
 
 Without the Android secrets the APK is skipped with a warning; without `CPMESH_ADMIN_TOKEN` (or the username and
 password) the GitHub Release is still published but the website is left unchanged. Creating a token needs a recent

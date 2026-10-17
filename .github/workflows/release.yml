@@ -1,7 +1,8 @@
 name: Release
 
 # Builds the desktop and Android apps, publishes them as a GitHub Release, then registers the
-# release on the website so its Downloads section and the apps' update check offer it.
+# release on the website so its Downloads section and the apps' update check offer it. The MCP
+# package is published to npm when its version isn't there yet.
 # See "Releasing" in CONTRIBUTING.md for the required secrets.
 
 on:
@@ -348,3 +349,60 @@ jobs:
         run: |
           gh release view "$TAG" --json tagName,url,isDraft,assets > "$RUNNER_TEMP/release.json"
           node scripts/release/publish-website.mjs --release "$RUNNER_TEMP/release.json" --notes "$NOTES"
+
+  npm:
+    name: MCP package on npm
+    needs: [prepare, desktop, android]
+    # Same gate as Publish, so a failing website update doesn't hold the package back. npm only gets
+    # a version it doesn't have yet: a release that didn't bump mcp/cpmesh-mcp leaves it alone.
+    if: >-
+      !cancelled() && needs.prepare.result == 'success' && needs.desktop.result == 'success' &&
+      (needs.android.result == 'success' || needs.android.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # npm trusted publishing and provenance
+      id-token: write
+    defaults:
+      run:
+        shell: bash
+        working-directory: mcp/cpmesh-mcp
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: npm
+          cache-dependency-path: mcp/cpmesh-mcp/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Publish the MCP package
+        env:
+          # Optional: without it, npm authenticates through trusted publishing (see CONTRIBUTING.md)
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          name="$(node -p "require('./package.json').name")"
+          version="$(node -p "require('./package.json').version")"
+          status="$(curl -sS -o /dev/null -w '%{http_code}' "https://registry.npmjs.org/${name//\//%2f}/$version" || true)"
+          case "$status" in
+            200)
+              echo "$name@$version is already on npm; nothing to publish." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+              ;;
+            404) ;;
+            *)
+              echo "::error::Couldn't check whether $name@$version is on npm (HTTP $status)"
+              exit 1
+              ;;
+          esac
+          if [ -n "$NPM_TOKEN" ]; then
+            export NODE_AUTH_TOKEN="$NPM_TOKEN"
+          fi
+          # prepublishOnly typechecks, builds and tests the package first
+          npm publish --provenance --access public
+          echo "Published [$name@$version](https://www.npmjs.com/package/$name/v/$version)" >> "$GITHUB_STEP_SUMMARY"
