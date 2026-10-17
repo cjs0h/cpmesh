@@ -168,6 +168,8 @@ pub enum SignInAction {
 pub struct KeyProblem {
     /// The account's current key version, which this device doesn't have.
     pub server_version: i32,
+    /// A device that shared the key with this one but isn't verified here yet.
+    pub shared_by: Option<String>,
 }
 
 /// Shared application state managed by Tauri.
@@ -1415,6 +1417,12 @@ async fn prepare_connection(ctx: &AppContext, config: &AppConfig) -> Result<(), 
 }
 
 async fn refresh_keys(ctx: &AppContext) -> Result<(), String> {
+    update_keys(ctx, false).await
+}
+
+/// Imports what the relay holds for us and rotates when due. With `share`, rotates
+/// anyway, so every verified member, including one that lacks it, gets the current key.
+async fn update_keys(ctx: &AppContext, share: bool) -> Result<(), String> {
     let _operation = ctx.key_operations.lock().await;
     let own_id = ctx.config.read().await.device_id.clone();
     let api = ctx.api.lock().await;
@@ -1429,7 +1437,7 @@ async fn refresh_keys(ctx: &AppContext) -> Result<(), String> {
     }
     let exchange = exchange.as_mut().expect("keyring restored");
     let due = synchronize_keys(ctx, exchange, &api, &own_id).await?;
-    if due {
+    if due || share {
         crate::key_sync::rotate(exchange, &api, &own_id, &ctx.config_dir).await?;
     }
     ctx.rotation_pending.store(false, Ordering::SeqCst);
@@ -1450,8 +1458,15 @@ async fn synchronize_keys(
             Ok(due)
         }
         Err(error) => {
-            if let SyncError::MissingCurrentKey { server_version } = error {
-                ctx.set_key_problem(Some(KeyProblem { server_version }));
+            if let SyncError::MissingCurrentKey {
+                server_version,
+                shared_by,
+            } = &error
+            {
+                ctx.set_key_problem(Some(KeyProblem {
+                    server_version: *server_version,
+                    shared_by: shared_by.clone(),
+                }));
             }
             Err(error.into())
         }
@@ -1931,16 +1946,48 @@ pub async fn get_devices(ctx: State<'_, AppContext>) -> Result<Vec<DeviceInfo>, 
     Ok(devices)
 }
 
+/// What happened to the group key after this device changed who it trusts.
+#[derive(Debug, Default, PartialEq, Serialize)]
+pub struct KeyUpdate {
+    /// This device rotated the key so the device it verified holds the current one.
+    pub shared: bool,
+    /// Why the key could not be updated yet; the removal or verification itself
+    /// succeeded. After a removal, sending stays paused until this is resolved.
+    pub blocked: Option<String>,
+}
+
+impl KeyUpdate {
+    fn from_result(result: Result<(), String>, shared: bool) -> Self {
+        match result {
+            Ok(()) => KeyUpdate {
+                shared,
+                blocked: None,
+            },
+            Err(error) => KeyUpdate {
+                shared: false,
+                blocked: Some(error),
+            },
+        }
+    }
+}
+
 #[tauri::command]
-pub async fn remove_device(ctx: State<'_, AppContext>, device_id: String) -> Result<(), String> {
-    uuid::Uuid::parse_str(&device_id).map_err(|_| "Invalid device ID")?;
+pub async fn remove_device(
+    ctx: State<'_, AppContext>,
+    device_id: String,
+) -> Result<KeyUpdate, String> {
+    remove_member(&ctx, &device_id).await
+}
+
+async fn remove_member(ctx: &AppContext, device_id: &str) -> Result<KeyUpdate, String> {
+    uuid::Uuid::parse_str(device_id).map_err(|_| "Invalid device ID")?;
     let deleted = {
         let _operation = ctx.key_operations.lock().await;
         ctx.rotation_pending.store(true, Ordering::SeqCst);
         let mut verifier =
             crate::crypto::verify::KeyVerifier::new(&ctx.config_dir).map_err(|e| e.to_string())?;
-        verifier.remove_pin(&device_id).map_err(|e| e.to_string())?;
-        ctx.api.lock().await.delete_device(&device_id).await
+        verifier.remove_pin(device_id).map_err(|e| e.to_string())?;
+        ctx.api.lock().await.delete_device(device_id).await
     };
     if let Err(error) = deleted {
         if let Some(ws) = ctx.ws.lock().await.as_ref() {
@@ -1949,15 +1996,16 @@ pub async fn remove_device(ctx: State<'_, AppContext>, device_id: String) -> Res
         return Err(format!("Removal not confirmed; syncing is paused: {error}"));
     }
     ctx.devices.write().await.retain(|d| d.id != device_id);
-    if device_id != ctx.config.read().await.device_id {
-        match refresh_keys(&ctx).await {
-            // Removed; a key this device lacks is recovered on its own (Settings →
-            // Encryption keys), and the next key it gets leaves the removed device out
-            Err(_) if ctx.key_problem().is_some() => {}
-            result => result?,
-        }
+    if device_id == ctx.config.read().await.device_id {
+        return Ok(KeyUpdate::default());
     }
-    Ok(())
+    Ok(match refresh_keys(ctx).await {
+        // Removed; a key this device lacks is recovered on its own (Settings →
+        // Encryption keys), and the next key it gets leaves the removed device out
+        Err(_) if ctx.key_problem().is_some() => KeyUpdate::default(),
+        // Removed; the new key may still have to wait for other devices
+        result => KeyUpdate::from_result(result, false),
+    })
 }
 
 // === Device Approval Commands ===
@@ -1985,6 +2033,8 @@ pub struct MyApprovalStatusInfo {
     pub approval_code: Option<String>,
     pub sas: Option<String>,
     pub session_id: Option<String>,
+    /// The device on the other end of the pairing, to name it on screen.
+    pub approver_id: Option<String>,
     pub locally_verified: bool,
 }
 
@@ -2209,8 +2259,14 @@ pub async fn reject_pending_device(
 pub async fn get_my_approval_status(
     ctx: State<'_, AppContext>,
 ) -> Result<MyApprovalStatusInfo, String> {
-    // A device that registered before protocol 3 has no encryption key on the
-    // relay yet; the approver needs it to wrap the group key for us.
+    my_approval_status(&ctx).await
+}
+
+/// Pending device: keeps our encryption key published, then advances the pairing
+/// exchange the approver started.
+async fn my_approval_status(ctx: &AppContext) -> Result<MyApprovalStatusInfo, String> {
+    // The approver wraps the group key to the encryption key the relay lists for us;
+    // a device that registered before protocol 3 has not published one yet.
     if !ctx.encryption_key_published.load(Ordering::SeqCst) {
         let api = ctx.api.lock().await;
         let exchange = ctx.exchange.lock().await;
@@ -2235,7 +2291,7 @@ pub async fn get_my_approval_status(
         if resp.pairing_version != PAIRING_VERSION {
             return Err("Update the approving client and server".into());
         }
-        let kp = device_keys(&ctx)?.identity;
+        let kp = device_keys(ctx)?.identity;
         let peer = KeyPair::parse_public_key(approver_pub_bytes).map_err(|e| e.to_string())?;
         let fingerprint = derive_approval_code(&kp.public, &peer);
         // Phase 1 (pairing lock only): record the session and the commitment as
@@ -2336,11 +2392,13 @@ pub async fn get_my_approval_status(
     let approval_code = candidate.map(|(_, c)| c.fingerprint.clone());
     let sas = candidate.and_then(|(_, c)| c.sas.clone());
     let session_id = candidate.map(|(id, _)| id.clone());
+    let approver_id = candidate.map(|(_, c)| c.peer.id.clone());
     Ok(MyApprovalStatusInfo {
         status: resp.status.to_string(),
         approval_code,
         sas,
         session_id,
+        approver_id,
         locally_verified,
     })
 }
@@ -2410,12 +2468,22 @@ pub async fn get_own_identity(ctx: State<'_, AppContext>) -> Result<OwnIdentity,
 
 /// Explicit recovery/migration only: the expected FULL fingerprint must come from
 /// the other device itself, not a value copied from the relay's device listing.
+/// Afterwards the keys catch up: keys that device sent are accepted, a waiting
+/// rotation runs, and a device the relay lists without the current key receives it.
 #[tauri::command]
 pub async fn verify_device_identity(
     ctx: State<'_, AppContext>,
     device_id: String,
     fingerprint: String,
-) -> Result<(), String> {
+) -> Result<KeyUpdate, String> {
+    verify_member(&ctx, &device_id, &fingerprint).await
+}
+
+async fn verify_member(
+    ctx: &AppContext,
+    device_id: &str,
+    fingerprint: &str,
+) -> Result<KeyUpdate, String> {
     let generation = ctx.generation.load(Ordering::SeqCst);
     let devices = ctx
         .api
@@ -2431,19 +2499,108 @@ pub async fn verify_device_identity(
         .ok_or("Approved device not found")?;
     let key = KeyPair::parse_public_key(peer.public_key.as_deref().ok_or("Device key missing")?)
         .map_err(|e| e.to_string())?;
-    let expected = normalize_fingerprint(&fingerprint);
+    let expected = normalize_fingerprint(fingerprint);
     if expected.len() != 64 || expected != normalize_fingerprint(&KeyPair::fingerprint(&key)) {
         return Err("Full fingerprint does not match. Do not trust this device.".into());
     }
-    let _operation = ctx.key_operations.lock().await;
-    if generation != ctx.generation.load(Ordering::SeqCst) {
-        return Err("Session changed; verify again".into());
+    // The relay's word only decides whether to rotate now; the wrap goes to the
+    // identity just compared, like every other verified member's.
+    let lacks_key = peer.has_current_key == Some(false);
+    {
+        let _operation = ctx.key_operations.lock().await;
+        if generation != ctx.generation.load(Ordering::SeqCst) {
+            return Err("Session changed; verify again".into());
+        }
+        let mut verifier =
+            crate::crypto::verify::KeyVerifier::new(&ctx.config_dir).map_err(|e| e.to_string())?;
+        verifier
+            .pin_after_approval(device_id, &key)
+            .map_err(|e| e.to_string())?;
     }
-    let mut verifier =
-        crate::crypto::verify::KeyVerifier::new(&ctx.config_dir).map_err(|e| e.to_string())?;
-    verifier
-        .pin_after_approval(&device_id, &key)
-        .map_err(|e| e.to_string())
+    // A device that lacks the key itself can't share it; it may accept the key now.
+    let share = lacks_key && ctx.key_problem().is_none();
+    Ok(KeyUpdate::from_result(update_keys(ctx, share).await, share))
+}
+
+/// The account's other approved devices and how this device trusts each: whom to
+/// verify or remove before keys can be shared, and who lacks the current key.
+#[tauri::command]
+pub async fn get_device_trust(
+    ctx: State<'_, AppContext>,
+) -> Result<Vec<crate::key_sync::Member>, String> {
+    device_trust(&ctx).await
+}
+
+async fn device_trust(ctx: &AppContext) -> Result<Vec<crate::key_sync::Member>, String> {
+    let own_id = ctx.config.read().await.device_id.clone();
+    let api = ctx.api.lock().await;
+    crate::key_sync::other_members(&api, &own_id, &ctx.config_dir).await
+}
+
+/// Shares the group key with an approved device that lacks it, once both devices
+/// showed the same pairing code (started with `begin_device_approval`): trusts the
+/// identity just compared, then rotates so every verified member gets the key.
+/// Can be repeated for the same session after the devices in the way are handled.
+#[tauri::command]
+pub async fn confirm_key_share(
+    ctx: State<'_, AppContext>,
+    device_id: String,
+    session_id: String,
+    code: String,
+) -> Result<(), String> {
+    share_key_after_pairing(&ctx, &device_id, &session_id, &code).await
+}
+
+async fn share_key_after_pairing(
+    ctx: &AppContext,
+    device_id: &str,
+    session_id: &str,
+    code: &str,
+) -> Result<(), String> {
+    let candidate = ctx
+        .pairing
+        .lock()
+        .await
+        .get(session_id)
+        .cloned()
+        .ok_or("Pairing session is missing; start again")?;
+    if candidate.incoming
+        || candidate.peer.id != device_id
+        || !code_matches(&candidate, code)
+        || candidate.started.elapsed() > MFA_TICKET_TTL
+    {
+        return Err("Pairing code or session changed; start again".into());
+    }
+    if candidate.sas.is_none() {
+        return Err("Wait until both devices show the same 8-digit code".into());
+    }
+    let key = KeyPair::parse_public_key(&candidate.peer.public_key).map_err(|e| e.to_string())?;
+    {
+        let _operation = ctx.key_operations.lock().await;
+        let listed = ctx
+            .api
+            .lock()
+            .await
+            .get_device_keys()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !listed
+            .devices
+            .iter()
+            .any(|d| d.id == device_id && d.status == DeviceStatus::Approved)
+        {
+            return Err(
+                "Only approved devices can receive the key; approve this one instead".into(),
+            );
+        }
+        crate::crypto::verify::KeyVerifier::new(&ctx.config_dir)
+            .map_err(|e| e.to_string())?
+            .pin_after_approval(device_id, &key)
+            .map_err(|e| e.to_string())?;
+    }
+    update_keys(ctx, true).await?;
+    ctx.pairing.lock().await.remove(session_id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -3963,6 +4120,7 @@ mod tests {
             last_seen: None,
             online: false,
             status,
+            has_current_key: None,
         }
     }
 
@@ -4488,5 +4646,334 @@ mod tests {
             serde_json::from_value::<SignInAction>(json!({"action": "set_aside_keys"})).unwrap(),
             SignInAction::SetAsideKeys
         );
+    }
+
+    // ---- device approval -----------------------------------------------------
+
+    use crate::key_sync::tests::{NOT_APPROVED, requests, signed_in};
+
+    #[tokio::test]
+    async fn a_pending_device_publishes_its_key_and_reaches_its_approval_status() {
+        const WAITING: &str = r#"{"pairing_version":3,"status":"pending"}"#;
+        let (base_url, log) = serve(vec![
+            (403, NOT_APPROVED),
+            (204, ""),
+            (200, WAITING),
+            (200, WAITING),
+        ])
+        .await;
+        let (_dir, ctx) = context();
+        *ctx.api.lock().await = signed_in(&base_url);
+        ctx.config.write().await.device_id = uuid::Uuid::new_v4().to_string();
+        *ctx.exchange.lock().await =
+            Some(KeyExchange::new(crate::crypto::keys::DeviceKeys::generate()));
+
+        let status = my_approval_status(&ctx).await.unwrap();
+        assert_eq!(status.status, "pending");
+        assert!(!status.locally_verified);
+        // Published once, not on every poll.
+        my_approval_status(&ctx).await.unwrap();
+        assert_eq!(
+            requests(&log),
+            [
+                "GET /api/devices/keys",
+                "PUT /api/devices/me/encryption-key",
+                "GET /api/device-approvals/me",
+                "GET /api/device-approvals/me",
+            ]
+        );
+    }
+
+    // ---- sharing the key with a member that lacks it --------------------------
+
+    use crate::key_sync::KEY_SHARING_BLOCKED;
+    use crate::key_sync::tests::{Mesh, device_client, listed};
+
+    /// Approved devices on a relay whose current key is version 1.
+    async fn mesh(
+        names: &[&str],
+    ) -> (
+        String,
+        Arc<std::sync::Mutex<Mesh>>,
+        Vec<(String, DeviceKeys)>,
+    ) {
+        let members: Vec<(String, DeviceKeys)> = names
+            .iter()
+            .map(|_| (uuid::Uuid::new_v4().to_string(), DeviceKeys::generate()))
+            .collect();
+        let listing = members
+            .iter()
+            .zip(names)
+            .map(|((id, keys), name)| listed(id, name, keys))
+            .collect();
+        let (base_url, relay) = Mesh::start(listing, 1).await;
+        (base_url, relay, members)
+    }
+
+    /// This device, signed in to `base_url` and holding version 1 of the key.
+    async fn member(
+        base_url: &str,
+        (id, keys): &(String, DeviceKeys),
+    ) -> (tempfile::TempDir, AppContext) {
+        let (dir, ctx) = context();
+        *ctx.api.lock().await = device_client(base_url, id);
+        ctx.config.write().await.device_id = id.clone();
+        let mut exchange = KeyExchange::new(keys.clone());
+        exchange.add_key_version(1, vec![1; 32]).unwrap();
+        *ctx.exchange.lock().await = Some(exchange);
+        (dir, ctx)
+    }
+
+    fn trust(dir: &tempfile::TempDir, (id, keys): &(String, DeviceKeys)) {
+        KeyVerifier::new(dir.path())
+            .unwrap()
+            .pin_after_approval(id, &keys.identity.public)
+            .unwrap();
+    }
+
+    /// What `begin_device_approval` and `poll_device_approval` leave behind once
+    /// both screens show `sas`.
+    async fn paired(ctx: &AppContext, (id, keys): &(String, DeviceKeys), sas: &str) -> String {
+        let session = uuid::Uuid::new_v4().to_string();
+        ctx.pairing.lock().await.insert(
+            session.clone(),
+            PairingCandidate {
+                peer: DeviceIdentity {
+                    id: id.clone(),
+                    public_key: keys.identity.public_key_bytes(),
+                },
+                peer_encryption: None,
+                fingerprint: "AB".repeat(32),
+                nonce: Some([1; 32]),
+                commit: Some([2; 32]),
+                sas: Some(sas.into()),
+                started: Instant::now(),
+                incoming: false,
+            },
+        );
+        session
+    }
+
+    #[tokio::test]
+    async fn sharing_the_key_takes_the_pairing_code_and_every_member_verified() {
+        let (base_url, relay, devices) = mesh(&["Studio", "Mac", "Phone"]).await;
+        let (studio, mac, phone) = (&devices[0], &devices[1], &devices[2]);
+        let (dir, ctx) = member(&base_url, studio).await;
+        let session = paired(&ctx, mac, "1234 5678").await;
+
+        // Nothing moves without the code both screens showed, for that device.
+        for (device, code) in [(&mac.0, "8765 4321"), (&phone.0, "1234 5678")] {
+            assert_eq!(
+                share_key_after_pairing(&ctx, device, &session, code)
+                    .await
+                    .unwrap_err(),
+                "Pairing code or session changed; start again"
+            );
+        }
+        // The phone was never verified here, so a new key can't reach every member.
+        let error = share_key_after_pairing(&ctx, &mac.0, &session, "1234 5678")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            format!("{KEY_SHARING_BLOCKED} Phone (not verified on this device)")
+        );
+        assert!(!relay.lock().unwrap().holds_current_key(&mac.0));
+        assert!(
+            KeyVerifier::new(dir.path()).unwrap().is_pinned(&mac.0),
+            "the code confirmed the Mac's identity"
+        );
+
+        // Once the phone is verified, the same pairing completes the share.
+        trust(&dir, phone);
+        share_key_after_pairing(&ctx, &mac.0, &session, "12345678")
+            .await
+            .unwrap();
+        assert!(relay.lock().unwrap().holds_current_key(&mac.0));
+        assert!(relay.lock().unwrap().holds_current_key(&phone.0));
+        assert_eq!(
+            ctx.exchange.lock().await.as_ref().unwrap().current_version,
+            2
+        );
+        assert!(
+            ctx.pairing.lock().await.is_empty(),
+            "the session is used up"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_approved_devices_receive_the_key_by_sharing() {
+        let (base_url, relay, devices) = mesh(&["Studio", "New"]).await;
+        relay.lock().unwrap().devices[1].status = DeviceStatus::Pending;
+        let (dir, ctx) = member(&base_url, &devices[0]).await;
+        let session = paired(&ctx, &devices[1], "1234 5678").await;
+
+        assert_eq!(
+            share_key_after_pairing(&ctx, &devices[1].0, &session, "1234 5678")
+                .await
+                .unwrap_err(),
+            "Only approved devices can receive the key; approve this one instead"
+        );
+        assert!(
+            !KeyVerifier::new(dir.path())
+                .unwrap()
+                .is_pinned(&devices[1].0)
+        );
+    }
+
+    #[tokio::test]
+    async fn verifying_a_member_that_lacks_the_key_shares_it() {
+        let (base_url, relay, devices) = mesh(&["Studio", "Mac"]).await;
+        let mac = &devices[1];
+        let (_dir, ctx) = member(&base_url, &devices[0]).await;
+        let fingerprint = KeyPair::fingerprint(&mac.1.identity.public);
+
+        assert!(verify_member(&ctx, &mac.0, &"0".repeat(64)).await.is_err());
+        assert_eq!(
+            verify_member(&ctx, &mac.0, &fingerprint).await.unwrap(),
+            KeyUpdate {
+                shared: true,
+                blocked: None
+            }
+        );
+        assert!(relay.lock().unwrap().holds_current_key(&mac.0));
+        // A member that holds the key keeps it; nothing rotates again.
+        assert_eq!(
+            verify_member(&ctx, &mac.0, &fingerprint).await.unwrap(),
+            KeyUpdate::default()
+        );
+        assert_eq!(
+            ctx.exchange.lock().await.as_ref().unwrap().current_version,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn a_removal_succeeds_even_while_the_new_key_waits_for_another_device() {
+        let (base_url, relay, devices) = mesh(&["Studio", "Mac", "Old laptop"]).await;
+        let (mac, old) = (&devices[1], &devices[2]);
+        let (dir, ctx) = member(&base_url, &devices[0]).await;
+        trust(&dir, old);
+
+        let update = remove_member(&ctx, &old.0).await.unwrap();
+        assert_eq!(
+            update.blocked,
+            Some(format!(
+                "{KEY_SHARING_BLOCKED} Mac (not verified on this device)"
+            ))
+        );
+        assert_eq!(relay.lock().unwrap().devices.len(), 2);
+        assert!(
+            ctx.rotation_pending.load(Ordering::SeqCst),
+            "sending stays paused until the key changes"
+        );
+
+        // Verifying the Mac lets the waiting rotation run.
+        let fingerprint = KeyPair::fingerprint(&mac.1.identity.public);
+        assert_eq!(
+            verify_member(&ctx, &mac.0, &fingerprint).await.unwrap(),
+            KeyUpdate {
+                shared: true,
+                blocked: None
+            }
+        );
+        assert!(!ctx.rotation_pending.load(Ordering::SeqCst));
+        assert!(relay.lock().unwrap().holds_current_key(&mac.0));
+    }
+
+    #[tokio::test]
+    async fn the_devices_page_learns_who_lacks_the_key_and_who_is_unverified() {
+        let (base_url, relay, devices) = mesh(&["Studio", "Mac"]).await;
+        relay.lock().unwrap().give_current_key(&devices[0].0);
+        let (_dir, ctx) = member(&base_url, &devices[0]).await;
+
+        let trust = device_trust(&ctx).await.unwrap();
+        let json = serde_json::to_value(&trust).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!([{
+                "id": devices[1].0,
+                "name": "Mac",
+                "verified": false,
+                "trust": "unverified",
+                "can_receive_keys": true,
+                "has_current_key": false,
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_device_without_the_key_accepts_it_once_it_verifies_the_sharer() {
+        let (base_url, relay, devices) = mesh(&["Studio", "Mac"]).await;
+        let (studio, mac) = (&devices[0], &devices[1]);
+        let (_studio_dir, studio_ctx) = member(&base_url, studio).await;
+        // The Mac has none of the account's keys
+        let (_mac_dir, mac_ctx) = context();
+        *mac_ctx.api.lock().await = device_client(&base_url, &mac.0);
+        mac_ctx.config.write().await.device_id = mac.0.clone();
+        *mac_ctx.exchange.lock().await = Some(KeyExchange::new(mac.1.clone()));
+
+        assert!(refresh_keys(&mac_ctx).await.is_err());
+        assert_eq!(
+            mac_ctx.key_problem(),
+            Some(KeyProblem {
+                server_version: 1,
+                shared_by: None
+            })
+        );
+
+        // "Verify this device there": the studio compares the Mac's fingerprint and,
+        // as the relay lists the Mac without the key, shares it
+        let mac_fingerprint = KeyPair::fingerprint(&mac.1.identity.public);
+        assert_eq!(
+            verify_member(&studio_ctx, &mac.0, &mac_fingerprint)
+                .await
+                .unwrap(),
+            KeyUpdate {
+                shared: true,
+                blocked: None
+            }
+        );
+        assert!(relay.lock().unwrap().holds_current_key(&mac.0));
+
+        // The Mac learns who sent it, but accepts nothing from a device it hasn't verified
+        assert!(refresh_keys(&mac_ctx).await.is_err());
+        assert_eq!(
+            mac_ctx.key_problem(),
+            Some(KeyProblem {
+                server_version: 2,
+                shared_by: Some(studio.0.clone())
+            })
+        );
+        assert!(
+            !mac_ctx
+                .exchange
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .has_group_key()
+        );
+
+        // Verifying the studio on the Mac lets the key in; nothing rotates again
+        let studio_fingerprint = KeyPair::fingerprint(&studio.1.identity.public);
+        assert_eq!(
+            verify_member(&mac_ctx, &studio.0, &studio_fingerprint)
+                .await
+                .unwrap(),
+            KeyUpdate::default()
+        );
+        assert_eq!(mac_ctx.key_problem(), None);
+        assert_eq!(
+            mac_ctx
+                .exchange
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .current_version,
+            2
+        );
+        assert!(relay.lock().unwrap().holds_current_key(&mac.0));
     }
 }

@@ -95,7 +95,7 @@ describe('recovery', () => {
 	});
 
 	it('offers the backups that fix the missing key first', () => {
-		const problem = { server_version: 4 };
+		const problem = { server_version: 4, shared_by: null };
 		const fixes = backup({ path: '/a', versions: [3, 4] });
 		const older = backup({ path: '/b', versions: [1, 2] });
 		const unreadable = backup({ path: '/c', versions: [], problem: 'Neither key opens it' });
@@ -118,21 +118,21 @@ describe('recovery', () => {
 
 	it('names the devices a new key cannot reach yet', () => {
 		const devices: KeyMember[] = [
-			{ id: 'ok', name: 'Mac', verified: true, can_receive_keys: true },
-			{ id: 'unverified', name: 'Phone', verified: false, can_receive_keys: true },
-			{ id: 'outdated', name: 'Old', verified: true, can_receive_keys: false },
+			{ id: 'ok', name: 'Mac', verified: true, trust: 'verified', can_receive_keys: true, has_current_key: true },
+			{ id: 'unverified', name: 'Phone', verified: false, trust: 'unverified', can_receive_keys: true, has_current_key: true },
+			{ id: 'outdated', name: 'Old', verified: true, trust: 'verified', can_receive_keys: false, has_current_key: null },
 		];
 		expect(recovery.resetBlockers(devices).map((d) => d.id)).toEqual(['unverified', 'outdated']);
 		expect(recovery.resetBlockers([])).toEqual([]);
 	});
 
 	it('follows the key problem and installed updates the backend reports', async () => {
-		mocks.invoke.mockImplementation(async (command: string) => (command === 'get_key_problem' ? { server_version: 4 } : false));
+		mocks.invoke.mockImplementation(async (command: string) => (command === 'get_key_problem' ? { server_version: 4, shared_by: null } : false));
 		const stop = recovery.watchRecovery();
 		await flush();
 		expect(mocks.invoke).toHaveBeenCalledWith('get_key_problem');
 		expect(mocks.invoke).toHaveBeenCalledWith('update_installed');
-		expect(recovery.recovery.keyProblem).toEqual({ server_version: 4 });
+		expect(recovery.recovery.keyProblem).toEqual({ server_version: 4, shared_by: null });
 		expect(recovery.recovery.updateInstalled).toBe(false);
 
 		mocks.handlers.get('key-problem-changed')?.({ payload: null });

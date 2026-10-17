@@ -279,6 +279,10 @@ pub async fn handle_list_devices(
         Ok(d) => d,
         Err(_) => return json_error("failed to list devices", StatusCode::INTERNAL_SERVER_ERROR),
     };
+    let holders = match state.db.current_key_holders(claims.user_id).await {
+        Ok(holders) => holders,
+        Err(e) => return super::middleware::ApiError::internal(e).into_response(),
+    };
 
     let mut infos = Vec::new();
     for d in devices {
@@ -291,10 +295,22 @@ pub async fn handle_list_devices(
             "name": d.name,
             "last_seen": d.last_seen.map(|t| t.to_rfc3339()),
             "online": online,
+            "has_current_key": has_current_key(&d, holders.as_ref()),
             "status": d.status,
         }));
     }
     json_response(StatusCode::OK, infos)
+}
+
+/// Whether an approved device holds a wrap of the current group key; `None` when
+/// that does not apply. Shown so a key holder can offer to share the key.
+fn has_current_key(
+    device: &crate::models::Device,
+    holders: Option<&std::collections::HashSet<uuid::Uuid>>,
+) -> Option<bool> {
+    holders
+        .filter(|_| device.status == "approved")
+        .map(|holders| holders.contains(&device.id))
 }
 
 pub async fn handle_delete_device(
@@ -375,6 +391,10 @@ pub async fn handle_get_device_keys(
             );
         }
     };
+    let holders = match state.db.current_key_holders(claims.user_id).await {
+        Ok(holders) => holders,
+        Err(e) => return super::middleware::ApiError::internal(e).into_response(),
+    };
 
     let infos: Vec<proto::DeviceInfo> = devices
         .iter()
@@ -388,6 +408,7 @@ pub async fn handle_get_device_keys(
             last_seen: None,
             online: false,
             status: d.status.parse().unwrap(),
+            has_current_key: has_current_key(d, holders.as_ref()),
         })
         .collect();
 

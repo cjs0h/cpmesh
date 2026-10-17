@@ -14,6 +14,8 @@ export interface DeviceInfo {
 	last_seen?: string;
 	online: boolean;
 	status: 'pending' | 'approved' | 'rejected' | 'revoked';
+	/** Approved devices: whether the relay holds this device's copy of the current key (absent on older servers). */
+	has_current_key?: boolean | null;
 }
 
 export interface HistoryEntry {
@@ -195,8 +197,26 @@ export async function getDevices(): Promise<DeviceInfo[]> {
 	return invoke('get_devices');
 }
 
-export async function removeDevice(deviceId: string): Promise<void> {
+/** What happened to the encryption key after removing or verifying a device. */
+export interface KeyUpdate {
+	/** The verified device lacked the current key and now has it. */
+	shared: boolean;
+	/** Why the key couldn't change yet; the removal or verification itself succeeded. */
+	blocked: string | null;
+}
+
+export async function removeDevice(deviceId: string): Promise<KeyUpdate> {
 	return invoke('remove_device', { deviceId });
+}
+
+/** The account's other approved devices, and how this device trusts each. */
+export async function getDeviceTrust(): Promise<KeyMember[]> {
+	return invoke('get_device_trust');
+}
+
+/** Shares the key with an approved device once both screens show the same pairing code (session from `beginDeviceApproval`). */
+export async function confirmKeyShare(deviceId: string, sessionId: string, code: string): Promise<void> {
+	return invoke('confirm_key_share', { deviceId, sessionId, code });
 }
 
 // === Device Approval ===
@@ -221,6 +241,8 @@ export interface MyApprovalStatus {
 	approval_code?: string;
 	sas?: string | null;
 	session_id?: string;
+	/** The device on the other end of the pairing. */
+	approver_id?: string | null;
 	locally_verified: boolean;
 }
 
@@ -249,7 +271,7 @@ export async function getOwnIdentity(): Promise<{ device_id: string; fingerprint
 	return invoke('get_own_identity');
 }
 
-export async function verifyDeviceIdentity(deviceId: string, fingerprint: string): Promise<void> {
+export async function verifyDeviceIdentity(deviceId: string, fingerprint: string): Promise<KeyUpdate> {
 	return invoke('verify_device_identity', { deviceId, fingerprint });
 }
 
@@ -368,6 +390,8 @@ export async function restartApp(): Promise<void> {
 /** This device lacks the account's current encryption key. */
 export interface KeyProblem {
 	server_version: number;
+	/** A device that shared the key with this one but isn't verified here yet */
+	shared_by: string | null;
 }
 
 export interface KeyBackup {
@@ -386,14 +410,21 @@ export interface KeyBackup {
 	problem: string | null;
 }
 
+/** How this device trusts an approved device's identity. */
+export type Trust = 'verified' | 'unverified' | 'key_changed' | 'revoked';
+
 /** Another approved device: one may still have the key, and new keys reach it only once it's verified here. */
 export interface KeyMember {
 	id: string;
 	name: string;
-	/** Verified on this device (full fingerprint comparison) */
+	/** Verified on this device (full fingerprint or pairing code, or a signed membership) */
 	verified: boolean;
+	/** Why it isn't, when it isn't: never verified, its identity changed, or removed earlier */
+	trust: Trust;
 	/** It published a certified encryption key (an up-to-date cpmesh) */
 	can_receive_keys: boolean;
+	/** The relay's word on whether it holds the current key; null on older servers */
+	has_current_key: boolean | null;
 }
 
 export interface KeyRecoveryStatus {

@@ -966,7 +966,7 @@ pub(crate) mod tests {
     pub(crate) struct Recorded {
         pub(crate) method: String,
         pub(crate) path: String,
-        authorization: Option<String>,
+        pub(crate) authorization: Option<String>,
         pub(crate) body: String,
     }
 
