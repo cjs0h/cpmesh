@@ -2,7 +2,7 @@
 //!
 //! Release installers are signed with the project's update key (`tauri signer sign
 //! --app-version <version>`, see `scripts/release/sign-installers.sh`), and the public
-//! half is compiled into the app from `updater-key.pub`. An installer is only launched
+//! half is compiled into the app from `updater-key.pub`. An installer is only installed
 //! when its signature verifies against that key, the version it was signed for is newer
 //! than the running app, and it was built for this platform. A compromised server can
 //! therefore neither push its own binary nor roll users back to an older release.

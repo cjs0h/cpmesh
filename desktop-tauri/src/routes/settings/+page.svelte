@@ -165,11 +165,11 @@
 		if (!updateInfo) return;
 		downloadingUpdate = true;
 		try {
+			// Once installed, the new version starts in place of this one
 			await downloadAndInstallUpdate(updateInfo.download_url);
 		} catch (e) {
-			toast.error('Update failed', errorMessage(e));
-		} finally {
 			downloadingUpdate = false;
+			toast.error('Update failed', errorMessage(e));
 		}
 	}
 

@@ -371,6 +371,10 @@ export async function checkUpdate(): Promise<UpdateInfo | null> {
 	return invoke('check_update');
 }
 
+/**
+ * Downloads the update, checks its signature and installs it, then cpmesh restarts into the
+ * new version (on Windows, its installer starts it once cpmesh has quit).
+ */
 export async function downloadAndInstallUpdate(downloadUrl: string): Promise<void> {
 	return invoke('download_and_install_update', { downloadUrl });
 }

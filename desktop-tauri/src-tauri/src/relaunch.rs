@@ -1,12 +1,13 @@
 //! Hands over to a newer cpmesh installed over the running one.
 //!
-//! Closing the window leaves cpmesh running in the tray, so an update (a package
-//! upgrade, the in-app updater's installer, a replaced AppImage) leaves the previous
-//! version running from an executable that has since been replaced. Opening cpmesh
-//! again would only bring that version back: the single-instance plugin hands every
-//! launch to the running process. So the running process remembers the executable it
-//! started from, and when a launch arrives after that file changed, it exits and
-//! starts the new version with the launch's arguments instead.
+//! Closing the window leaves cpmesh running in the tray, so an update installed outside
+//! the app (a package upgrade, a replaced AppImage) leaves the previous version running
+//! from an executable that has since been replaced. Opening cpmesh again would only
+//! bring that version back: the single-instance plugin hands every launch to the
+//! running process. So the running process remembers the executable it started from,
+//! and when a launch arrives after that file changed, it exits and starts the new
+//! version with the launch's arguments instead. (The in-app updater restarts into the
+//! version it installed by itself, see `install`.)
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -127,6 +128,12 @@ pub fn on_exit(app: &AppHandle) {
     };
     let mut env = app.env();
     env.args_os = args;
+    // An APPIMAGE inherited from another AppImage (cpmesh started from its terminal) would
+    // start that AppImage
+    #[cfg(target_os = "linux")]
+    if !crate::install::is_appimage() {
+        env.appimage = None;
+    }
     app.cleanup_before_exit();
     tauri::process::restart(&env);
 }

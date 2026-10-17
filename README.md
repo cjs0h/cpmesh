@@ -250,8 +250,23 @@ for at least 24 hours, and MCP retains up to 32 encrypted requests/receipts for 
 
 ### Updating the desktop app
 
-cpmesh keeps running in the tray after its window is closed, so an update (a package upgrade, the in-app updater's
-installer or a new AppImage) leaves the previous version running until it restarts. Opening cpmesh again starts the new
+**Install update** (in the update banner or under **Settings → About**) downloads the new version, checks its signature
+(see [Signing updates](CONTRIBUTING.md#signing-updates)), installs it over the running one and restarts cpmesh into it:
+
+- **Linux package (.deb)**: the package manager (`apt-get`) upgrades it once you enter your password in the system's
+  dialog (polkit). It doesn't go through the App Center, which can't upgrade an installed package from a file.
+- **AppImage**: the new AppImage replaces the file you run.
+- **macOS**: the app from the new disk image replaces the one you run, asking for an administrator's password only when
+  you can't change its folder. An app opened where it was downloaded runs from a read-only copy and can't be replaced:
+  move it to Applications first.
+- **Windows**: the installer runs with just a progress bar, closes cpmesh, and starts the new version when it's done.
+
+Versions up to 0.4.1 open the downloaded installer instead, which can't replace the running app: quit cpmesh from its
+tray (menu bar) icon, then run the installer, or on Linux install the package from a terminal
+(`sudo apt install ./cpmesh-<version>-linux-amd64.deb`).
+
+cpmesh keeps running in the tray after its window is closed, so an update installed another way (a package upgrade or a
+new AppImage) leaves the previous version running until it restarts. Opening cpmesh again starts the new
 version: on Linux, launching an upgraded package ends your previous version still running the replaced binary (never
 another user's); otherwise the running version restarts into the new one with the launch's arguments (a `cpmesh://`
 sign-in link stays with the version that started the sign-in). While the window is open, a **Restart now** banner appears

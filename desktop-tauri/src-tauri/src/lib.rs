@@ -5,6 +5,8 @@ mod crypto;
 mod device_keys;
 mod fingerprint;
 mod history;
+#[cfg(desktop)]
+mod install;
 mod key_backup;
 mod key_sync;
 mod proto;
@@ -16,6 +18,7 @@ mod shortcut;
 mod state;
 #[cfg(desktop)]
 mod tray;
+#[cfg(desktop)]
 mod updater;
 mod ws;
 
