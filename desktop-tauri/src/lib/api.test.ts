@@ -114,6 +114,26 @@ describe('Tauri command wrappers', () => {
 			'exchange_oauth_code',
 			{ serverUrl: 'https://s', code: 'code', codeVerifier: 'verifier' },
 		],
+		[
+			'resolveSignIn (set keys aside)',
+			() => api.resolveSignIn({ action: 'set_aside_keys' }),
+			'resolve_sign_in',
+			{ action: { action: 'set_aside_keys' } },
+		],
+		[
+			'resolveSignIn (replace a registration)',
+			() => api.resolveSignIn({ action: 'replace_device', device_id: 'd1', waiting_device_ids: ['d2'] }),
+			'resolve_sign_in',
+			{ action: { action: 'replace_device', device_id: 'd1', waiting_device_ids: ['d2'] } },
+		],
+		['cancelSignIn', () => api.cancelSignIn(), 'cancel_sign_in', undefined],
+		['getKeyProblem', () => api.getKeyProblem(), 'get_key_problem', undefined],
+		['getKeyRecoveryStatus', () => api.getKeyRecoveryStatus(), 'get_key_recovery_status', undefined],
+		['inspectKeyBackup', () => api.inspectKeyBackup('/b'), 'inspect_key_backup', { path: '/b' }],
+		['restoreKeyBackup', () => api.restoreKeyBackup('/b'), 'restore_key_backup', { path: '/b' }],
+		['resetEncryption', () => api.resetEncryption(4), 'reset_encryption', { expectedVersion: 4 }],
+		['updateInstalled', () => api.updateInstalled(), 'update_installed', undefined],
+		['restartApp', () => api.restartApp(), 'restart_app', undefined],
 	] as const)('%s invokes the matching command', async (_name, call, command, args) => {
 		await call();
 		expect(invoke).toHaveBeenCalledTimes(1);

@@ -38,6 +38,7 @@
 	import SettingsGroup from '#lib/components/ui/SettingsGroup.svelte';
 	import Skeleton from '#lib/components/ui/Skeleton.svelte';
 	import Switch from '#lib/components/ui/Switch.svelte';
+	import EncryptionKeys from '#lib/components/EncryptionKeys.svelte';
 
 	const desktop = isDesktop();
 	const status = $derived(getStatusValue());
@@ -334,6 +335,8 @@
 				{/snippet}
 			</SettingRow>
 		</SettingsGroup>
+
+		<EncryptionKeys />
 
 		<SettingsGroup title="Appearance">
 			<SettingRow label="Theme" description="Follow your system, or keep cpmesh light or dark.">

@@ -160,10 +160,9 @@ pub async fn handle_ws_upgrade(
             .and_then(|value| value.to_str().ok())
             != Some(PROTOCOL_VERSION)
     {
-        return json_error(
-            &format!("update your client: WebSocket protocol {PROTOCOL_VERSION} is required"),
-            StatusCode::UPGRADE_REQUIRED,
-        );
+        return super::middleware::upgrade_required(&format!(
+            "WebSocket protocol {PROTOCOL_VERSION} is required"
+        ));
     }
 
     let replacing = if let Some(id) = claims.device_id {

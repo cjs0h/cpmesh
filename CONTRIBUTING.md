@@ -65,6 +65,10 @@ cargo test --workspace
 cd desktop-tauri/src-tauri && cargo test
 ```
 
+Desktop tests never touch the OS credential store (in test builds `SecureStore::new` stores secrets
+in files) or a real relay: sign-in, key recovery and rotation flows run against stateful fake relays
+built with `serve_with` in `src/api/client.rs`.
+
 The server's PostgreSQL integration tests (`crates/cpmesh-server/tests/db.rs`) are skipped unless
 `TEST_DATABASE_URL` is set. Each test migrates into its own throwaway schema, so any scratch
 database works — for example with Docker:

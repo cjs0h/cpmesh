@@ -1,7 +1,7 @@
 use log::{debug, error, info};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -18,6 +18,8 @@ use crate::crypto::keys::{KeyPair, derive_approval_code};
 use crate::crypto::verify::{KeyVerifier, ReplayGuard};
 use crate::device_keys::DeviceKeyStore;
 use crate::history::History;
+use crate::key_backup::{self, BackupInfo};
+use crate::key_sync::{AccountKeys, Owner, SyncError};
 use crate::proto::models::*;
 use crate::state::AppState;
 use crate::ws::connection::{TokenProvider, WsConnection, WsEvent};
@@ -74,6 +76,100 @@ impl PendingMfaLogin {
     }
 }
 
+/// How long a sign-in waits for the user's decision about keys saved here.
+const SIGN_IN_DECISION_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// Who is signing in, and as which device.
+#[derive(Clone)]
+struct SignIn {
+    server_url: String,
+    user_id: String,
+    device_name: String,
+    /// The account as the user knows it (email or username), for the decision screens.
+    account: String,
+}
+
+/// A sign-in that stopped before setting up this device, because the user decides what
+/// happens to keys saved here first. Its session stays in `AppContext::api`.
+struct PendingSignIn {
+    sign_in: SignIn,
+    decision: SignInDecision,
+    started: Instant,
+    /// The user's choice was carried out, but the sign-in failed after it; trying
+    /// again only retries the sign-in.
+    applied: bool,
+}
+
+/// What the user decides before a sign-in can set up this device.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SignInDecision {
+    /// Keys saved by a version from before cpmesh recorded whose they are.
+    UnknownKeys {
+        account: String,
+        /// Whether this device's key opens them; keys it can't open can only be set aside.
+        readable: bool,
+        /// A device on the account that has this computer's device key, which makes it
+        /// likely that they are this account's.
+        matching_device: Option<String>,
+    },
+    /// Keys recorded as another account's.
+    OtherAccountKeys {
+        account: String,
+        owner_server: String,
+        /// Keys this account kept here earlier come back too.
+        returning: bool,
+    },
+    /// Keys this device's key can't open: its identity was reset or replaced.
+    UnreadableKeys { account: String },
+    /// The account has this computer registered under device keys it no longer has.
+    ReplaceDevice {
+        account: String,
+        /// The registration the server says is this computer's, or the likeliest one.
+        suggested_device_id: Option<String>,
+        devices: Vec<AccountDevice>,
+        /// Key backups on this computer.
+        backups: usize,
+        /// The backup holding the device key of the suggested registration, if one does.
+        matching_backup: Option<String>,
+    },
+}
+
+/// One of the account's devices, for choosing the registration to replace.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AccountDevice {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub last_seen: Option<String>,
+    pub online: bool,
+}
+
+/// The user's answer to a [`SignInDecision`].
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum SignInAction {
+    /// The saved keys are this account's.
+    UseSavedKeys,
+    /// Move them into a backup folder, then continue.
+    SetAsideKeys,
+    /// Remove this computer's old registration and register it again. When that was
+    /// the account's only approved device, the devices waiting for approval go too:
+    /// only a registration on an account without devices is approved by itself.
+    ReplaceDevice {
+        device_id: String,
+        #[serde(default)]
+        waiting_device_ids: Vec<String>,
+    },
+}
+
+/// Why this device can't keep its keys up to date, for the recovery screen.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct KeyProblem {
+    /// The account's current key version, which this device doesn't have.
+    pub server_version: i32,
+}
+
 /// Shared application state managed by Tauri.
 pub struct AppContext {
     pub config: RwLock<AppConfig>,
@@ -101,6 +197,12 @@ pub struct AppContext {
     /// Set once this process confirmed the relay lists our current encryption key.
     encryption_key_published: AtomicBool,
     rotation_pending: AtomicBool,
+    /// The sign-in waiting for a decision about keys saved here. Lock after `api`.
+    pending_sign_in: Mutex<Option<PendingSignIn>>,
+    /// Set while this device lacks the account's current group key.
+    key_problem: std::sync::Mutex<Option<KeyProblem>>,
+    /// Tells the window about key problems (not set in tests).
+    app: std::sync::OnceLock<tauri::AppHandle>,
 }
 
 #[derive(Clone)]
@@ -172,7 +274,46 @@ impl AppContext {
             key_operations: Mutex::new(()),
             rotation_pending: AtomicBool::new(false),
             encryption_key_published: AtomicBool::new(false),
+            pending_sign_in: Mutex::new(None),
+            key_problem: std::sync::Mutex::new(None),
+            app: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Lets the context notify the window (`key-problem-changed`).
+    pub fn attach(&self, app: tauri::AppHandle) {
+        let _ = self.app.set(app);
+    }
+
+    pub fn key_problem(&self) -> Option<KeyProblem> {
+        self.key_problem
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn set_key_problem(&self, problem: Option<KeyProblem>) {
+        {
+            let mut current = self.key_problem.lock().unwrap_or_else(|e| e.into_inner());
+            if *current == problem {
+                return;
+            }
+            current.clone_from(&problem);
+        }
+        if let Some(app) = self.app.get() {
+            let _ = app.emit("key-problem-changed", problem);
+        }
+    }
+
+    /// Pauses a sign-in for the user's `decision`.
+    async fn ask(&self, sign_in: SignIn, decision: SignInDecision) -> LoginStep {
+        *self.pending_sign_in.lock().await = Some(PendingSignIn {
+            sign_in,
+            decision: decision.clone(),
+            started: Instant::now(),
+            applied: false,
+        });
+        LoginStep::DecisionRequired(decision)
     }
 
     /// Takes the sign-in waiting for its second factor, unless it has expired.
@@ -196,6 +337,9 @@ pub enum LoginStep {
     VerificationSent,
     /// The password was right; a second factor comes next.
     MfaRequired(MfaPrompt),
+    /// Signed in, but the user decides what happens to keys saved on this device
+    /// before it is set up (`resolve_sign_in`).
+    DecisionRequired(SignInDecision),
 }
 
 /// What the sign-in screen asks for next. The ticket itself stays in the backend.
@@ -228,6 +372,8 @@ impl From<&MfaChallenge> for MfaPrompt {
 pub struct MfaLoginDone {
     /// Set when a recovery code was used: how many unused ones are left.
     pub recovery_codes_remaining: Option<u32>,
+    /// Set when the user decides about keys saved here before this device is set up.
+    pub decision: Option<SignInDecision>,
 }
 
 /// Why the second factor did not finish the sign-in.
@@ -264,7 +410,9 @@ impl MfaLoginError {
                 format!("The server could not check the code (HTTP {status}). Try again."),
                 false,
             ),
-            ApiError::Server { message, .. } => (sentence_case(message), false),
+            ApiError::Server { message, .. } | ApiError::DeviceKeysChanged { message, .. } => {
+                (sentence_case(message), false)
+            }
             ApiError::Http(e) => (format!("Could not reach the server: {e}"), false),
         };
         MfaLoginError { message, restart }
@@ -416,6 +564,7 @@ pub async fn setup_and_login(
     *api = api_client(&server_url, &ctx.config_dir);
     // A new sign-in replaces one that was waiting for its second factor
     ctx.pending_mfa.lock().await.take();
+    ctx.pending_sign_in.lock().await.take();
 
     // Register or login
     if is_register {
@@ -462,8 +611,26 @@ pub async fn setup_and_login(
     };
 
     let user_id = auth_resp.user_id.unwrap_or_default();
-    finish_sign_in(&ctx, &mut api, server_url, user_id, device_name).await?;
-    Ok(LoginStep::SignedIn)
+    finish_sign_in(
+        &ctx,
+        &mut api,
+        SignIn {
+            server_url,
+            user_id,
+            device_name,
+            account: username,
+        },
+    )
+    .await
+}
+
+/// The account as its owner knows it, for the decision screens.
+fn account_label(user: &UserInfo) -> String {
+    if user.email.is_empty() {
+        user.username.clone()
+    } else {
+        user.email.clone()
+    }
 }
 
 /// Finishes the sign-in `setup_and_login` paused for a second factor, then sets up
@@ -476,24 +643,32 @@ pub async fn complete_mfa_login(
 ) -> Result<MfaLoginDone, MfaLoginError> {
     let mut api = ctx.api.lock().await;
     let (pending, verified) = verify_pending_mfa(&ctx, &mut api, method, code.trim()).await?;
+    ctx.pending_sign_in.lock().await.take();
 
     // The ticket is used up, so a failure from here on needs a new sign-in
     let user = api
         .get_me()
         .await
         .map_err(|e| MfaLoginError::restart(format!("Failed to get user info: {e}")))?;
-    finish_sign_in(
+    let step = finish_sign_in(
         &ctx,
         &mut api,
-        pending.server_url,
-        user.id,
-        pending.device_name,
+        SignIn {
+            server_url: pending.server_url,
+            account: account_label(&user),
+            user_id: user.id,
+            device_name: pending.device_name,
+        },
     )
     .await
     .map_err(MfaLoginError::restart)?;
 
     Ok(MfaLoginDone {
         recovery_codes_remaining: verified.recovery_codes_remaining,
+        decision: match step {
+            LoginStep::DecisionRequired(decision) => Some(decision),
+            _ => None,
+        },
     })
 }
 
@@ -532,30 +707,83 @@ async fn verify_pending_mfa(
 
 /// Registers this device for a freshly signed-in session and saves the account: the
 /// device key pair, the group key (once the device is approved), the tokens in secure
-/// storage and the config.
+/// storage and the config. Stops for the user's decision when keys saved here are not
+/// known to be this account's, can't be opened, or when the account has this computer
+/// registered with other device keys; `resolve_sign_in` continues from there.
 async fn finish_sign_in(
     ctx: &AppContext,
     api: &mut ApiClient,
-    server_url: String,
-    user_id: String,
-    device_name: String,
-) -> Result<(), String> {
-    crate::key_sync::bind_account(
+    sign_in: SignIn,
+) -> Result<LoginStep, String> {
+    let previous = ctx.config.read().await.clone();
+    let owner = Owner::new(&sign_in.server_url, &sign_in.user_id);
+    let mut binding = crate::key_sync::account_keys(
         &ctx.config_dir,
-        &server_url,
-        &user_id,
-        &*ctx.config.read().await,
+        &sign_in.server_url,
+        &sign_in.user_id,
+        &previous,
     )?;
-    // Generate stable device fingerprint using the account's user_id
-    let fingerprint = crate::fingerprint::generate_device_fingerprint(&user_id).ok();
-
+    // Back on an account whose keys were archived while another one used this computer
+    if binding == AccountKeys::Ready
+        && key_backup::holds_no_account_files(&ctx.config_dir)
+        && let Some(archived) = key_backup::archived_for(&ctx.config_dir, &owner)
+            .into_iter()
+            .next()
+    {
+        key_backup::bring_back(&ctx.config_dir, &archived)?;
+        binding = crate::key_sync::account_keys(
+            &ctx.config_dir,
+            &sign_in.server_url,
+            &sign_in.user_id,
+            &previous,
+        )?;
+    }
     // Load or generate the device keys (identity + encryption) from the credential store
     let keys = device_keys(ctx).map_err(|e| format!("Key generation failed: {e}"))?;
+    let readable = crate::key_sync::restore(keys.clone(), &ctx.config_dir).is_ok();
+    let account = sign_in.account.clone();
+    let decision = match binding {
+        AccountKeys::Other(other) => Some(SignInDecision::OtherAccountKeys {
+            account,
+            owner_server: other.server,
+            returning: !key_backup::archived_for(&ctx.config_dir, &owner).is_empty(),
+        }),
+        AccountKeys::Unknown => Some(SignInDecision::UnknownKeys {
+            account,
+            readable,
+            matching_device: if readable {
+                device_with_key(api, &keys.identity).await
+            } else {
+                None
+            },
+        }),
+        AccountKeys::Ready if !readable => Some(SignInDecision::UnreadableKeys { account }),
+        AccountKeys::Ready => None,
+    };
+    if let Some(decision) = decision {
+        return Ok(ctx.ask(sign_in, decision).await);
+    }
+    crate::key_sync::bind_account(
+        &ctx.config_dir,
+        &sign_in.server_url,
+        &sign_in.user_id,
+        &previous,
+    )?;
+    // Generate stable device fingerprint using the account's user_id
+    let fingerprint = crate::fingerprint::generate_device_fingerprint(&sign_in.user_id).ok();
+
     // Register device with fingerprint and the certified encryption key
-    let reg_resp = api
-        .register_device(&device_name, &keys, fingerprint)
+    let reg_resp = match api
+        .register_device(&sign_in.device_name, &keys, fingerprint)
         .await
-        .map_err(|e| format!("Device registration failed: {e}"))?;
+    {
+        Ok(response) => response,
+        Err(ApiError::DeviceKeysChanged { device_id, .. }) => {
+            let decision = replacement_decision(ctx, api, &sign_in, &previous, device_id).await?;
+            return Ok(ctx.ask(sign_in, decision).await);
+        }
+        Err(e) => return Err(format!("Device registration failed: {e}")),
+    };
 
     let device_id = reg_resp.device.id.clone();
     let device_status = reg_resp.device.status.to_string();
@@ -574,10 +802,10 @@ async fn finish_sign_in(
 
     // Save config (no tokens in plaintext)
     let mut config = ctx.config.write().await;
-    config.server_url = server_url;
-    config.user_id = user_id;
+    config.server_url = sign_in.server_url;
+    config.user_id = sign_in.user_id;
     config.device_id = device_id;
-    config.device_name = device_name;
+    config.device_name = sign_in.device_name;
     config.device_status = device_status;
     config
         .save(&ctx.config_dir)
@@ -592,7 +820,236 @@ async fn finish_sign_in(
     let db_path = ctx.config_dir.join("history.db");
     *ctx.history.lock().await = Some(History::open(&db_path, 1000).map_err(|e| e.to_string())?);
 
+    Ok(LoginStep::SignedIn)
+}
+
+/// The account's device that uses `identity`, if any: evidence that keys saved under
+/// it belong to this account.
+async fn device_with_key(api: &ApiClient, identity: &KeyPair) -> Option<String> {
+    let public_key = identity.public_key_bytes();
+    api.get_device_keys()
+        .await
+        .ok()?
+        .devices
+        .into_iter()
+        .find(|device| device.public_key.as_deref() == Some(public_key.as_slice()))
+        .map(|device| device.name)
+}
+
+/// Explains a registration the server refused because the account has this computer
+/// registered with other device keys, and which registration that probably is.
+async fn replacement_decision(
+    ctx: &AppContext,
+    api: &ApiClient,
+    sign_in: &SignIn,
+    previous: &AppConfig,
+    reported: Option<String>,
+) -> Result<SignInDecision, String> {
+    let listed = api
+        .get_device_keys()
+        .await
+        .map_err(|e| format!("Could not list your devices: {}", describe_api_error(&e)))?
+        .devices;
+    // The plain listing adds when each device was last seen
+    let seen = api.get_devices().await.unwrap_or_default();
+    let devices: Vec<AccountDevice> = listed
+        .iter()
+        .map(|device| {
+            let seen = seen.iter().find(|d| d.id == device.id);
+            AccountDevice {
+                id: device.id.clone(),
+                name: device.name.clone(),
+                status: device.status.to_string(),
+                last_seen: seen.and_then(|d| d.last_seen.clone()),
+                online: seen.is_some_and(|d| d.online),
+            }
+        })
+        .collect();
+    let listed_id = |id: &String| devices.iter().any(|device| device.id == *id);
+    let same_account = Owner::new(&previous.server_url, &previous.user_id)
+        == Owner::new(&sign_in.server_url, &sign_in.user_id);
+    let suggested = reported
+        .filter(listed_id)
+        // Servers before this version don't say which: this computer's last registration…
+        .or_else(|| Some(previous.device_id.clone()).filter(|id| same_account && listed_id(id)))
+        // …or the only device with this computer's name
+        .or_else(|| {
+            let mut named = devices.iter().filter(|d| d.name == sign_in.device_name);
+            match (named.next(), named.next()) {
+                (Some(device), None) => Some(device.id.clone()),
+                _ => None,
+            }
+        });
+    let backups = key_backup::list(&ctx.config_dir);
+    let old_key = suggested
+        .as_ref()
+        .and_then(|id| listed.iter().find(|device| device.id == *id))
+        .and_then(|device| device.public_key.clone());
+    let matching_backup = old_key.and_then(|old_key| {
+        backups
+            .iter()
+            .find(|folder| key_backup::identity_public_keys(folder).contains(&old_key))
+            .map(|folder| folder.display().to_string())
+    });
+    Ok(SignInDecision::ReplaceDevice {
+        account: sign_in.account.clone(),
+        suggested_device_id: suggested,
+        devices,
+        backups: backups.len(),
+        matching_backup,
+    })
+}
+
+/// Continues a sign-in that stopped for the user's decision about keys saved here.
+#[tauri::command]
+pub async fn resolve_sign_in(
+    ctx: State<'_, AppContext>,
+    action: SignInAction,
+) -> Result<LoginStep, String> {
+    resolve(&ctx, action).await
+}
+
+async fn resolve(ctx: &AppContext, action: SignInAction) -> Result<LoginStep, String> {
+    let mut api = ctx.api.lock().await;
+    let pending = ctx
+        .pending_sign_in
+        .lock()
+        .await
+        .take()
+        .filter(|pending| pending.started.elapsed() < SIGN_IN_DECISION_TTL)
+        .ok_or(MFA_SIGN_IN_EXPIRED)?;
+    if !pending.applied
+        && let Err(error) = apply_sign_in_action(ctx, &api, &pending, action).await
+    {
+        // Nothing changed; the user can try again or choose differently
+        *ctx.pending_sign_in.lock().await = Some(pending);
+        return Err(error);
+    }
+    match finish_sign_in(ctx, &mut api, pending.sign_in.clone()).await {
+        Ok(step) => Ok(step),
+        Err(error) => {
+            *ctx.pending_sign_in.lock().await = Some(PendingSignIn {
+                applied: true,
+                ..pending
+            });
+            Err(error)
+        }
+    }
+}
+
+/// Drops a sign-in that was waiting for the user's decision, and its session.
+#[tauri::command]
+pub async fn cancel_sign_in(ctx: State<'_, AppContext>) -> Result<(), String> {
+    let mut api = ctx.api.lock().await;
+    if ctx.pending_sign_in.lock().await.take().is_some() {
+        *api = ApiClient::new(&AppConfig::default().server_url);
+        TokenStore::new(&ctx.config_dir)
+            .clear()
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
+}
+
+async fn apply_sign_in_action(
+    ctx: &AppContext,
+    api: &ApiClient,
+    pending: &PendingSignIn,
+    action: SignInAction,
+) -> Result<(), String> {
+    let dir = &ctx.config_dir;
+    let sign_in = &pending.sign_in;
+    match (&pending.decision, action) {
+        (SignInDecision::UnknownKeys { readable: true, .. }, SignInAction::UseSavedKeys) => {
+            info!("Recording the saved keys as the signed-in account's, as the user chose");
+            crate::key_sync::record_owner(dir, &sign_in.server_url, &sign_in.user_id)
+        }
+        (SignInDecision::OtherAccountKeys { .. }, SignInAction::SetAsideKeys) => {
+            // Kept for their account, which gets them back when it signs in here again
+            *ctx.history.lock().await = None;
+            *ctx.exchange.lock().await = None;
+            let other = crate::key_sync::read_owner(dir)?
+                .ok_or("These keys no longer belong to another account. Sign in again.")?;
+            let keys = device_keys(ctx)?;
+            let opens = crate::key_sync::restore(keys.clone(), dir).is_ok();
+            key_backup::archive(dir, &other, opens.then_some(&keys.identity)).map(drop)
+        }
+        (SignInDecision::UnknownKeys { .. }, SignInAction::SetAsideKeys) => {
+            // Nothing may keep the account's files open while they move
+            *ctx.history.lock().await = None;
+            *ctx.exchange.lock().await = None;
+            let keys = device_keys(ctx)?;
+            let opens = crate::key_sync::restore(keys.clone(), dir).is_ok();
+            key_backup::set_aside(
+                dir,
+                key_backup::ACCOUNT_FILES,
+                "set aside at sign-in: not known to be the signed-in account's",
+                opens.then_some(&keys.identity),
+                crate::key_sync::read_owner(dir)?,
+            )
+            .map(drop)
+        }
+        (SignInDecision::UnreadableKeys { .. }, SignInAction::SetAsideKeys) => {
+            *ctx.exchange.lock().await = None;
+            key_backup::set_aside(
+                dir,
+                key_backup::KEYRING_FILES,
+                "set aside at sign-in: this device's key can't open them",
+                None,
+                crate::key_sync::read_owner(dir)?,
+            )
+            .map(drop)
+        }
+        (
+            SignInDecision::ReplaceDevice { devices, .. },
+            SignInAction::ReplaceDevice {
+                device_id,
+                waiting_device_ids,
+            },
+        ) => replace_registration(ctx, api, devices, &device_id, &waiting_device_ids).await,
+        _ => Err("That choice doesn't fit this step. Sign in again.".into()),
+    }
+}
+
+/// Removes this computer's old registration, and the devices waiting for approval the
+/// user agreed to remove with it, so that this computer can register again.
+async fn replace_registration(
+    ctx: &AppContext,
+    api: &ApiClient,
+    devices: &[AccountDevice],
+    device_id: &str,
+    waiting: &[String],
+) -> Result<(), String> {
+    let device = |id: &str| devices.iter().find(|device| device.id == id);
+    let old = device(device_id).ok_or("Choose one of your devices.")?;
+    if waiting
+        .iter()
+        .any(|id| id == device_id || device(id).is_none_or(|d| d.status == "approved"))
+    {
+        return Err("Only devices waiting for approval can be removed along with it.".into());
+    }
+    for id in std::iter::once(device_id).chain(waiting.iter().map(String::as_str)) {
+        uuid::Uuid::parse_str(id).map_err(|_| "Invalid device ID")?;
+        match api.delete_device(id).await {
+            // Already gone, e.g. removed by an attempt whose response was lost
+            Ok(()) | Err(ApiError::Server { status: 404, .. }) => {}
+            Err(e) => {
+                let name = device(id).map_or(id, |d| d.name.as_str());
+                return Err(format!(
+                    "Could not remove “{name}”: {}",
+                    describe_api_error(&e)
+                ));
+            }
+        }
+    }
+    info!(
+        "Removed this computer's old registration ({}) and {} waiting device(s), as the user chose",
+        old.id,
+        waiting.len()
+    );
+    // The old identity is never trusted here again
+    KeyVerifier::new(&ctx.config_dir)
+        .and_then(|mut verifier| verifier.remove_pin(device_id))
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -971,12 +1428,34 @@ async fn refresh_keys(ctx: &AppContext) -> Result<(), String> {
         *exchange = Some(crate::key_sync::restore(keys, &ctx.config_dir)?);
     }
     let exchange = exchange.as_mut().expect("keyring restored");
-    let due = crate::key_sync::synchronize(exchange, &api, &own_id, &ctx.config_dir).await?;
+    let due = synchronize_keys(ctx, exchange, &api, &own_id).await?;
     if due {
         crate::key_sync::rotate(exchange, &api, &own_id, &ctx.config_dir).await?;
     }
     ctx.rotation_pending.store(false, Ordering::SeqCst);
     Ok(())
+}
+
+/// `key_sync::synchronize`, keeping track of whether the current key is missing so the
+/// window can offer recovery.
+async fn synchronize_keys(
+    ctx: &AppContext,
+    exchange: &mut KeyExchange,
+    api: &ApiClient,
+    own_id: &str,
+) -> Result<bool, String> {
+    match crate::key_sync::synchronize(exchange, api, own_id, &ctx.config_dir).await {
+        Ok(due) => {
+            ctx.set_key_problem(None);
+            Ok(due)
+        }
+        Err(error) => {
+            if let SyncError::MissingCurrentKey { server_version } = error {
+                ctx.set_key_problem(Some(KeyProblem { server_version }));
+            }
+            Err(error.into())
+        }
+    }
 }
 
 async fn stop_connection_tasks(ctx: &AppContext) {
@@ -1471,7 +1950,12 @@ pub async fn remove_device(ctx: State<'_, AppContext>, device_id: String) -> Res
     }
     ctx.devices.write().await.retain(|d| d.id != device_id);
     if device_id != ctx.config.read().await.device_id {
-        refresh_keys(&ctx).await?;
+        match refresh_keys(&ctx).await {
+            // Removed; a key this device lacks is recovered on its own (Settings →
+            // Encryption keys), and the next key it gets leaves the removed device out
+            Err(_) if ctx.key_problem().is_some() => {}
+            result => result?,
+        }
     }
     Ok(())
 }
@@ -1658,7 +2142,7 @@ pub async fn confirm_device_approval(
     let api = ctx.api.lock().await;
     let mut guard = ctx.exchange.lock().await;
     let exchange = guard.as_mut().ok_or("Encryption not initialized")?;
-    crate::key_sync::synchronize(exchange, &api, &own_id, &ctx.config_dir).await?;
+    synchronize_keys(&ctx, exchange, &api, &own_id).await?;
     let mut members =
         crate::key_sync::trusted_members(exchange, &api, &own_id, &ctx.config_dir).await?;
     // The new member's encryption key must be certified by the identity we just
@@ -2330,22 +2814,27 @@ pub async fn logout(
     stop_connection_tasks(&ctx).await;
     {
         let config = ctx.config.read().await;
-        if !config.user_id.is_empty() {
-            crate::key_sync::bind_account(
+        // Records whose keys these are, so a later sign-in knows; never blocks signing out
+        if !config.user_id.is_empty()
+            && let Err(e) = crate::key_sync::bind_account(
                 &ctx.config_dir,
                 &config.server_url,
                 &config.user_id,
                 &config,
-            )?;
+            )
+        {
+            log::warn!("Signing out without recording whose keys these are: {e}");
         }
     }
 
     // Forget the session in memory first, so no refresh can write it back to storage
     *ctx.api.lock().await = ApiClient::new(&AppConfig::default().server_url);
     ctx.pending_mfa.lock().await.take();
+    ctx.pending_sign_in.lock().await.take();
     ctx.pairing.lock().await.clear();
     ctx.pending_push.lock().await.take();
     ctx.encryption_key_published.store(false, Ordering::SeqCst);
+    ctx.set_key_problem(None);
 
     // Clear tokens from secure storage
     let token_store = TokenStore::new(&ctx.config_dir);
@@ -2366,6 +2855,257 @@ pub async fn logout(
     let _ = app_handle.emit("connection-state-changed", "not_configured");
     Ok(())
 }
+
+// === Encryption key recovery ===
+
+/// What Settings → Encryption keys shows.
+#[derive(Debug, Serialize)]
+pub struct KeyRecoveryStatus {
+    /// Set while this device lacks the account's current key.
+    pub problem: Option<KeyProblem>,
+    /// The key versions this device has.
+    pub versions: Vec<i32>,
+    /// Backups cpmesh made on this computer, newest first.
+    pub backups: Vec<BackupInfo>,
+    /// The account's other approved devices: one may still have the key, and starting
+    /// new keys needs each verified here (or removed).
+    pub devices: Vec<crate::key_sync::Member>,
+    /// Why the devices couldn't be listed (offline, for example).
+    pub devices_error: Option<String>,
+}
+
+/// What restoring a backup added.
+#[derive(Debug, Serialize)]
+pub struct RestoredKeys {
+    pub added: Vec<i32>,
+    pub current_version: i32,
+}
+
+/// The signed-in account, for checking whose keys a backup holds.
+async fn signed_in_account(ctx: &AppContext) -> Result<(Owner, String), String> {
+    let config = ctx.config.read().await;
+    if !config.is_configured() {
+        return Err("Sign in first.".into());
+    }
+    Ok((
+        Owner::new(&config.server_url, &config.user_id),
+        config.device_id.clone(),
+    ))
+}
+
+/// The keys in memory, or else the saved keyring. Lock `api` before `exchange`.
+fn loaded_keys<'a>(
+    ctx: &AppContext,
+    guard: &'a mut Option<KeyExchange>,
+) -> Result<&'a mut KeyExchange, String> {
+    if guard.is_none() {
+        let store = DeviceKeyStore::new(&ctx.config_dir);
+        if !store.has_identity() {
+            return Err("Device key is missing".into());
+        }
+        *guard = Some(crate::key_sync::restore(
+            store.load_or_generate()?,
+            &ctx.config_dir,
+        )?);
+    }
+    Ok(guard.as_mut().expect("keyring restored"))
+}
+
+#[tauri::command]
+pub async fn get_key_problem(ctx: State<'_, AppContext>) -> Result<Option<KeyProblem>, String> {
+    Ok(ctx.key_problem())
+}
+
+#[tauri::command]
+pub async fn get_key_recovery_status(
+    ctx: State<'_, AppContext>,
+) -> Result<KeyRecoveryStatus, String> {
+    let (account, own_id) = signed_in_account(&ctx).await?;
+    let (devices, devices_error) = {
+        let api = ctx.api.lock().await;
+        match crate::key_sync::other_members(&api, &own_id, &ctx.config_dir).await {
+            Ok(devices) => (devices, None),
+            Err(e) => (Vec::new(), Some(e)),
+        }
+    };
+    let mut guard = ctx.exchange.lock().await;
+    let exchange = loaded_keys(&ctx, &mut guard)?;
+    let versions = exchange.keys_by_version.keys().copied().collect();
+    let backups = key_backup::list(&ctx.config_dir)
+        .iter()
+        .map(|folder| key_backup::inspect(folder, Some(exchange.key_pair()), Some(&account)))
+        .collect();
+    Ok(KeyRecoveryStatus {
+        problem: ctx.key_problem(),
+        versions,
+        backups,
+        devices,
+        devices_error,
+    })
+}
+
+/// Describes a backup folder the user chose, before restoring it.
+#[tauri::command]
+pub async fn inspect_key_backup(
+    ctx: State<'_, AppContext>,
+    path: String,
+) -> Result<BackupInfo, String> {
+    let (account, _) = signed_in_account(&ctx).await?;
+    let mut guard = ctx.exchange.lock().await;
+    let exchange = loaded_keys(&ctx, &mut guard)?;
+    Ok(key_backup::inspect(
+        Path::new(path.trim()),
+        Some(exchange.key_pair()),
+        Some(&account),
+    ))
+}
+
+/// Adds the group keys of a backup to this device's keyring, re-encrypted for this
+/// device. Never replaces a key, and refuses keys recorded as another account's or
+/// that can't open this account's clips.
+#[tauri::command]
+pub async fn restore_key_backup(
+    ctx: State<'_, AppContext>,
+    path: String,
+) -> Result<RestoredKeys, String> {
+    let (account, _) = signed_in_account(&ctx).await?;
+    let _operation = ctx.key_operations.lock().await;
+    let api = ctx.api.lock().await;
+    let mut guard = ctx.exchange.lock().await;
+    let exchange = loaded_keys(&ctx, &mut guard)?;
+    let mut candidate = exchange.clone();
+    let added = key_backup::restore_into(&mut candidate, Path::new(path.trim()), &account)?;
+    check_keys_open_history(&api, &candidate, &added).await?;
+    candidate
+        .save_keyring(&AppConfig::keyring_path(&ctx.config_dir))
+        .map_err(|e| format!("Could not save the restored keys: {e}"))?;
+    *exchange = candidate;
+    info!("Restored key versions {added:?} from a backup");
+    Ok(RestoredKeys {
+        added,
+        current_version: exchange.current_version,
+    })
+}
+
+/// Refuses restored keys that can't open any of the account's clips encrypted with
+/// them: keys without a recorded owner (from before owner records) could be another
+/// account's. Clips that can't be checked (none stored, or the relay unreachable)
+/// don't block the restore the user asked for.
+async fn check_keys_open_history(
+    api: &ApiClient,
+    restored: &KeyExchange,
+    added: &[i32],
+) -> Result<(), String> {
+    if added.is_empty() {
+        return Ok(());
+    }
+    let Ok(page) = api.get_clipboard_history(50, 0).await else {
+        return Ok(());
+    };
+    // Only the restored keys, so keys this device already had prove nothing
+    let mut only_restored = KeyExchange::new(restored.keys().clone());
+    for version in added {
+        if let Some(key) = restored.keys_by_version.get(version) {
+            only_restored
+                .add_key_version(*version, key.clone())
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    let mut signed_checks = 0;
+    for entry in &page.entries {
+        if opens_entry(&only_restored, entry) {
+            return Ok(());
+        }
+        if entry.request_id.is_some() && added.contains(&entry.key_version) {
+            signed_checks += 1;
+        }
+    }
+    if signed_checks > 0 {
+        return Err(
+            "This backup's keys can't open your account's clips, so they belong to another account. Nothing was restored."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Whether `exchange` decrypts `entry` (its authenticity is checked when it is shown).
+fn opens_entry(exchange: &KeyExchange, entry: &ClipboardEntry) -> bool {
+    match (&entry.request_id, entry.sent_at) {
+        (Some(request_id), Some(sent_at)) => {
+            let metadata = base64::engine::general_purpose::STANDARD
+                .decode(&entry.metadata)
+                .unwrap_or_default();
+            crate::crypto::entry::open_entry(
+                exchange,
+                &EntryContext {
+                    key_version: entry.key_version,
+                    content_type: &entry.content_type,
+                    sender_id: &entry.device_id,
+                    request_id,
+                    sent_at,
+                },
+                &entry.encrypted_data,
+                &metadata,
+            )
+            .is_ok()
+        }
+        _ => exchange
+            .decrypt_payload_legacy(&entry.encrypted_data, entry.key_version)
+            .is_ok(),
+    }
+}
+
+/// The last resort the user confirmed, after the warning: starts a new encryption key
+/// for the account because no device and no backup has the current one. Only for the
+/// state they reviewed (`expected_version` is still current and still missing here).
+#[tauri::command]
+pub async fn reset_encryption(
+    ctx: State<'_, AppContext>,
+    expected_version: i32,
+) -> Result<i32, String> {
+    let (_, own_id) = signed_in_account(&ctx).await?;
+    let _operation = ctx.key_operations.lock().await;
+    let api = ctx.api.lock().await;
+    let mut guard = ctx.exchange.lock().await;
+    let exchange = loaded_keys(&ctx, &mut guard)?;
+    let version = crate::key_sync::reset_group_key(
+        exchange,
+        &api,
+        &own_id,
+        &ctx.config_dir,
+        expected_version,
+    )
+    .await?;
+    ctx.set_key_problem(None);
+    Ok(version)
+}
+
+// === Updates installed while running ===
+
+/// Whether a newer version was installed over this one while it ran.
+#[cfg(desktop)]
+#[tauri::command]
+pub fn update_installed() -> bool {
+    crate::relaunch::update_installed()
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn update_installed() -> bool {
+    false
+}
+
+/// Restarts cpmesh, into the version installed over this one if there is one.
+#[cfg(desktop)]
+#[tauri::command]
+pub fn restart_app(app_handle: tauri::AppHandle) {
+    crate::relaunch::relaunch(&app_handle, crate::relaunch::foreground_args());
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn restart_app() {}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct UpdateInfo {
@@ -2618,7 +3358,7 @@ pub async fn setup_with_oauth_tokens(
     server_url: String,
     access_token: String,
     refresh_token: String,
-) -> Result<(), String> {
+) -> Result<LoginStep, String> {
     // Validate server URL scheme
     if !server_url.starts_with("https://") && !server_url.starts_with("http://") {
         return Err("Server URL must start with https:// or http://".into());
@@ -2629,6 +3369,7 @@ pub async fn setup_with_oauth_tokens(
     api.set_tokens(access_token, refresh_token);
     // The browser finished the sign-in instead of the second-factor prompt
     ctx.pending_mfa.lock().await.take();
+    ctx.pending_sign_in.lock().await.take();
 
     // Get user info to obtain user_id for fingerprinting
     let user_info = api
@@ -2636,8 +3377,17 @@ pub async fn setup_with_oauth_tokens(
         .await
         .map_err(|e| format!("Failed to get user info: {e}"))?;
 
-    let device_name = crate::fingerprint::auto_device_name();
-    finish_sign_in(&ctx, &mut api, server_url, user_info.id, device_name).await
+    finish_sign_in(
+        &ctx,
+        &mut api,
+        SignIn {
+            server_url,
+            account: account_label(&user_info),
+            user_id: user_info.id,
+            device_name: crate::fingerprint::auto_device_name(),
+        },
+    )
+    .await
 }
 
 #[derive(Serialize, serde::Deserialize)]
@@ -3184,5 +3934,559 @@ mod tests {
         ] {
             assert!(!supports_browser_sign_in(older), "{older}");
         }
+    }
+
+    // ---- sign-ins that stop for the user's decision -------------------------------
+
+    use crate::api::client::tests::serve_with;
+    use crate::crypto::keys::DeviceKeys;
+    use crate::key_sync::OWNER_FILE;
+    use serde_json::json;
+
+    /// The account as a relay keeps it.
+    #[derive(Default)]
+    struct Account {
+        devices: Vec<DeviceInfo>,
+        deleted: Vec<String>,
+        /// Registrations to refuse with a server error first
+        failing_registrations: usize,
+    }
+
+    fn device(name: &str, public_key: Vec<u8>, status: DeviceStatus) -> DeviceInfo {
+        DeviceInfo {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.into(),
+            public_key: Some(public_key),
+            public_key_sig: None,
+            encryption_key: None,
+            encryption_key_sig: None,
+            last_seen: None,
+            online: false,
+            status,
+        }
+    }
+
+    /// Registers devices like the relay; a device's name stands in for the hardware
+    /// fingerprint that tells the relay it is the same computer.
+    async fn relay_for(account: Arc<std::sync::Mutex<Account>>) -> String {
+        serve_with(move |request| {
+            let mut account = account.lock().unwrap();
+            let route = request.path.split('?').next().unwrap_or_default();
+            match (request.method.as_str(), route) {
+                ("POST", "/api/devices/challenge") => {
+                    (200, json!({"challenge": "challenge-1"}).to_string())
+                }
+                ("POST", "/api/devices") if account.failing_registrations > 0 => {
+                    account.failing_registrations -= 1;
+                    (503, json!({"error": "service unavailable"}).to_string())
+                }
+                ("POST", "/api/devices") => {
+                    let registration: RegisterDeviceRequest =
+                        serde_json::from_str(&request.body).unwrap();
+                    let tokens = json!({"access_token": "bound-access", "refresh_token": "bound-refresh"});
+                    if let Some(known) = account.devices.iter().find(|d| {
+                        d.public_key.as_deref() == Some(registration.public_key.as_slice())
+                    }) {
+                        let mut body = tokens.clone();
+                        body["device"] = json!({"id": known.id, "status": known.status.to_string()});
+                        return (200, body.to_string());
+                    }
+                    if let Some(old) = account.devices.iter().find(|d| d.name == registration.name) {
+                        return (
+                            409,
+                            json!({
+                                "error": "device keys changed: this device is already registered with different keys.",
+                                "code": "device_keys_changed",
+                                "device_id": old.id,
+                                "device_name": old.name,
+                            })
+                            .to_string(),
+                        );
+                    }
+                    let status = if account.devices.is_empty() {
+                        DeviceStatus::Approved
+                    } else {
+                        DeviceStatus::Pending
+                    };
+                    let registered = device(&registration.name, registration.public_key, status);
+                    let mut body = tokens.clone();
+                    body["device"] = json!({"id": registered.id, "status": registered.status.to_string()});
+                    account.devices.push(registered);
+                    (201, body.to_string())
+                }
+                ("GET", "/api/devices/keys") => (
+                    200,
+                    serde_json::to_string(&DeviceKeysResponse {
+                        devices: account.devices.clone(),
+                    })
+                    .unwrap(),
+                ),
+                ("GET", "/api/devices") => (200, serde_json::to_string(&account.devices).unwrap()),
+                ("DELETE", path) if path.starts_with("/api/devices/") => {
+                    let id = path.trim_start_matches("/api/devices/").to_string();
+                    if !account.devices.iter().any(|d| d.id == id) {
+                        return (404, json!({"error": "device not found"}).to_string());
+                    }
+                    account.devices.retain(|d| d.id != id);
+                    account.deleted.push(id);
+                    (204, String::new())
+                }
+                _ => (404, json!({"error": "not found"}).to_string()),
+            }
+        })
+        .await
+    }
+
+    fn alice(server_url: &str) -> SignIn {
+        SignIn {
+            server_url: server_url.into(),
+            user_id: "user-alice".into(),
+            device_name: "Linux - box".into(),
+            account: "alice@example.com".into(),
+        }
+    }
+
+    /// Signs `alice` in to the relay at `server_url`, up to the first decision.
+    async fn sign_in(ctx: &AppContext, server_url: &str) -> Result<LoginStep, String> {
+        sign_in_as(ctx, alice(server_url)).await
+    }
+
+    async fn sign_in_as(ctx: &AppContext, who: SignIn) -> Result<LoginStep, String> {
+        let mut api = ctx.api.lock().await;
+        *api = api_client(&who.server_url, &ctx.config_dir);
+        api.set_tokens("access".into(), "refresh".into());
+        finish_sign_in(ctx, &mut api, who).await
+    }
+
+    /// Signing out (Settings) keeps the keys and forgets the account.
+    async fn sign_out(ctx: &AppContext) {
+        let mut config = ctx.config.write().await;
+        *config = AppConfig::default();
+        config.save(&ctx.config_dir).unwrap();
+        *ctx.exchange.lock().await = None;
+        *ctx.history.lock().await = None;
+    }
+
+    /// Gives the signed-in account a group key, as syncing would.
+    async fn receive_key(ctx: &AppContext, version: i32, byte: u8) {
+        let mut exchange = ctx.exchange.lock().await;
+        let exchange = exchange.as_mut().unwrap();
+        exchange.add_key_version(version, vec![byte; 32]).unwrap();
+        exchange
+            .save_keyring(&AppConfig::keyring_path(&ctx.config_dir))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn switching_accounts_archives_keys_and_brings_them_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_a = relay_for(Arc::new(std::sync::Mutex::new(Account::default()))).await;
+        let server_b = relay_for(Arc::new(std::sync::Mutex::new(Account::default()))).await;
+        let bob = |server: &str| SignIn {
+            server_url: server.into(),
+            user_id: "user-bob".into(),
+            device_name: "Linux - box".into(),
+            account: "bob@example.com".into(),
+        };
+        let ctx = AppContext::new(dir.path().to_path_buf());
+
+        // Alice uses this computer, then signs out
+        assert_eq!(sign_in(&ctx, &server_a).await.unwrap(), LoginStep::SignedIn);
+        receive_key(&ctx, 1, 0xA1).await;
+        sign_out(&ctx).await;
+
+        // Bob signs in to another server: Alice's keys are put away, never mixed in
+        assert_eq!(
+            sign_in_as(&ctx, bob(&server_b)).await.unwrap(),
+            LoginStep::DecisionRequired(SignInDecision::OtherAccountKeys {
+                account: "bob@example.com".into(),
+                owner_server: server_a.clone(),
+                returning: false,
+            })
+        );
+        assert_eq!(
+            resolve(&ctx, SignInAction::SetAsideKeys).await.unwrap(),
+            LoginStep::SignedIn
+        );
+        let alice_owner = Owner::new(&server_a, "user-alice");
+        assert_eq!(key_backup::archived_for(dir.path(), &alice_owner).len(), 1);
+        assert!(
+            ctx.exchange
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .keys_by_version
+                .is_empty()
+        );
+        receive_key(&ctx, 1, 0xB1).await;
+        sign_out(&ctx).await;
+
+        // Alice comes back: Bob's keys are archived, and hers return
+        assert_eq!(
+            sign_in(&ctx, &server_a).await.unwrap(),
+            LoginStep::DecisionRequired(SignInDecision::OtherAccountKeys {
+                account: "alice@example.com".into(),
+                owner_server: server_b.clone(),
+                returning: true,
+            })
+        );
+        assert_eq!(
+            resolve(&ctx, SignInAction::SetAsideKeys).await.unwrap(),
+            LoginStep::SignedIn
+        );
+        assert_eq!(
+            ctx.exchange.lock().await.as_ref().unwrap().keys_by_version[&1],
+            vec![0xA1; 32]
+        );
+        assert!(key_backup::archived_for(dir.path(), &alice_owner).is_empty());
+        let bob_owner = Owner::new(&server_b, "user-bob");
+        assert_eq!(key_backup::archived_for(dir.path(), &bob_owner).len(), 1);
+
+        // Signing out and in to the same account changes nothing
+        sign_out(&ctx).await;
+        assert_eq!(sign_in(&ctx, &server_a).await.unwrap(), LoginStep::SignedIn);
+        assert_eq!(
+            ctx.exchange.lock().await.as_ref().unwrap().keys_by_version[&1],
+            vec![0xA1; 32]
+        );
+    }
+
+    /// A profile of a version from before protocol 3, after a sign-out on it cleared
+    /// the config: `device.key`, a keyring it encrypted, and local history.
+    fn legacy_profile(dir: &Path) -> KeyPair {
+        let identity = KeyPair::generate();
+        identity
+            .save_private_key(&AppConfig::key_path(dir))
+            .unwrap();
+        let mut keyring = KeyExchange::new(DeviceKeys {
+            identity: identity.clone(),
+            encryption: KeyPair::generate(),
+        });
+        keyring.add_key_version(1, vec![1; 32]).unwrap();
+        keyring.save_keyring(&AppConfig::keyring_path(dir)).unwrap();
+        AppConfig::default().save(dir).unwrap();
+        std::fs::write(dir.join("history.db"), b"").unwrap();
+        identity
+    }
+
+    #[tokio::test]
+    async fn keys_nobody_recorded_are_used_only_when_the_user_says_they_are_theirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = legacy_profile(dir.path());
+        // The account knows this computer by its device key
+        let account = Arc::new(std::sync::Mutex::new(Account::default()));
+        let known = device(
+            "Linux - box",
+            identity.public_key_bytes(),
+            DeviceStatus::Approved,
+        );
+        account.lock().unwrap().devices.push(known.clone());
+        let server = relay_for(account.clone()).await;
+        let ctx = AppContext::new(dir.path().to_path_buf());
+
+        let step = sign_in(&ctx, &server).await.unwrap();
+        assert_eq!(
+            step,
+            LoginStep::DecisionRequired(SignInDecision::UnknownKeys {
+                account: "alice@example.com".into(),
+                readable: true,
+                matching_device: Some("Linux - box".into()),
+            })
+        );
+        // Nothing was decided for the user
+        assert!(!dir.path().join(OWNER_FILE).exists());
+        assert!(!ctx.config.read().await.is_configured());
+
+        // A choice for another question changes nothing
+        assert!(
+            resolve(
+                &ctx,
+                SignInAction::ReplaceDevice {
+                    device_id: known.id.clone(),
+                    waiting_device_ids: vec![],
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(account.lock().unwrap().deleted, Vec::<String>::new());
+
+        assert_eq!(
+            resolve(&ctx, SignInAction::UseSavedKeys).await.unwrap(),
+            LoginStep::SignedIn
+        );
+        assert_eq!(
+            crate::key_sync::read_owner(dir.path()).unwrap(),
+            Some(Owner::new(&server, "user-alice"))
+        );
+        // The same device, with its keys
+        let config = ctx.config.read().await.clone();
+        assert_eq!(config.device_id, known.id);
+        assert_eq!(
+            ctx.exchange.lock().await.as_ref().unwrap().keys_by_version[&1],
+            vec![1; 32]
+        );
+        assert!(key_backup::list(dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn setting_keys_aside_keeps_them_and_this_devices_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = legacy_profile(dir.path());
+        let account = Arc::new(std::sync::Mutex::new(Account::default()));
+        let server = relay_for(account.clone()).await;
+        let ctx = AppContext::new(dir.path().to_path_buf());
+
+        assert!(matches!(
+            sign_in(&ctx, &server).await.unwrap(),
+            LoginStep::DecisionRequired(SignInDecision::UnknownKeys {
+                readable: true,
+                matching_device: None,
+                ..
+            })
+        ));
+        assert_eq!(
+            resolve(&ctx, SignInAction::SetAsideKeys).await.unwrap(),
+            LoginStep::SignedIn
+        );
+        let backups = key_backup::list(dir.path());
+        assert_eq!(backups.len(), 1);
+        assert!(backups[0].join("keyring.enc").is_file());
+        assert!(backups[0].join("history.db").is_file());
+        assert!(!AppConfig::keyring_path(dir.path()).exists());
+        // Registered with the identity it already had, which still opens the backup
+        let devices = account.lock().unwrap().devices.clone();
+        assert_eq!(devices[0].public_key, Some(identity.public_key_bytes()));
+        assert_eq!(
+            key_backup::inspect(&backups[0], Some(&identity), None).versions,
+            [1]
+        );
+        assert_eq!(
+            crate::key_sync::read_owner(dir.path()).unwrap(),
+            Some(Owner::new(&server, "user-alice"))
+        );
+    }
+
+    #[tokio::test]
+    async fn another_accounts_keys_can_only_be_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        legacy_profile(dir.path());
+        crate::key_sync::record_owner(dir.path(), "https://other.example/", "user-bob").unwrap();
+        let account = Arc::new(std::sync::Mutex::new(Account::default()));
+        let server = relay_for(account.clone()).await;
+        let ctx = AppContext::new(dir.path().to_path_buf());
+
+        assert_eq!(
+            sign_in(&ctx, &server).await.unwrap(),
+            LoginStep::DecisionRequired(SignInDecision::OtherAccountKeys {
+                account: "alice@example.com".into(),
+                owner_server: "https://other.example".into(),
+                returning: false,
+            })
+        );
+        assert!(resolve(&ctx, SignInAction::UseSavedKeys).await.is_err());
+        assert_eq!(
+            resolve(&ctx, SignInAction::SetAsideKeys).await.unwrap(),
+            LoginStep::SignedIn
+        );
+        let bob = Owner::new("https://other.example", "user-bob");
+        let backup = &key_backup::archived_for(dir.path(), &bob)[0];
+        let info = key_backup::inspect(backup, None, Some(&Owner::new(&server, "user-alice")));
+        assert_eq!(info.same_account, Some(false));
+        let info = key_backup::inspect(backup, None, Some(&bob));
+        assert_eq!(info.same_account, Some(true));
+    }
+
+    #[tokio::test]
+    async fn keys_this_device_cannot_open_are_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut foreign = KeyExchange::new(DeviceKeys::generate());
+        foreign.add_key_version(1, vec![1; 32]).unwrap();
+        foreign
+            .save_keyring(&AppConfig::keyring_path(dir.path()))
+            .unwrap();
+        let account = Arc::new(std::sync::Mutex::new(Account::default()));
+        let server = relay_for(account).await;
+        crate::key_sync::record_owner(dir.path(), &server, "user-alice").unwrap();
+        let ctx = AppContext::new(dir.path().to_path_buf());
+
+        assert_eq!(
+            sign_in(&ctx, &server).await.unwrap(),
+            LoginStep::DecisionRequired(SignInDecision::UnreadableKeys {
+                account: "alice@example.com".into(),
+            })
+        );
+        assert_eq!(
+            resolve(&ctx, SignInAction::SetAsideKeys).await.unwrap(),
+            LoginStep::SignedIn
+        );
+        let backup = &key_backup::list(dir.path())[0];
+        assert!(backup.join("keyring.enc").is_file());
+        // Only the keyring moved: the account's other files stay
+        assert!(dir.path().join(OWNER_FILE).is_file());
+    }
+
+    #[tokio::test]
+    async fn this_computers_old_registration_is_replaced_only_when_the_user_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_identity = KeyPair::generate();
+        // The old keys, set aside earlier, next to the device key that opens them
+        let backup = dir.path().join("backups").join("keys-20260101-000000");
+        std::fs::create_dir_all(&backup).unwrap();
+        old_identity
+            .save_private_key(&backup.join("device.key"))
+            .unwrap();
+        let account = Arc::new(std::sync::Mutex::new(Account::default()));
+        let old = device(
+            "Linux - box",
+            old_identity.public_key_bytes(),
+            DeviceStatus::Approved,
+        );
+        let mac = device(
+            "macOS - MacBook",
+            KeyPair::generate().public_key_bytes(),
+            DeviceStatus::Pending,
+        );
+        account.lock().unwrap().devices = vec![old.clone(), mac.clone()];
+        let server = relay_for(account.clone()).await;
+        let ctx = AppContext::new(dir.path().to_path_buf());
+
+        let LoginStep::DecisionRequired(SignInDecision::ReplaceDevice {
+            suggested_device_id,
+            devices,
+            backups,
+            matching_backup,
+            ..
+        }) = sign_in(&ctx, &server).await.unwrap()
+        else {
+            panic!("expected the replacement question");
+        };
+        assert_eq!(suggested_device_id.as_deref(), Some(old.id.as_str()));
+        assert_eq!(devices.len(), 2);
+        assert_eq!(backups, 1);
+        assert_eq!(matching_backup, Some(backup.display().to_string()));
+        assert!(account.lock().unwrap().deleted.is_empty());
+
+        // An approved device is never removed as "waiting"
+        assert!(
+            resolve(
+                &ctx,
+                SignInAction::ReplaceDevice {
+                    device_id: mac.id.clone(),
+                    waiting_device_ids: vec![old.id.clone()],
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert!(account.lock().unwrap().deleted.is_empty());
+
+        // The old registration was the only approved device, so the waiting one goes too
+        assert_eq!(
+            resolve(
+                &ctx,
+                SignInAction::ReplaceDevice {
+                    device_id: old.id.clone(),
+                    waiting_device_ids: vec![mac.id.clone()],
+                }
+            )
+            .await
+            .unwrap(),
+            LoginStep::SignedIn
+        );
+        let config = ctx.config.read().await.clone();
+        let account = account.lock().unwrap();
+        assert_eq!(account.deleted, [old.id.clone(), mac.id.clone()]);
+        assert_eq!(account.devices.len(), 1);
+        assert_eq!(config.device_id, account.devices[0].id);
+        assert_eq!(config.device_status, "approved");
+        // The old identity is never trusted here again
+        let mut verifier = KeyVerifier::new(dir.path()).unwrap();
+        assert!(
+            verifier
+                .pin_after_approval(&old.id, &old_identity.public)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_sign_in_after_the_choice_is_retried_without_repeating_it() {
+        let dir = tempfile::tempdir().unwrap();
+        legacy_profile(dir.path());
+        let account = Arc::new(std::sync::Mutex::new(Account {
+            failing_registrations: 1,
+            ..Account::default()
+        }));
+        let server = relay_for(account).await;
+        let ctx = AppContext::new(dir.path().to_path_buf());
+        sign_in(&ctx, &server).await.unwrap();
+
+        let error = resolve(&ctx, SignInAction::SetAsideKeys).await.unwrap_err();
+        assert!(error.contains("Device registration failed"), "{error}");
+        assert_eq!(
+            key_backup::list(dir.path()).len(),
+            1,
+            "the keys were set aside"
+        );
+        // Trying again finishes the sign-in, without setting anything aside twice
+        assert_eq!(
+            resolve(&ctx, SignInAction::SetAsideKeys).await.unwrap(),
+            LoginStep::SignedIn
+        );
+        assert_eq!(key_backup::list(dir.path()).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_decision_can_be_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        legacy_profile(dir.path());
+        let server = relay_for(Arc::new(std::sync::Mutex::new(Account::default()))).await;
+        let ctx = AppContext::new(dir.path().to_path_buf());
+        sign_in(&ctx, &server).await.unwrap();
+        assert!(ctx.pending_sign_in.lock().await.is_some());
+
+        *ctx.pending_sign_in.lock().await = None;
+        assert_eq!(
+            resolve(&ctx, SignInAction::SetAsideKeys).await,
+            Err(MFA_SIGN_IN_EXPIRED.to_string())
+        );
+        // Nothing moved
+        assert!(AppConfig::keyring_path(dir.path()).is_file());
+    }
+
+    #[test]
+    fn decisions_reach_the_window_with_their_kind() {
+        assert_eq!(
+            serde_json::to_value(LoginStep::DecisionRequired(SignInDecision::UnknownKeys {
+                account: "alice@example.com".into(),
+                readable: true,
+                matching_device: None,
+            }))
+            .unwrap(),
+            json!({
+                "status": "decision_required",
+                "kind": "unknown_keys",
+                "account": "alice@example.com",
+                "readable": true,
+                "matching_device": null,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<SignInAction>(json!({
+                "action": "replace_device",
+                "device_id": "d1",
+                "waiting_device_ids": ["d2"],
+            }))
+            .unwrap(),
+            SignInAction::ReplaceDevice {
+                device_id: "d1".into(),
+                waiting_device_ids: vec!["d2".into()],
+            }
+        );
+        assert_eq!(
+            serde_json::from_value::<SignInAction>(json!({"action": "set_aside_keys"})).unwrap(),
+            SignInAction::SetAsideKeys
+        );
     }
 }

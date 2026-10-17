@@ -71,11 +71,16 @@ export interface MfaPrompt {
 	message: string;
 }
 
-export type LoginStep = { status: 'signed_in' | 'verification_sent' } | ({ status: 'mfa_required' } & MfaPrompt);
+export type LoginStep =
+	| { status: 'signed_in' | 'verification_sent' }
+	| ({ status: 'mfa_required' } & MfaPrompt)
+	| ({ status: 'decision_required' } & SignInDecision);
 
 export interface MfaLoginDone {
 	/** Set when a recovery code was used: how many unused ones are left */
 	recovery_codes_remaining: number | null;
+	/** Set when the user decides about keys saved on this device before it is set up */
+	decision: SignInDecision | null;
 }
 
 /** What `completeMfaLogin` rejects with. */
@@ -117,6 +122,65 @@ export async function completeMfaLogin(method: MfaCodeMethod, code: string): Pro
 /** Forgets a sign-in waiting for its second factor. */
 export async function cancelMfaLogin(): Promise<void> {
 	return invoke('cancel_mfa_login');
+}
+
+// === Keys saved on this device, at sign-in ===
+
+/** One of the account's devices, as the relay lists it. */
+export interface AccountDevice {
+	id: string;
+	name: string;
+	status: 'pending' | 'approved' | 'rejected' | 'revoked';
+	last_seen: string | null;
+	online: boolean;
+}
+
+/** What the user decides before a sign-in can set up this device. */
+export type SignInDecision =
+	| {
+			/** Keys saved by a version that didn't record whose they are */
+			kind: 'unknown_keys';
+			account: string;
+			/** Whether this device's key opens them; otherwise they can only be set aside */
+			readable: boolean;
+			/** A device on the account with this computer's device key, if there is one */
+			matching_device: string | null;
+	  }
+	| {
+			/** Keys recorded as another account's: archived for it, they come back when it signs in here */
+			kind: 'other_account_keys';
+			account: string;
+			owner_server: string;
+			/** This account's own keys, archived here earlier, come back too */
+			returning: boolean;
+	  }
+	| { kind: 'unreadable_keys'; account: string }
+	| {
+			/** The account has this computer registered with device keys it no longer has */
+			kind: 'replace_device';
+			account: string;
+			/** The registration the server says is this computer's, or the likeliest one */
+			suggested_device_id: string | null;
+			devices: AccountDevice[];
+			/** Key backups on this computer */
+			backups: number;
+			/** The backup holding the suggested registration's device key */
+			matching_backup: string | null;
+	  };
+
+export type SignInAction =
+	| { action: 'use_saved_keys' }
+	| { action: 'set_aside_keys' }
+	| { action: 'replace_device'; device_id: string; waiting_device_ids: string[] };
+
+/** Continues a sign-in that stopped for a `SignInDecision`. */
+export async function resolveSignIn(action: SignInAction): Promise<LoginStep> {
+	return invoke('resolve_sign_in', { action });
+}
+
+/** Drops a sign-in that was waiting for a decision. */
+export async function cancelSignIn(): Promise<void> {
+	return invoke('cancel_sign_in');
 }
 
 export async function connectToServer(): Promise<void> {
@@ -289,6 +353,92 @@ export async function downloadAndInstallUpdate(downloadUrl: string): Promise<voi
 	return invoke('download_and_install_update', { downloadUrl });
 }
 
+/** Whether a newer version was installed over the running one (it starts after a restart). */
+export async function updateInstalled(): Promise<boolean> {
+	return invoke('update_installed');
+}
+
+/** Restarts cpmesh, into the newer version when one was installed. */
+export async function restartApp(): Promise<void> {
+	return invoke('restart_app');
+}
+
+// === Encryption key recovery ===
+
+/** This device lacks the account's current encryption key. */
+export interface KeyProblem {
+	server_version: number;
+}
+
+export interface KeyBackup {
+	path: string;
+	name: string;
+	/** When cpmesh set these keys aside (RFC 3339); null for backups made by hand */
+	created_at: string | null;
+	reason: string | null;
+	/** The server of the account they belong to, when recorded */
+	owner_server: string | null;
+	/** Whether they are recorded as this account's; null when nothing says whose */
+	same_account: boolean | null;
+	/** Key versions inside, when the keyring could be opened */
+	versions: number[];
+	/** Why it can't be restored, when it can't */
+	problem: string | null;
+}
+
+/** Another approved device: one may still have the key, and new keys reach it only once it's verified here. */
+export interface KeyMember {
+	id: string;
+	name: string;
+	/** Verified on this device (full fingerprint comparison) */
+	verified: boolean;
+	/** It published a certified encryption key (an up-to-date cpmesh) */
+	can_receive_keys: boolean;
+}
+
+export interface KeyRecoveryStatus {
+	problem: KeyProblem | null;
+	/** Key versions this device has */
+	versions: number[];
+	/** Backups found on this computer, newest first */
+	backups: KeyBackup[];
+	/** The account's other approved devices */
+	devices: KeyMember[];
+	/** Why the devices couldn't be listed */
+	devices_error: string | null;
+}
+
+export interface RestoredKeys {
+	added: number[];
+	current_version: number;
+}
+
+export async function getKeyProblem(): Promise<KeyProblem | null> {
+	return invoke('get_key_problem');
+}
+
+export async function getKeyRecoveryStatus(): Promise<KeyRecoveryStatus> {
+	return invoke('get_key_recovery_status');
+}
+
+/** Describes a backup folder the user chose, before restoring it. */
+export async function inspectKeyBackup(path: string): Promise<KeyBackup> {
+	return invoke('inspect_key_backup', { path });
+}
+
+/** Adds a backup's keys to this device; never replaces a key it has. */
+export async function restoreKeyBackup(path: string): Promise<RestoredKeys> {
+	return invoke('restore_key_backup', { path });
+}
+
+/**
+ * Last resort, after the user confirmed the warning: starts a new encryption key because
+ * no device and no backup has the current one (`expectedVersion`).
+ */
+export async function resetEncryption(expectedVersion: number): Promise<number> {
+	return invoke('reset_encryption', { expectedVersion });
+}
+
 // === OAuth / Social Login ===
 
 export interface SocialStatus {
@@ -320,7 +470,7 @@ export async function setupWithOAuthTokens(
 	serverUrl: string,
 	accessToken: string,
 	refreshToken: string,
-): Promise<void> {
+): Promise<LoginStep> {
 	return invoke('setup_with_oauth_tokens', { serverUrl, accessToken, refreshToken });
 }
 

@@ -24,10 +24,10 @@ pub struct SecureStore {
     backend: Backend,
 }
 
-/// Where secrets are persisted. Only one variant is constructed per platform in
-/// production builds; tests exercise the file backend everywhere.
+/// Where secrets are persisted. Only one variant is constructed per build: mobile
+/// platforms and unit tests use files, desktop builds the OS credential store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
 enum Backend {
     /// OS credential store first, falling back to files when it is unavailable.
     Keyring,
@@ -36,11 +36,12 @@ enum Backend {
 }
 
 impl SecureStore {
-    /// Creates a store using the platform default backend.
+    /// Creates a store using the platform default backend. Unit tests always get the
+    /// file backend: they must never read or overwrite a user's real credentials.
     pub fn new(service: &str, config_dir: &Path) -> Self {
-        #[cfg(any(target_os = "android", target_os = "ios"))]
+        #[cfg(any(test, target_os = "android", target_os = "ios"))]
         let backend = Backend::File;
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(not(any(test, target_os = "android", target_os = "ios")))]
         let backend = Backend::Keyring;
 
         Self::with_backend(service, config_dir, backend)
@@ -274,13 +275,12 @@ mod tests {
     }
 
     #[test]
-    fn new_picks_platform_default_backend() {
+    fn tests_never_use_the_real_credential_store() {
         let dir = TempDir::new().unwrap();
         let store = SecureStore::new("cpmesh-test", dir.path());
-        #[cfg(any(target_os = "android", target_os = "ios"))]
         assert_eq!(store.backend, Backend::File);
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        assert_eq!(store.backend, Backend::Keyring);
         assert_eq!(store.service, "cpmesh-test");
+        store.save("k", "v").unwrap();
+        assert!(dir.path().join(".secret_k").is_file());
     }
 }

@@ -25,10 +25,12 @@
 		confirmPairing,
 		connectToServer,
 		logout,
+		restartApp,
 		type MyApprovalStatus,
 	} from '#lib/api.js';
 
 	import { isDesktop } from '#lib/platform.js';
+	import { openKeyRecovery, recovery, watchRecovery } from '#lib/recovery.svelte.js';
 	import { initTheme } from '#lib/theme.svelte.js';
 	import { toast } from '#lib/toast.svelte.js';
 	import { errorMessage, hasModKey, rememberServerUrl } from '#lib/ui.js';
@@ -40,6 +42,7 @@
 	import Logo from '#lib/components/ui/Logo.svelte';
 	import Toaster from '#lib/components/ui/Toaster.svelte';
 	import PairingScreen from '#lib/components/PairingScreen.svelte';
+	import KeyRecoveryDialog from '#lib/components/KeyRecoveryDialog.svelte';
 	import '#lib/app.css';
 
 	initTheme();
@@ -62,6 +65,8 @@
 
 	onMount(() => {
 		initEventListeners();
+		// A missing encryption key, and a newer version installed over this one
+		const stopWatchingRecovery = watchRecovery();
 		// The tray and app menus open sections of the window
 		let disposed = false;
 		let unlistenNavigate: (() => void) | undefined;
@@ -76,6 +81,7 @@
 		return () => {
 			disposed = true;
 			unlistenNavigate?.();
+			stopWatchingRecovery();
 			destroyEventListeners();
 			if (approvalPollTimer) clearInterval(approvalPollTimer);
 		};
@@ -200,6 +206,7 @@
 
 	let downloading = $state(false);
 	let connecting = $state(false);
+	let restarting = $state(false);
 
 	async function handleDownloadUpdate() {
 		if (!updateInfo) return;
@@ -207,10 +214,22 @@
 		try {
 			await downloadAndInstallUpdate(updateInfo.download_url);
 			dismissUpdate();
+			toast.info('Finish installing the update', 'cpmesh offers to restart once the new version is in place.', 8000);
 		} catch (e) {
 			toast.error('Update failed', errorMessage(e));
 		} finally {
 			downloading = false;
+		}
+	}
+
+	// The version installed over this one starts in its place
+	async function handleRestart() {
+		restarting = true;
+		try {
+			await restartApp();
+		} catch (e) {
+			restarting = false;
+			toast.error('Couldn’t restart cpmesh', errorMessage(e));
 		}
 	}
 
@@ -321,7 +340,16 @@
 		</nav>
 
 		<div class="flex min-w-0 flex-1 flex-col">
-			{#if updateInfo && desktop}
+			{#if recovery.updateInstalled && desktop}
+				<div class="flex items-center gap-3 border-b border-border bg-bg-deep px-6 py-2 text-[13px]" role="status">
+					<Icon name="refresh" size={14} class="text-muted" />
+					<p class="min-w-0 flex-1 truncate">
+						<span class="font-medium text-fg">A new version of cpmesh is installed.</span>
+						<span class="text-muted"> Restart to start using it.</span>
+					</p>
+					<Button size="xs" variant="primary" icon="refresh" loading={restarting} onclick={handleRestart}>Restart now</Button>
+				</div>
+			{:else if updateInfo && desktop}
 				<div class="flex items-center gap-3 border-b border-border bg-bg-deep px-6 py-2 text-[13px]" role="status">
 					<Icon name="download" size={14} class="text-muted" />
 					<p class="min-w-0 flex-1 truncate">
@@ -337,7 +365,15 @@
 
 			<main class="flex-1 overflow-y-auto max-sm:pb-[calc(4rem+env(safe-area-inset-bottom))]">
 				<div class="mx-auto w-full max-w-[760px] px-8 pt-7 pb-12 max-sm:px-4 max-sm:pt-5">
-					{#if syncError}
+					{#if recovery.keyProblem}
+						<Alert tone="warning" title="This device doesn’t have your encryption key" class="mb-6">
+							Sync is paused. Get the key from another of your devices, restore it from a backup, or start new keys as a last
+							resort.
+							{#snippet actions()}
+								<Button size="sm" variant="primary" icon="key" onclick={openKeyRecovery}>Recover keys…</Button>
+							{/snippet}
+						</Alert>
+					{:else if syncError}
 						<Alert tone="danger" title="Sync problem" class="mb-6" ondismiss={clearSyncError}>{syncError}</Alert>
 					{/if}
 					{@render children()}
@@ -368,4 +404,5 @@
 {/if}
 
 <Toaster />
+<KeyRecoveryDialog />
 <ConfirmHost />
