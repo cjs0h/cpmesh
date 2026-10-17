@@ -10,6 +10,7 @@ pub mod db;
 pub mod email;
 pub mod mfa;
 pub mod models;
+pub mod oauth;
 pub mod pii;
 pub mod rbac;
 pub mod routes;
@@ -35,6 +36,12 @@ pub struct RateLimiters {
     pub refresh: Arc<routes::middleware::IpRateLimiter>,
     /// Second-factor codes and emailed confirmation codes.
     pub mfa: Arc<routes::middleware::IpRateLimiter>,
+    /// Agents starting a device authorization (`/oauth/device_authorization`).
+    pub oauth_device: Arc<routes::middleware::IpRateLimiter>,
+    /// Looking up, approving and denying user codes, per address and per account: a
+    /// user code has only about 34 bits.
+    pub user_code_ip: Arc<routes::middleware::IpRateLimiter>,
+    pub user_code_user: Arc<routes::middleware::UserRateLimiter>,
 }
 
 pub struct AppState {

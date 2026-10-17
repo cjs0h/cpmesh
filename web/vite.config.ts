@@ -8,6 +8,10 @@ export default defineConfig(({ mode }) => ({
     port: 5173,
     proxy: {
       '/api': 'http://localhost:8080',
+      // Agents signing in: these send the browser to the consent pages (`#/authorize`, `#/activate`)
+      '/oauth': 'http://localhost:8080',
+      '/activate': 'http://localhost:8080',
+      '/.well-known/oauth-authorization-server': 'http://localhost:8080',
       '/ws': {
         target: 'ws://localhost:8080',
         ws: true,

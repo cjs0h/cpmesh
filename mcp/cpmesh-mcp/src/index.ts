@@ -8,29 +8,34 @@
  * locally so clipboard content stays end-to-end encrypted between the agent
  * and the user's other devices.
  *
+ * The user signs the agent in on the cpmesh website (OAuth: a browser on this
+ * computer, or a code entered in any browser) and chooses what it may do;
+ * passwords and second factors never pass through the agent.
+ *
  * Environment variables:
  *   CPMESH_SERVER_URL  — server base URL (can also be passed to cpmesh_login)
- *   CPMESH_USERNAME    — optional; enables auto-login at startup
- *   CPMESH_PASSWORD    — optional; enables auto-login at startup (with two-factor
- *                        authentication, the agent still asks the user for the code)
  *   CPMESH_HOME        — state directory (default ~/.cpmesh/mcp)
  */
 
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import type { PendingAuthorization } from "./authorization.js";
 import { CpmeshDevice, DeviceNotReadyError } from "./device.js";
-import { sameAccount } from "./signin.js";
-import { loadSession } from "./state.js";
+import { setUserAgent } from "./oauth.js";
 
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
+/** How long the MCP client may take to show a sign-in link before the link is only returned. */
+const ELICITATION_TIMEOUT_MS = 120_000;
 
 // stdout is the MCP protocol channel — all diagnostics go to stderr.
 const log = (...args: unknown[]) =>
   console.error("[cpmesh-mcp]", ...args);
 
+setUserAgent(`cpmesh-mcp/${VERSION} (Node ${process.versions.node}; ${process.platform})`);
 const device = new CpmeshDevice();
 
 function result(data: unknown, summary?: string) {
@@ -66,29 +71,15 @@ const loginSchema = {
     .optional()
     .describe(
       "cpmesh server base URL: https://cpmesh.com for the hosted service, or the user's self-hosted server. " +
-        "Optional if CPMESH_SERVER_URL is set in the server environment.",
+        "Optional if CPMESH_SERVER_URL is set in the server environment or this agent signed in before.",
     ),
-  username: z
-    .string()
-    .optional()
+  mode: z
+    .enum(["auto", "browser", "device"])
+    .default("auto")
     .describe(
-      "cpmesh account username. Optional when CPMESH_USERNAME is set, or when finishing a sign-in " +
-        "that is waiting for a two-factor code.",
-    ),
-  password: z
-    .string()
-    .optional()
-    .describe(
-      "cpmesh account password. Not needed when finishing a sign-in that is waiting for a two-factor " +
-        "code (for 10 minutes after cpmesh_login asked for it), or when CPMESH_PASSWORD is set for this account.",
-    ),
-  code: z
-    .string()
-    .max(64)
-    .optional()
-    .describe(
-      "Two-factor authentication code: the current 6-digit code from the user's authenticator app, or one " +
-        'of their recovery codes. Pass it after cpmesh_login answered status "mfa_required". Never store or log it.',
+      'Where the user approves: "browser" opens the approval page in a browser on this computer; "device" gives a ' +
+        'link and code to enter in any browser (for SSH, containers or no display). "auto" (default) picks browser ' +
+        "unless this computer can't show one, and falls back to device when the browser can't be opened.",
     ),
 };
 
@@ -99,7 +90,7 @@ const waitForApprovalSchema = {
     .min(5)
     .max(600)
     .default(180)
-    .describe("How long to keep polling for the user's approval."),
+    .describe("How long to keep waiting for the user's approval (sign-in, then device pairing)."),
 };
 
 const pushSchema = {
@@ -140,13 +131,64 @@ const removeDeviceSchema = {
 
 const server = new McpServer({ name: "cpmesh", version: VERSION });
 
+/** The URL elicitation showing the current sign-in link, until the user approved it. */
+let openElicitation: string | null = null;
+
+device.onAuthorized = () => {
+  const elicitationId = openElicitation;
+  openElicitation = null;
+  if (!elicitationId) return;
+  try {
+    void server.server.createElicitationCompletionNotifier(elicitationId)().catch((error: unknown) =>
+      log("could not report the finished sign-in to the client:", error instanceof Error ? error.message : String(error)));
+  } catch {
+    // The client no longer takes elicitations
+  }
+};
+
+/**
+ * Shows the sign-in link through the MCP client (URL elicitation) when it
+ * supports that: the device flow's link, or a browser page this server could
+ * not open itself. The link carries no secret; it is always in the result too.
+ */
+async function presentLink(
+  pending: PendingAuthorization,
+  extra: { requestId: string | number; signal: AbortSignal },
+): Promise<"accept" | "decline" | "cancel" | undefined> {
+  const url =
+    pending.mode === "device" ? pending.verification_uri_complete ?? pending.verification_uri
+      : pending.browser_opened === false ? pending.verification_uri : undefined;
+  if (!url || !server.server.getClientCapabilities()?.elicitation?.url) return undefined;
+  const elicitationId = randomUUID();
+  try {
+    const answer = await server.server.elicitInput(
+      {
+        mode: "url",
+        elicitationId,
+        url,
+        message:
+          pending.mode === "device"
+            ? `Sign in to cpmesh and approve this AI agent. Check that the page shows the code ${pending.user_code}.`
+            : "Sign in to cpmesh in a browser on this computer and approve this AI agent.",
+      },
+      { relatedRequestId: extra.requestId, signal: extra.signal, timeout: ELICITATION_TIMEOUT_MS },
+    );
+    if (answer.action === "accept") openElicitation = elicitationId;
+    return answer.action;
+  } catch (error) {
+    log("the client did not show the sign-in link:", error instanceof Error ? error.message : String(error));
+    return undefined;
+  }
+}
+
 server.registerTool(
   "cpmesh_status",
   {
     title: "cpmesh status",
     description:
-      "Check cpmesh readiness: login state, device approval status, the 8-digit pairing code and " +
-      "session ID (while pending), group key version, and the exact next step to take. Call this first if unsure.",
+      "Check cpmesh readiness: sign-in state (and the approval link while a sign-in is pending), what the user " +
+      "allowed this agent (scope), device approval status, the 8-digit pairing code and session ID (while pending), " +
+      "group key version, and the exact next step to take. Call this first if unsure.",
     inputSchema: {},
   },
   async () => {
@@ -161,53 +203,34 @@ server.registerTool(
 server.registerTool(
   "cpmesh_login",
   {
-    title: "Log in and register this agent as a cpmesh device",
+    title: "Sign in to cpmesh and register this agent as a device",
     description:
-      "Logs into the cpmesh server and registers this MCP server as a new device under the " +
-      "user's account. Ask the user for their server URL, username and password before calling. " +
-      'With two-factor authentication the response has status "mfa_required": ask the user for the ' +
-      "current 6-digit code from their authenticator app (or a recovery code), then call cpmesh_login " +
-      "again with code (the password can be left out for 10 minutes). " +
-      "Unless this is the account's first device, the device starts PENDING: once the user starts " +
-      "the approval on a trusted device, both devices show the same 8-digit pairing code (cpmesh_status " +
-      "has it, plus a 64-character full code for a stronger check). Ask the user to read the code " +
-      "shown on THEIR device; if it matches, call cpmesh_confirm_pairing with that code, then " +
-      "cpmesh_wait_for_approval.",
+      "Starts signing this agent in to the user's cpmesh account and returns at once (status " +
+      '"authorization_pending") with a link: the user signs in on the cpmesh website (password, passkey or SSO; ' +
+      "never give the agent their password or codes) and approves what this agent may do. Show the user the link " +
+      "(and, in device mode, the code their page must show), then call cpmesh_wait_for_approval: it finishes the " +
+      "sign-in and registers this MCP server as a device. Unless it is the account's first device, the device then " +
+      "waits for pairing: once the user starts the approval on a trusted device, both devices show the same 8-digit " +
+      "pairing code (cpmesh_status has it, plus a 64-character full code). Ask the user to read the code shown on " +
+      "THEIR device; if it matches, call cpmesh_confirm_pairing with that code, then cpmesh_wait_for_approval again. " +
+      "Only call this when cpmesh_status says the agent is not signed in, or to re-authorize it (e.g. to add read access).",
     inputSchema: loginSchema,
   },
-  async ({ server_url, username, password, code }) => {
+  async ({ server_url, mode }, extra) => {
     try {
-      // Left-out values continue the sign-in waiting for a two-factor code, else come from the environment
-      const env = process.env;
-      const waiting = device.waitingSignIn(server_url, username);
-      const url = server_url ?? waiting?.serverUrl ?? env.CPMESH_SERVER_URL;
-      if (!url) {
-        return failure(
-          new Error(
-            "No server URL: pass server_url or set CPMESH_SERVER_URL in the MCP server environment.",
-          ),
-        );
-      }
-      const user = username ?? waiting?.username ?? env.CPMESH_USERNAME;
-      if (!user) {
-        return failure(
-          new Error("No username: pass username or set CPMESH_USERNAME in the MCP server environment."),
-        );
-      }
-      const envAccount =
-        env.CPMESH_SERVER_URL !== undefined &&
-        env.CPMESH_USERNAME !== undefined &&
-        sameAccount(
-          { serverUrl: url, username: user },
-          { serverUrl: env.CPMESH_SERVER_URL, username: env.CPMESH_USERNAME },
-        );
-      const res = await device.login(
-        url,
-        user,
-        password ?? (envAccount ? env.CPMESH_PASSWORD : undefined),
-        code,
-      );
-      return result(res, res.message);
+      const res = await device.login({
+        serverUrl: server_url,
+        mode,
+        clientName: server.server.getClientVersion()?.name,
+      });
+      if (res.status !== "authorization_pending") return result(res, res.message);
+      const shown = await presentLink(res, extra);
+      const note =
+        shown === "accept" ? " The MCP client opened the sign-in page for the user."
+          : shown === "decline" || shown === "cancel" ? " The user dismissed the sign-in link in the MCP client: show it to them instead."
+            : "";
+      const message = res.message + note;
+      return result({ ...res, message, ...(shown && { link_shown_by_client: shown }) }, message);
     } catch (error) {
       return failure(error);
     }
@@ -217,12 +240,13 @@ server.registerTool(
 server.registerTool(
   "cpmesh_wait_for_approval",
   {
-    title: "Wait for device approval",
+    title: "Wait for the sign-in and device approval",
     description:
-      "Polls until the user approves this MCP device on one of their approved cpmesh devices " +
-      "(they compare the 8-digit pairing code shown on both devices and confirm here with " +
-      "cpmesh_confirm_pairing). On approval, the authenticated group key is synced and clipboard tools " +
-      "become usable. Tell the user to go approve the device BEFORE calling this.",
+      "Finishes whichever step is pending, waiting up to timeout_seconds: the user's sign-in approval in the browser, " +
+      "then this device's registration, then the device pairing (the user compares the 8-digit pairing code shown on " +
+      "both devices and you confirm it with cpmesh_confirm_pairing). On approval, the authenticated group key is synced " +
+      "and clipboard tools become usable. Tell the user what to approve BEFORE calling this; call it again while the " +
+      "status is still pending.",
     inputSchema: waitForApprovalSchema,
   },
   async ({ timeout_seconds }) => {
@@ -282,7 +306,8 @@ server.registerTool(
     description:
       "End-to-end encrypts and signs text, then waits for the relay to acknowledge persistence. This does NOT " +
       "confirm delivery to other devices (which may be offline). Use it to hand the user " +
-      "snippets, commands, URLs or generated content they should paste elsewhere.",
+      "snippets, commands, URLs or generated content they should paste elsewhere. Needs the user's " +
+      "permission to send (clipboard:write).",
     inputSchema: pushSchema,
   },
   async ({ text, request_id }) => {
@@ -306,7 +331,8 @@ server.registerTool(
       "Returns the user's clipboard history, decrypted (newest first). Each entry includes the " +
       "text, source device, timestamp, size and whether the sender was authenticated " +
       "(entries from devices that predate protocol 3 are readable but unauthenticated). " +
-      "Use this to see what the user copied recently on their devices.",
+      "Use this to see what the user copied recently on their devices. Needs the user's permission to read " +
+      "(clipboard:read); a send-only agent gets an error saying how to re-authorize.",
     inputSchema: getSchema,
   },
   async ({ limit, offset }) => {
@@ -331,7 +357,7 @@ server.registerTool(
     description:
       "Returns the single most recent clipboard entry across the user's devices (decrypted). " +
       "With skip_own=true it ignores entries pushed by this agent and returns what the user " +
-      "actually copied last on their devices.",
+      "actually copied last on their devices. Needs clipboard:read.",
     inputSchema: latestSchema,
   },
   async ({ skip_own }) => {
@@ -356,7 +382,7 @@ server.registerTool(
     title: "Search clipboard history",
     description:
       "Case-insensitive substring search over the user's decrypted clipboard history. " +
-      "Useful to find something the user copied earlier.",
+      "Useful to find something the user copied earlier. Needs clipboard:read.",
     inputSchema: searchSchema,
   },
   async ({ query, limit }) => {
@@ -380,7 +406,8 @@ server.registerTool(
     title: "Delete a clipboard entry",
     description:
       "Deletes one entry from the (shared) clipboard history by ID. Get IDs from " +
-      "cpmesh_get_clipboard / cpmesh_search_clipboard.",
+      "cpmesh_get_clipboard / cpmesh_search_clipboard. Needs clipboard:delete, which the user grants only " +
+      "when asked (off by default).",
     inputSchema: deleteSchema,
   },
   async ({ entry_id }) => {
@@ -419,9 +446,9 @@ server.registerTool(
   {
     title: "Remove a device from the account",
     description:
-      "Removes another device from the user's cpmesh account by ID (revokes its access). " +
-      "Refuses to remove this MCP device's own registration unless force=true — for that, " +
-      "prefer cpmesh_logout.",
+      "Removes another device from the user's cpmesh account by ID (revokes its access). Needs devices:manage, " +
+      "which the user grants only when asked (off by default). Refuses to remove this MCP device's own " +
+      "registration unless force=true, which signs this agent out like cpmesh_logout (prefer that).",
     inputSchema: removeDeviceSchema,
   },
   async ({ device_id, force }) => {
@@ -437,10 +464,11 @@ server.registerTool(
 server.registerTool(
   "cpmesh_logout",
   {
-    title: "Log out",
+    title: "Sign out",
     description:
-      "Logs out and wipes all local cpmesh state (device key, group keyring, session tokens). " +
-      "The device registration stays on the account until removed server-side.",
+      "Signs this agent out: revokes its authorization on the cpmesh server, which also removes this device " +
+      "from the user's account (their other devices rotate the group key), and wipes all local cpmesh state " +
+      "(device keys, group keyring, session tokens). Signing in again later needs a new approval and pairing.",
     inputSchema: {},
   },
   async () => {
@@ -470,7 +498,7 @@ function loadSkillText(): string {
     "# cpmesh skill",
     "",
     "1. Install: add {\"mcpServers\":{\"cpmesh\":{\"command\":\"npx\",\"args\":[\"-y\",\"cpmesh-mcp\"],\"env\":{\"CPMESH_SERVER_URL\":\"https://cpmesh.com\"}}}} to your MCP client config (self-hosted users put their own server URL).",
-    "2. First run: call cpmesh_login. If it answers mfa_required, obtain a current authenticator/recovery code from the user and sign in again with code; never store it. Start approval on a trusted device, then use cpmesh_status for the 8-digit pairing code and session ID. The user compares the code on both devices; call cpmesh_confirm_pairing with the code the user read on the approving device (or the 64-character full code), then cpmesh_wait_for_approval. Never automatically echo a relay-provided value as confirmation.",
+    "2. First run: call cpmesh_login. It returns at once with a link: the user signs in on the cpmesh website and approves this agent (in device mode they check the code shown). Never ask for their password or two-factor codes. Then call cpmesh_wait_for_approval. Unless this is the account's first device, the user starts approval on a trusted device; use cpmesh_status for the 8-digit pairing code and session ID. The user compares the code on both devices; call cpmesh_confirm_pairing with the code the user read on the approving device (or the 64-character full code), then cpmesh_wait_for_approval. Never automatically echo a relay-provided value as confirmation.",
     "3. Use cpmesh_push_clipboard to share text to the user's devices and cpmesh_get_clipboard / cpmesh_get_latest_clipboard / cpmesh_search_clipboard to read what they copied.",
   ].join("\n");
 }
@@ -481,7 +509,7 @@ server.registerPrompt(
     title: "How to install and use cpmesh",
     description:
       "Instructions for setting up and using the cpmesh MCP server: installation snippet, " +
-      "first-run device pairing, and tool usage patterns.",
+      "browser sign-in, first-run device pairing, and tool usage patterns.",
   },
   async () => ({
     messages: [
@@ -495,22 +523,6 @@ server.registerPrompt(
 
 // === Startup ===
 
-async function autoLoginFromEnv(): Promise<void> {
-  const { CPMESH_SERVER_URL, CPMESH_USERNAME, CPMESH_PASSWORD } = process.env;
-  if (!CPMESH_SERVER_URL || !CPMESH_USERNAME || !CPMESH_PASSWORD) return;
-  try {
-    if (loadSession()) return; // already logged in
-    const res = await device.login(CPMESH_SERVER_URL, CPMESH_USERNAME, CPMESH_PASSWORD);
-    log("auto-login:", res.message);
-  } catch (e) {
-    log(
-      "auto-login failed:",
-      e instanceof Error ? e.message : String(e),
-      "— tools will report not-logged-in; the agent can call cpmesh_login.",
-    );
-  }
-}
-
 async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   server.server.onclose = () => device.stop();
@@ -520,7 +532,6 @@ async function main(): Promise<void> {
   });
   await server.connect(transport);
   log(`cpmesh MCP server v${VERSION} running (stdio)`);
-  await autoLoginFromEnv();
 }
 
 main().catch((e) => {

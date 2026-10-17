@@ -308,12 +308,12 @@ export const toolGroups: McpToolGroup[] = [
     title: 'Setup and pairing',
     icon: 'key',
     tools: [
-      { name: 'cpmesh_status', desc: 'Login and approval state, the pairing code if pending, the group-key version and the exact next step.' },
-      { name: 'cpmesh_login', desc: 'Sign in and register the agent with proof of key possession.' },
+      { name: 'cpmesh_status', desc: 'Sign-in and approval state, the pairing code if pending, the group-key version and the exact next step.' },
+      { name: 'cpmesh_login', desc: 'Opens the cpmesh approval page in a browser on this computer, or gives a code to enter at /activate (over SSH, in containers or without a display), then registers the agent with proof of key possession.' },
       { name: 'cpmesh_confirm_pairing', desc: 'Confirm the 8-digit pairing code (or the full 64-character code) compared on your trusted device.' },
       { name: 'cpmesh_verify_device', desc: 'Verify an existing peer using its full public-key fingerprint after an upgrade or recovery.' },
-      { name: 'cpmesh_wait_for_approval', desc: 'Waits until you approve the device, then syncs the encryption key.' },
-      { name: 'cpmesh_logout', desc: 'Signs out and wipes the local device key, keyring and session.' },
+      { name: 'cpmesh_wait_for_approval', desc: 'Waits for whatever is pending (your approval in the browser, then pairing), then syncs the encryption key.' },
+      { name: 'cpmesh_logout', desc: 'Revokes the agent, which removes its device, and wipes the local device key, keyring and session.' },
     ],
   },
   {
@@ -339,10 +339,74 @@ export const toolGroups: McpToolGroup[] = [
 
 export const envVars = [
   { name: 'CPMESH_SERVER_URL', def: '—', desc: 'Your cpmesh server URL. Can also be passed to cpmesh_login.' },
-  { name: 'CPMESH_USERNAME', def: '—', desc: 'Optional. With CPMESH_PASSWORD, signs in automatically at startup.' },
-  { name: 'CPMESH_PASSWORD', def: '—', desc: 'Optional. Only use it in a private, user-level config file.' },
   { name: 'CPMESH_HOME', def: '~/.cpmesh/mcp', desc: 'Where the device key, keyring, session and key pins are stored.' },
 ];
+
+export interface GuideItem {
+  icon: string;
+  title: string;
+  desc: string;
+}
+
+export interface GuideStep {
+  title: string;
+  desc: string;
+}
+
+export const prerequisites: GuideItem[] = [
+  { icon: 'terminal', title: 'Node.js 18.19 or newer', desc: 'Your agent starts the server with npx. Nothing else to install.' },
+  {
+    icon: 'user',
+    title: 'A cpmesh account',
+    desc: 'On cpmesh.com or your own relay. You sign in on the cpmesh website, so the agent never sees your sign-in details.',
+  },
+  { icon: 'laptop', title: 'One approved device', desc: 'The desktop or Android app, used once to pair the agent.' },
+];
+
+/** The agent's first run: sign-in in the browser (or with a code), then pairing. */
+export function firstRunSteps(serverUrl: string): GuideStep[] {
+  const activate = `${normalizeServerUrl(serverUrl)}/activate`;
+  return [
+    {
+      title: 'Ask your agent to connect',
+      desc: `Say "Connect to cpmesh". The agent calls cpmesh_login and opens the cpmesh approval page in a browser on the same computer. Over SSH, in a container or without a display, it gives you a code to enter at ${activate} instead.`,
+    },
+    {
+      title: 'Approve it in your browser',
+      desc: "On the cpmesh approval page, sign in if asked and check the agent's name. Choose what it may do (read the clipboard, send to the clipboard, delete clipboard entries, manage devices), then approve.",
+    },
+    {
+      title: 'Pair it on a trusted device',
+      desc: 'Start approval in Devices on a device you already use. It and the agent show the same 8-digit pairing code. Only if the codes match, confirm on the device and give the code to the agent for cpmesh_confirm_pairing.',
+    },
+    {
+      title: 'Start using it',
+      desc: 'The agent calls cpmesh_wait_for_approval, receives the encryption key and is ready. It stays signed in while you use it; see it under Connected agents on the cpmesh dashboard.',
+    },
+  ];
+}
+
+export const securityNotes: string[] = [
+  'The agent signs in through the cpmesh website (OAuth with PKCE, or a code you enter), so your sign-in details and second factor never pass through the agent or its model. It gets its own tokens, limited to what you approved.',
+  'The agent is a real cpmesh device with its own identity and encryption keys. Clips are encrypted with AES-256-GCM, bound to their context and signed before they leave your machine, and the relay only stores ciphertext.',
+  'Pairing requires a person to compare the 8-digit code on both ends: each side commits to its contribution before seeing the other, so a relay that substitutes a key cannot make the codes agree. Do not skip confirmation.',
+  'Peer identities require explicit verification or a signed transition from a verified member. A relay-provided self-signature or approval flag does not establish trust.',
+  'The relay enforces what you approved. Once paired, the agent holds your encryption key, so a send-only agent is kept from your history by the relay, not by cryptography.',
+  'State lives in ~/.cpmesh/mcp (files are 0600 on macOS and Linux). Revoke the agent under Connected agents to sign it out and remove its device; cpmesh_logout does the same from the agent and wipes its local profile.',
+];
+
+export function troubleshooting(serverUrl: string): { q: string; a: string }[] {
+  const activate = `${normalizeServerUrl(serverUrl)}/activate`;
+  return [
+    { q: 'The agent does not see any cpmesh tools', a: 'Restart the client after editing its config, and check that "npx -y cpmesh-mcp" works in a terminal. Most clients have an MCP panel that shows server errors.' },
+    { q: 'npx is not found on Windows', a: 'Some clients cannot start npx directly. Use "command": "cmd" with "args": ["/c", "npx", "-y", "cpmesh-mcp"].' },
+    { q: 'Not sure what state it is in', a: 'Ask the agent to run cpmesh_status. It always replies with the next step to take.' },
+    { q: 'No browser opened', a: `When the agent can't open a browser on its computer, it gives you a code instead. Open ${activate} on any device, sign in and enter the code. You can also ask it to sign in with a code (cpmesh_login with mode "device").` },
+    { q: 'The agent was signed out', a: 'Agents stay signed in for 30 days after they were last used, and signing out everywhere signs them out too. Ask the agent to connect again and approve it in your browser: it keeps its pairing, so there is no code to compare.' },
+    { q: "The agent can't read my clipboard", a: 'It may only have permission to send. Ask it to sign in again (cpmesh_login), then turn on reading the clipboard (clipboard:read) on the cpmesh approval page.' },
+    { q: 'I have no devices yet', a: 'The agent becomes your first device. It is approved automatically and creates your encryption key.' },
+  ];
+}
 
 export const examplePrompts = [
   { prompt: 'Send the deploy command to my phone.', tool: 'cpmesh_push_clipboard' },

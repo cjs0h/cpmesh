@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { ApiError, apiWithToken } from '../lib/api';
-  import { parseAppSignIn, ssoLoginUrl } from '../lib/auth';
+  import { parseAppSignIn, rememberReturnPath, returnPathFrom, ssoLoginUrl, takeReturnPath } from '../lib/auth';
   import { challengeFromBody, completeSignIn, errorMessage, secondStepHeading, type MfaChallenge, type SessionTokens } from '../lib/mfa';
   import { loadPublicSettings, publicSettings } from '../lib/stores/settings.svelte';
   import Icon from '../components/Icon.svelte';
@@ -21,6 +21,8 @@
 
   // The desktop app's "Sign in with browser": the finished sign-in goes to the app
   const appSignIn = parseAppSignIn(window.location.hash.split('?')[1]);
+  /** An AI agent's consent page (`#/authorize?…`, `#/activate?…`): it continues after the sign-in. */
+  let returnTo = $state(appSignIn ? null : returnPathFrom(window.location.hash));
   /** Second step of the sign-in (two-factor authentication). */
   let challenge = $state<MfaChallenge | null>(null);
   /** Set once the sign-in was handed to the app. */
@@ -50,22 +52,32 @@
   let resendEmail = $state('');
 
   onMount(() => {
+    // A single sign-on started on an agent's consent page, and came back here
+    const remembered = takeReturnPath();
     // Verification links and SSO errors land here with a status in the URL
     const hash = window.location.hash;
-    if (hash.includes('verified=true')) {
-      success = 'Email verified — you can sign in now.';
-      mode = 'login';
-      window.location.hash = '#/login';
-    } else if (hash.includes('verified=error')) {
-      error = 'Email verification failed. The link may have expired — request a new one below.';
-      mode = 'login';
-      resendOpen = true;
-      window.location.hash = '#/login';
-    }
-    const socialError = new URLSearchParams(hash.split('?')[1] || '').get('social_error');
-    if (socialError) {
-      error = socialError.replace(/\+/g, ' ');
-      window.location.hash = '#/login';
+    if (!returnTo) {
+      if (hash.includes('verified=true')) {
+        success = 'Email verified — you can sign in now.';
+        mode = 'login';
+        window.location.hash = '#/login';
+      } else if (hash.includes('verified=error')) {
+        error = 'Email verification failed. The link may have expired — request a new one below.';
+        mode = 'login';
+        resendOpen = true;
+        window.location.hash = '#/login';
+      }
+      const socialError = new URLSearchParams(hash.split('?')[1] || '').get('social_error');
+      if (socialError) {
+        error = socialError.replace(/\+/g, ' ');
+        if (remembered) {
+          // Back on the agent's page (without a navigation, which would clear the error)
+          returnTo = remembered;
+          history.replaceState(history.state, '', remembered);
+        } else {
+          window.location.hash = '#/login';
+        }
+      }
     }
 
     fetch('/api/auth/social/status')
@@ -142,7 +154,7 @@
     }
   }
 
-  /** Stores the session and opens the dashboard, or hands the sign-in to the desktop app. */
+  /** Stores the session and opens the dashboard (or the agent's consent page), or hands the sign-in to the desktop app. */
   async function finishSignIn(tokens: SessionTokens) {
     try {
       const url = await completeSignIn(tokens, appSignIn);
@@ -152,12 +164,17 @@
         window.location.href = url;
         return;
       }
-      window.location.hash = '#/';
+      window.location.hash = returnTo ?? '#/';
       window.location.reload();
     } catch (err) {
       challenge = null;
       error = `The cpmesh app couldn't take over the sign-in (${errorMessage(err)}). Sign in again to retry.`;
     }
+  }
+
+  /** Single sign-on leaves this page: keep the agent's consent page for the way back. */
+  function rememberConsentPage() {
+    if (returnTo) rememberReturnPath(returnTo);
   }
 
   async function handleRegister(e: Event) {
@@ -235,6 +252,10 @@
         <div class="mb-4 flex justify-center">
           <Badge size="md" icon="monitor">Signing in to the cpmesh app</Badge>
         </div>
+      {:else if returnTo}
+        <div class="mb-4 flex justify-center">
+          <Badge size="md" icon="sparkles">Sign in to approve an AI agent</Badge>
+        </div>
       {/if}
       <div class="mb-6 text-center">
         {#if appUrl}
@@ -309,7 +330,7 @@
               <span class="text-xs text-dim">or</span>
               <div class="h-px flex-1 bg-border"></div>
             </div>
-            <Button href={ssoLoginUrl(appSignIn)} variant="secondary" size="lg" icon="globe" class="w-full">
+            <Button href={ssoLoginUrl(appSignIn)} onclick={rememberConsentPage} variant="secondary" size="lg" icon="globe" class="w-full">
               Continue with {socialProvider ? socialProvider.charAt(0).toUpperCase() + socialProvider.slice(1) : 'SSO'}
             </Button>
           {/if}

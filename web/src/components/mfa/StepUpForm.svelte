@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { setTokens } from '../../lib/auth';
+  import { setTokens, signInLocation } from '../../lib/auth';
   import { titleCase } from '../../lib/format';
   import { errorMessage, getMfaStatus, sessionTransport, verifyFactor, verifyMethods, type MfaMethod, type SessionTokens } from '../../lib/mfa';
   import { fetchCurrentUser, resetUserState, userState } from '../../lib/stores/user.svelte';
@@ -77,7 +77,8 @@
     oncancel();
     disconnectWS();
     resetUserState();
-    window.location.hash = '#/login';
+    // On an AI agent's consent page, signing in again continues there
+    window.location.hash = signInLocation();
     window.location.reload();
   }
 </script>

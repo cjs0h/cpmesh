@@ -1,5 +1,17 @@
 import { describe, expect, it } from 'vitest';
-import { agentSetups, cursorInstallLink, normalizeServerUrl, DEFAULT_SERVER_URL, shellQuote, toolGroups } from './mcp';
+import {
+  agentSetups,
+  cursorInstallLink,
+  envVars,
+  firstRunSteps,
+  normalizeServerUrl,
+  DEFAULT_SERVER_URL,
+  prerequisites,
+  securityNotes,
+  shellQuote,
+  toolGroups,
+  troubleshooting,
+} from './mcp';
 
 const URL_ = 'https://relay.example.org';
 
@@ -104,5 +116,57 @@ describe('toolGroups', () => {
     const names = toolGroups.flatMap((g) => g.tools.map((t) => t.name));
     expect(names).toHaveLength(13);
     expect(new Set(names).size).toBe(13);
+  });
+});
+
+describe('sign-in copy', () => {
+  /** Every piece of guide copy and every snippet, for one server URL. */
+  function allCopy(url: string): string {
+    return JSON.stringify([agentSetups(url), toolGroups, envVars, prerequisites, firstRunSteps(url), securityNotes, troubleshooting(url)]);
+  }
+
+  it('never asks for a password or a one-time code in the agent', () => {
+    for (const url of [URL_, DEFAULT_SERVER_URL]) {
+      const copy = allCopy(url);
+      for (const banned of [/password/i, /\btotp\b/i, /authenticator/i, /6-digit/i, /CPMESH_USERNAME/, /CPMESH_PASSWORD/]) {
+        expect(copy, String(banned)).not.toMatch(banned);
+      }
+    }
+  });
+
+  it('documents only the server URL and home directory variables', () => {
+    expect(envVars.map((v) => v.name)).toEqual(['CPMESH_SERVER_URL', 'CPMESH_HOME']);
+  });
+
+  it('walks through browser approval, or a code at /activate, then pairing with the 8-digit code', () => {
+    const steps = firstRunSteps(`${URL_}/`);
+    expect(steps.map((s) => s.title)).toEqual([
+      'Ask your agent to connect',
+      'Approve it in your browser',
+      'Pair it on a trusted device',
+      'Start using it',
+    ]);
+    expect(steps[0].desc).toContain('opens the cpmesh approval page in a browser on the same computer');
+    expect(steps[0].desc).toContain(`a code to enter at ${URL_}/activate`);
+    expect(steps[1].desc).toContain('then approve');
+    expect(steps[2].desc).toContain('8-digit pairing code');
+    expect(steps[2].desc).toContain('cpmesh_confirm_pairing');
+    expect(steps[3].desc).toContain('cpmesh_wait_for_approval');
+  });
+
+  it('helps when no browser opens, and with agents that were signed out or can only send', () => {
+    const help = troubleshooting(URL_);
+    const answer = (q: string) => help.find((t) => t.q === q)?.a ?? '';
+    expect(answer('No browser opened')).toContain(`${URL_}/activate`);
+    expect(answer('The agent was signed out')).toContain('no code to compare');
+    expect(answer("The agent can't read my clipboard")).toContain('turn on reading the clipboard (clipboard:read) on the cpmesh approval page');
+    expect(help.some((t) => /two-factor/i.test(t.q))).toBe(false);
+  });
+
+  it('describes browser sign-in and revocation in the tool reference', () => {
+    const tools = Object.fromEntries(toolGroups.flatMap((g) => g.tools.map((t) => [t.name, t.desc])));
+    expect(tools.cpmesh_login).toContain('cpmesh approval page in a browser on this computer');
+    expect(tools.cpmesh_login).toContain('/activate');
+    expect(tools.cpmesh_logout).toContain('Revokes the agent, which removes its device');
   });
 });

@@ -95,7 +95,7 @@ jobs:
       - run: npm --prefix web ci && npm --prefix web run build
       - run: cargo build --locked -p cpmesh-server
       - run: npm --prefix mcp/cpmesh-mcp ci && npm --prefix mcp/cpmesh-mcp run build
-      - name: Mandatory MFA, registration proof, persistence ACK, retry and keyring restart
+      - name: OAuth sign-in (device code and browser), registration proof, persistence ACK, retry, restart and revocation
         env:
           CPMESH_E2E_DATABASE_URL: postgres://cpmesh:cpmesh@127.0.0.1:5432/cpmesh_e2e
         run: node mcp/cpmesh-mcp/scripts/live-smoke.mjs

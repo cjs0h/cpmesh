@@ -1,5 +1,10 @@
 #!/usr/bin/env node
 // Runs only against an explicitly supplied, disposable loopback database.
+//
+// Starts the relay (with BASE_URL, so agents can sign in), creates an account
+// that must use two-factor authentication and enrolls its authenticator, then
+// runs e2e-smoke.mjs: the harness signs the user in through the web API and
+// approves the MCP server's device-flow sign-in like the dashboard does.
 import { generateKeyPairSync, randomBytes, createHmac } from "node:crypto";
 import { mkdtemp, mkdir, writeFile, rm, truncate } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -105,8 +110,7 @@ try {
   const test = spawn(process.execPath, [fileURLToPath(new URL("./e2e-smoke.mjs", import.meta.url))], {
     stdio: "inherit",
     env: {
-      ...process.env, CPMESH_HOME: join(directory, "mcp"),
-      CPMESH_SERVER_URL: "", CPMESH_USERNAME: "", CPMESH_PASSWORD: "",
+      ...process.env, CPMESH_HOME: join(directory, "mcp"), CPMESH_SERVER_URL: "",
       CPMESH_E2E_URL: url, CPMESH_E2E_USERNAME: username, CPMESH_E2E_PASSWORD: password,
       CPMESH_E2E_CODE: enabled.body.recovery_codes[0],
     },

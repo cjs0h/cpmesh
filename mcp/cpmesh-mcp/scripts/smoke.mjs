@@ -2,8 +2,8 @@
 /**
  * Protocol smoke test: spawns the built server (dist/index.js) and exercises
  * the MCP surface over stdio — initialize, tools/list (including the login
- * tool's two-factor code parameter), prompts/list, a cpmesh_status call
- * (expects a graceful not-logged-in error), and the cpmesh_skill prompt.
+ * tool's browser sign-in parameters), prompts/list, a cpmesh_status call
+ * (expects a graceful not-signed-in answer), and the cpmesh_skill prompt.
  *
  * Usage: node scripts/smoke.mjs   (run after `npm run build`)
  * Exits non-zero on any failure.
@@ -19,7 +19,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const home = await mkdtemp(join(tmpdir(), "cpmesh-protocol-smoke-"));
 const proc = spawn(process.execPath, [join(root, "dist", "index.js")], {
   stdio: ["pipe", "pipe", "pipe"],
-  env: { ...process.env, CPMESH_HOME: home, CPMESH_SERVER_URL: "", CPMESH_USERNAME: "", CPMESH_PASSWORD: "" },
+  env: { ...process.env, CPMESH_HOME: home, CPMESH_SERVER_URL: "" },
 });
 
 let failures = 0;
@@ -98,10 +98,12 @@ try {
   );
 
   const loginInput = (tools.result?.tools ?? []).find((t) => t.name === "cpmesh_login")?.inputSchema;
+  const loginProperties = Object.keys(loginInput?.properties ?? {}).sort();
   check(
-    "cpmesh_login takes an optional two-factor code and password",
-    loginInput?.properties?.code?.type === "string" &&
-      !(loginInput.required ?? []).some((name) => name === "code" || name === "password"),
+    "cpmesh_login takes an optional server URL and sign-in mode, and no credentials",
+    JSON.stringify(loginProperties) === JSON.stringify(["mode", "server_url"]) &&
+      JSON.stringify(loginInput.properties.mode.enum) === JSON.stringify(["auto", "browser", "device"]) &&
+      (loginInput.required ?? []).length === 0,
   );
 
   const prompts = await request("prompts/list", {});
@@ -116,15 +118,16 @@ try {
   });
   const statusText = status.result?.content?.[0]?.text ?? "";
   check(
-    "status tool reports not-logged-in gracefully with next step",
-    /cpmesh_login/.test(statusText) && /logged_in/.test(statusText),
+    "status tool reports not-signed-in gracefully with next step",
+    /cpmesh_login/.test(statusText) && /"logged_in": false/.test(statusText),
   );
 
   const skill = await request("prompts/get", { name: "cpmesh_skill" });
   const skillText = skill.result?.messages?.[0]?.content?.text ?? "";
   check(
-    "skill prompt has install instructions",
-    skillText.includes("mcpServers") && skillText.length > 200,
+    "skill prompt has install instructions and the browser sign-in",
+    skillText.includes("mcpServers") && skillText.length > 200 && /cpmesh_wait_for_approval/.test(skillText) &&
+      !/CPMESH_PASSWORD|mfa_required/.test(skillText),
   );
 } catch (e) {
   console.error("smoke test crashed:", e);

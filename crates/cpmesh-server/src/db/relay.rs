@@ -28,24 +28,53 @@ pub enum ClipboardWrite {
     },
 }
 
+/// The outcome of registering a new device.
+pub enum NewDevice {
+    Registered(Box<Device>),
+    /// The account has as many devices as its plan allows.
+    LimitReached,
+    /// The agent grant registering it is revoked.
+    GrantRevoked,
+    /// The agent grant registering it already has a device (one per grant).
+    GrantHasDevice,
+}
+
 impl Db {
+    /// Registers a new device; the first device of an account is approved, later ones
+    /// wait for approval. A device registered by an agent is bound to its grant.
     pub async fn register_device(
         &self,
         user_id: Uuid,
         req: &cpmesh_proto::models::RegisterDeviceRequest,
         max_devices: i64,
-    ) -> Result<Option<Device>, sqlx::Error> {
+        grant_id: Option<Uuid>,
+    ) -> Result<NewDevice, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
             .bind(user_id)
             .fetch_one(&mut *tx)
             .await?;
+        if let Some(grant_id) = grant_id {
+            let grant: Option<(bool, bool)> = sqlx::query_as(
+                "SELECT revoked_at IS NOT NULL, device_id IS NOT NULL FROM oauth_grants
+                 WHERE id = $1 AND user_id = $2 FOR UPDATE",
+            )
+            .bind(grant_id)
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            match grant {
+                None | Some((true, _)) => return Ok(NewDevice::GrantRevoked),
+                Some((false, true)) => return Ok(NewDevice::GrantHasDevice),
+                Some((false, false)) => {}
+            }
+        }
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM devices WHERE user_id = $1")
             .bind(user_id)
             .fetch_one(&mut *tx)
             .await?;
         if count >= max_devices {
-            return Ok(None);
+            return Ok(NewDevice::LimitReached);
         }
         let status = if count == 0 { "approved" } else { "pending" };
         let device = sqlx::query_as::<_, Device>(
@@ -54,8 +83,15 @@ impl Db {
         ).bind(user_id).bind(&req.name).bind(&req.public_key).bind(&req.public_key_sig)
             .bind(status).bind(&req.fingerprint).bind(&req.encryption_key).bind(&req.encryption_key_sig)
             .fetch_one(&mut *tx).await?;
+        if let Some(grant_id) = grant_id {
+            sqlx::query("UPDATE oauth_grants SET device_id = $2 WHERE id = $1")
+                .bind(grant_id)
+                .bind(device.id)
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
-        Ok(Some(device))
+        Ok(NewDevice::Registered(Box::new(device)))
     }
 
     pub async fn rotation_required(&self, user_id: Uuid) -> Result<bool, sqlx::Error> {

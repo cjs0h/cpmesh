@@ -328,6 +328,84 @@ pub struct ApiToken {
     pub created_at: DateTime<Utc>,
 }
 
+/// An agent's authorization (OAuth grant). Bound to the agent's device once it
+/// registers; one grant per agent device.
+#[derive(Debug, Clone, FromRow)]
+pub struct OauthGrant {
+    pub id: uuid::Uuid,
+    pub user_id: uuid::Uuid,
+    pub client_id: String,
+    pub scopes: sqlx::types::Json<Vec<String>>,
+    pub device_id: Option<uuid::Uuid>,
+    /// Name the agent reported for itself when authorized.
+    pub agent_name: String,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    /// When the user authorized the agent (epoch seconds): the start of every session
+    /// of the grant, as recorded in its tokens.
+    pub session_start: i64,
+}
+
+impl OauthGrant {
+    pub fn scopes(&self) -> crate::oauth::Scopes {
+        crate::oauth::Scopes::from_recorded(self.scopes.iter().map(String::as_str))
+    }
+}
+
+/// A grant in force with what the "Connected agents" list shows about it.
+#[derive(Debug, Clone, FromRow)]
+pub struct OauthGrantListing {
+    pub id: uuid::Uuid,
+    pub client_id: String,
+    pub agent_name: String,
+    pub scopes: sqlx::types::Json<Vec<String>>,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub session_start: i64,
+    pub device_id: Option<uuid::Uuid>,
+    pub device_name: Option<String>,
+    pub device_status: Option<String>,
+    /// The user's bulk revocation time (`users.tokens_revoked_before`), 0 when none.
+    pub tokens_revoked_before: i64,
+}
+
+/// An authorization code or a device code (only its hash is stored).
+#[derive(Debug, Clone, FromRow)]
+pub struct OauthCode {
+    pub code_hash: String,
+    /// `authorization_code` or `device_code`.
+    pub kind: String,
+    /// Device codes: the user code, normalized (eight letters).
+    pub user_code: Option<String>,
+    pub client_id: String,
+    pub redirect_uri: Option<String>,
+    pub code_challenge: Option<String>,
+    /// Requested while a device code is pending, then what the user approved.
+    pub scopes: sqlx::types::Json<Vec<String>>,
+    /// `pending`, `approved` or `denied`.
+    pub status: String,
+    /// Who approved (or denied).
+    pub user_id: Option<uuid::Uuid>,
+    /// The approving session was confirmed with a second factor.
+    pub mfa: bool,
+    /// When the user approved (epoch seconds).
+    pub approved_at: Option<i64>,
+    pub requester_ip: Option<String>,
+    pub user_agent: Option<String>,
+    pub agent_name: String,
+    pub interval_secs: i32,
+    pub last_polled_at: Option<DateTime<Utc>>,
+    pub expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl OauthCode {
+    pub fn scopes(&self) -> crate::oauth::Scopes {
+        crate::oauth::Scopes::from_recorded(self.scopes.iter().map(String::as_str))
+    }
+}
+
 // Audit action constants
 pub const AUDIT_LOGIN_OK: &str = "login_success";
 pub const AUDIT_LOGIN_FAIL: &str = "login_failure";
@@ -377,6 +455,12 @@ pub const AUDIT_ADMIN_TEST_SMTP: &str = "admin_test_smtp";
 pub const AUDIT_ADMIN_TEST_OIDC: &str = "admin_test_oidc";
 pub const AUDIT_ADMIN_API_TOKEN_CREATE: &str = "admin_api_token_create";
 pub const AUDIT_ADMIN_API_TOKEN_REVOKE: &str = "admin_api_token_revoke";
+// OAuth for agents
+pub const AUDIT_OAUTH_GRANT_CREATE: &str = "oauth.grant.create";
+pub const AUDIT_OAUTH_GRANT_REVOKE: &str = "oauth.grant.revoke";
+pub const AUDIT_OAUTH_DEVICE_APPROVE: &str = "oauth.device.approve";
+pub const AUDIT_OAUTH_DEVICE_DENY: &str = "oauth.device.deny";
+pub const AUDIT_OAUTH_TOKEN_REUSE: &str = "oauth.token.reuse";
 
 /// Every audit action, for filtering in the admin console.
 pub const AUDIT_ACTIONS: &[&str] = &[
@@ -426,4 +510,9 @@ pub const AUDIT_ACTIONS: &[&str] = &[
     AUDIT_ADMIN_TEST_OIDC,
     AUDIT_ADMIN_API_TOKEN_CREATE,
     AUDIT_ADMIN_API_TOKEN_REVOKE,
+    AUDIT_OAUTH_GRANT_CREATE,
+    AUDIT_OAUTH_GRANT_REVOKE,
+    AUDIT_OAUTH_DEVICE_APPROVE,
+    AUDIT_OAUTH_DEVICE_DENY,
+    AUDIT_OAUTH_TOKEN_REUSE,
 ];

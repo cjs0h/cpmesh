@@ -17,18 +17,21 @@ use serde_json::{Value, json};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{AssertSqlSafe, PgPool};
 
+use crate::audit::RequestMeta;
 use crate::config::Config;
-use crate::db::Db;
+use crate::db::{Db, GrantBinding};
 use crate::email::EmailService;
 use crate::mfa::totp;
 use crate::mfa::webauthn::tests::TestAuthenticator;
 use crate::mfa::webauthn::{b64url, b64url_decode};
-use crate::models::User;
+use crate::models::{OauthGrant, User};
+use crate::oauth::grants::{RevokeReason, revoke_grant};
+use crate::oauth::{AgentClaims, MCP_CLIENT_ID, Scope, Scopes};
 use crate::pii::PiiService;
 use crate::rbac::Role;
-use crate::routes::auth::PkceCodeStore;
-use crate::routes::auth_service::{AuthService, SessionGrant, now_epoch};
-use crate::routes::middleware::build_rate_limiter;
+use crate::routes::auth::{PkceCodeStore, RefreshError, Refresher, rotate_refresh_token};
+use crate::routes::auth_service::{AuthService, RefreshResult, SessionGrant, now_epoch};
+use crate::routes::middleware::{build_rate_limiter, build_user_rate_limiter};
 use crate::settings::SettingsCache;
 use crate::test_support::*;
 use crate::ws::Hub;
@@ -547,6 +550,13 @@ struct Options {
     download_url_prefixes: Vec<String>,
     downloads_dir: Option<String>,
     updater_public_key: Option<String>,
+    refresh_reuse_grace: Option<std::time::Duration>,
+    /// Requests per minute and address for sign-ins and refreshes.
+    refresh_limit: Option<u32>,
+    /// User code lookups and decisions per minute and account.
+    user_code_limit: Option<u32>,
+    /// User code lookups and decisions per minute and address.
+    user_code_ip_limit: Option<u32>,
 }
 
 async fn with_app<F, Fut>(options: Options, body: F)
@@ -596,25 +606,32 @@ where
         EmailService::disabled()
     };
     let keys = test_keys();
+    let mut auth = AuthService::new(
+        TEST_KID,
+        &keys.private_pem,
+        &keys.public_keys_json,
+        Some(pool.clone()),
+    )
+    .unwrap();
+    if let Some(grace) = options.refresh_reuse_grace {
+        auth = auth.with_refresh_reuse_grace(grace);
+    }
     let state = Arc::new(AppState {
         db,
         config,
         hub: Hub::new(),
         pii: Some(PiiService::new(TEST_PII_MASTER_KEY, TEST_PII_HMAC_KEY).unwrap()),
-        auth: AuthService::new(
-            TEST_KID,
-            &keys.private_pem,
-            &keys.public_keys_json,
-            Some(pool.clone()),
-        )
-        .unwrap(),
+        auth,
         email,
         pkce_store: PkceCodeStore::new(),
         rate_limiters: RateLimiters {
             login: build_rate_limiter(1000),
             register: build_rate_limiter(1000),
-            refresh: build_rate_limiter(1000),
+            refresh: build_rate_limiter(options.refresh_limit.unwrap_or(1000)),
             mfa: build_rate_limiter(1000),
+            oauth_device: build_rate_limiter(1000),
+            user_code_ip: build_rate_limiter(options.user_code_ip_limit.unwrap_or(1000)),
+            user_code_user: build_user_rate_limiter(options.user_code_limit.unwrap_or(1000)),
         },
         settings: SettingsCache::new(),
     });
@@ -2031,6 +2048,1938 @@ async fn an_enroll_ticket_cannot_add_a_factor_once_the_account_has_one() {
             let (status, body) = app.call("POST", path, Some(&ticket), None).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
         }
+    })
+    .await;
+}
+
+// ---- Agents (OAuth clients) ---------------------------------------------------
+
+/// A new cpmesh-mcp grant of `user`, and its session before the agent's device exists.
+async fn agent_grant(app: &TestApp, user: &User, scopes: &[Scope]) -> (OauthGrant, SessionGrant) {
+    let session = SessionGrant::signed_in(user.id, true);
+    let grant = app
+        .state
+        .db
+        .create_oauth_grant(
+            user.id,
+            MCP_CLIENT_ID,
+            Scopes::of(scopes),
+            "Test agent",
+            session.session_start,
+        )
+        .await
+        .unwrap();
+    let session = session.with_agent(AgentClaims {
+        client_id: MCP_CLIENT_ID,
+        scopes: Scopes::of(scopes),
+        grant_id: grant.id,
+    });
+    (grant, session)
+}
+
+/// Registers the device holding `key`, with a fresh proof for `token`'s session.
+async fn register_device(
+    app: &TestApp,
+    token: &str,
+    key: &aws_lc_rs::signature::EcdsaKeyPair,
+    fingerprint: &str,
+) -> (StatusCode, Value) {
+    let (status, challenge) = app
+        .call("POST", "/api/devices/challenge", Some(token), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{challenge}");
+    let body = device_registration(key, challenge["challenge"].as_str().unwrap(), fingerprint);
+    app.call("POST", "/api/devices", Some(token), Some(body))
+        .await
+}
+
+fn registered_id(body: &Value) -> uuid::Uuid {
+    body["device"]["id"].as_str().unwrap().parse().unwrap()
+}
+
+/// Details of `user`'s audit entries for `action`, oldest first.
+async fn audit_details(app: &TestApp, user: &User, action: &str) -> Vec<Value> {
+    sqlx::query_scalar(
+        "SELECT details FROM audit_logs WHERE user_id = $1 AND action = $2 ORDER BY created_at",
+    )
+    .bind(user.id)
+    .bind(action)
+    .fetch_all(&app.state.db.pool)
+    .await
+    .unwrap()
+}
+
+async fn grant_revoked(app: &TestApp, grant_id: uuid::Uuid) -> bool {
+    let grant = app.state.db.get_oauth_grant(grant_id).await.unwrap();
+    grant.unwrap().revoked_at.is_some()
+}
+
+#[tokio::test]
+async fn agents_enroll_under_their_grant_and_use_only_what_it_allows() {
+    use aws_lc_rs::signature::KeyPair as _;
+    with_app(Options::default(), |app| async move {
+        let db = &app.state.db;
+        let auth = &app.state.auth;
+        let user = app.member("agent-owner").await;
+        let desktop = db
+            .create_device(
+                user.id,
+                "Desktop",
+                device_key().public_key().as_ref(),
+                None,
+                "approved",
+                None,
+            )
+            .await
+            .unwrap();
+        let (grant, session) =
+            agent_grant(&app, &user, &[Scope::ClipboardRead, Scope::ClipboardWrite]).await;
+        let token = auth.issue_access(&session).unwrap();
+
+        // Before its device exists, an agent can read the account and enroll, nothing else
+        let (status, me) = app.call("GET", "/api/me", Some(&token), None).await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        assert_eq!(me["id"], user.id.to_string());
+        let (status, body) = app.call("GET", "/api/devices", Some(&token), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["code"], "device_required");
+
+        let key = device_key();
+        let (status, registered) = register_device(&app, &token, &key, "agent").await;
+        assert_eq!(status, StatusCode::CREATED, "{registered}");
+        assert_eq!(registered["device"]["status"], "pending");
+        let device_id = registered_id(&registered);
+        assert_eq!(
+            db.get_oauth_grant(grant.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .device_id,
+            Some(device_id)
+        );
+        // The device's session is still the agent's
+        let device_token = registered["access_token"].as_str().unwrap().to_string();
+        let claims = auth.validate_access_token(&device_token).unwrap();
+        assert_eq!(
+            (claims.device_id, claims.agent),
+            (Some(device_id), session.agent)
+        );
+        let RefreshResult::Ok(refresh, _, _) =
+            auth.validate_refresh_token(registered["refresh_token"].as_str().unwrap())
+        else {
+            panic!("invalid refresh");
+        };
+        assert_eq!(refresh.agent, session.agent);
+
+        // While pending it sees its approval and the account, not the mesh
+        assert_eq!(
+            app.call("GET", "/api/device-approvals/me", Some(&device_token), None)
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.call("GET", "/api/me", Some(&device_token), None)
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.call("GET", "/api/devices", Some(&device_token), None)
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+
+        // One device per grant: the same key reconnects, another key is refused
+        let (status, body) = register_device(&app, &token, &key, "agent").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(registered_id(&body), device_id);
+        let (status, body) = register_device(&app, &token, &device_key(), "another").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["code"], "grant_device_mismatch");
+        assert_eq!(db.get_devices_by_user(user.id).await.unwrap().len(), 2);
+
+        // Once approved, it may do what its scopes allow
+        db.update_device_status(device_id, user.id, "approved", Some(desktop.id))
+            .await
+            .unwrap();
+        db.rotate_group_key(
+            user.id,
+            desktop.id,
+            0,
+            1,
+            &[(desktop.id, vec![1; 60]), (device_id, vec![2; 60])],
+            24,
+        )
+        .await
+        .unwrap();
+        for (method, uri, expected) in [
+            ("GET", "/api/devices".to_string(), StatusCode::OK),
+            ("GET", "/api/devices/keys".into(), StatusCode::OK),
+            ("GET", "/api/group-keys/current".into(), StatusCode::OK),
+            ("GET", "/api/clipboard".into(), StatusCode::OK),
+            ("GET", "/api/me".into(), StatusCode::OK),
+            (
+                "DELETE",
+                format!("/api/clipboard/{}", uuid::Uuid::new_v4()),
+                StatusCode::FORBIDDEN,
+            ),
+            ("DELETE", "/api/clipboard".into(), StatusCode::FORBIDDEN),
+            (
+                "DELETE",
+                format!("/api/devices/{}", desktop.id),
+                StatusCode::FORBIDDEN,
+            ),
+            ("POST", "/api/ws/ticket".into(), StatusCode::FORBIDDEN),
+            ("GET", "/api/me/subscription".into(), StatusCode::FORBIDDEN),
+            (
+                "GET",
+                "/api/device-approvals/pending".into(),
+                StatusCode::FORBIDDEN,
+            ),
+            ("GET", "/api/mfa".into(), StatusCode::FORBIDDEN),
+        ] {
+            let (status, body) = app.call(method, &uri, Some(&device_token), None).await;
+            assert_eq!(status, expected, "{method} {uri}: {body}");
+        }
+        assert!(db.get_device_by_id(desktop.id).await.is_ok());
+
+        // Every request checks the grant, and notes that it was used
+        let mut used = false;
+        for _ in 0..50 {
+            if db
+                .get_oauth_grant(grant.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_used_at
+                .is_some()
+            {
+                used = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(used, "last_used_at was never set");
+        let other = app.member("agent-stranger").await;
+        let (foreign, _) = agent_grant(&app, &other, &[Scope::ClipboardRead]).await;
+        for grant_id in [uuid::Uuid::new_v4(), foreign.id] {
+            let agent = AgentClaims {
+                grant_id,
+                ..session.agent.unwrap()
+            };
+            let forged = auth.issue_access(&session.with_agent(agent)).unwrap();
+            let (status, body) = app.call("GET", "/api/me", Some(&forged), None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+            assert_eq!(body["code"], "invalid_token");
+        }
+
+        // Revoking the grant removes its device the way removing a device does
+        assert!(!db.rotation_required(user.id).await.unwrap());
+        let meta = RequestMeta::default();
+        assert!(
+            revoke_grant(&app.state, user.id, grant.id, RevokeReason::User, &meta)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !revoke_grant(&app.state, user.id, grant.id, RevokeReason::User, &meta)
+                .await
+                .unwrap()
+        );
+        assert!(grant_revoked(&app, grant.id).await);
+        assert!(db.get_device_by_id(device_id).await.is_err());
+        assert!(
+            db.rotation_required(user.id).await.unwrap(),
+            "the group key must exclude it"
+        );
+        let (status, body) = app.call("GET", "/api/me", Some(&device_token), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        let audits = audit_details(&app, &user, "oauth.grant.revoke").await;
+        assert_eq!(audits.len(), 1, "{audits:?}");
+        assert_eq!(audits[0]["reason"], "user");
+        assert_eq!(audits[0]["device_id"], device_id.to_string());
+        assert_eq!(audits[0]["was_approved"], true);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn authorizing_again_moves_the_device_to_the_new_grant_without_pairing() {
+    with_app(Options::default(), |app| async move {
+        let db = &app.state.db;
+        let auth = &app.state.auth;
+        let user = app.member("agent-again").await;
+        let (old, old_session) = agent_grant(&app, &user, &[Scope::ClipboardRead]).await;
+        let old_token = auth.issue_access(&old_session).unwrap();
+        let key = device_key();
+        let (status, registered) = register_device(&app, &old_token, &key, "agent").await;
+        assert_eq!(status, StatusCode::CREATED, "{registered}");
+        assert_eq!(
+            registered["device"]["status"], "approved",
+            "the account's first device"
+        );
+        let device_id = registered_id(&registered);
+        let old_device_token = registered["access_token"].as_str().unwrap().to_string();
+
+        // Its tokens expired, so the agent is authorized again and reconnects its device
+        let (new, new_session) =
+            agent_grant(&app, &user, &[Scope::ClipboardRead, Scope::ClipboardWrite]).await;
+        let new_token = auth.issue_access(&new_session).unwrap();
+        let (status, body) = register_device(&app, &new_token, &key, "agent").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(registered_id(&body), device_id);
+        assert_eq!(body["device"]["status"], "approved", "still paired");
+        let new_device_token = body["access_token"].as_str().unwrap().to_string();
+        let claims = auth.validate_access_token(&new_device_token).unwrap();
+        assert_eq!(claims.agent.unwrap().grant_id, new.id);
+        assert_eq!(
+            db.get_oauth_grant(new.id).await.unwrap().unwrap().device_id,
+            Some(device_id)
+        );
+
+        // The old grant is superseded: revoked, without its device
+        assert!(grant_revoked(&app, old.id).await);
+        assert_eq!(
+            app.call("GET", "/api/devices", Some(&old_device_token), None)
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            app.call("GET", "/api/devices", Some(&new_device_token), None)
+                .await
+                .0,
+            StatusCode::OK
+        );
+        // ...and cannot take the device back
+        let (status, _) = app
+            .call("POST", "/api/devices/challenge", Some(&old_token), None)
+            .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let audits = audit_details(&app, &user, "oauth.grant.revoke").await;
+        assert_eq!(audits.len(), 1, "{audits:?}");
+        assert_eq!(audits[0]["reason"], "superseded");
+        assert_eq!(audits[0]["grant_id"], old.id.to_string());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn agent_refresh_rotates_within_the_grant_and_reuse_revokes_only_the_grant() {
+    let options = Options {
+        refresh_reuse_grace: Some(std::time::Duration::ZERO),
+        ..Options::default()
+    };
+    with_app(options, |app| async move {
+        let db = &app.state.db;
+        let auth = &app.state.auth;
+        let user = app.member("agent-refresh").await;
+        let (_, web_refresh) = auth
+            .issue_session(&SessionGrant::signed_in(user.id, true))
+            .unwrap();
+        let (grant, session) = agent_grant(&app, &user, &[Scope::ClipboardRead]).await;
+        let token = auth.issue_access(&session).unwrap();
+        let (status, registered) = register_device(&app, &token, &device_key(), "agent").await;
+        assert_eq!(status, StatusCode::CREATED, "{registered}");
+        let device_id = registered_id(&registered);
+        let refresh = registered["refresh_token"].as_str().unwrap().to_string();
+        let meta = RequestMeta::default();
+        let mcp = Refresher::Agent {
+            client_id: MCP_CLIENT_ID,
+        };
+
+        // Agents refresh only at the token endpoint, as their own client
+        let (status, body) = app
+            .call(
+                "POST",
+                "/api/auth/refresh",
+                None,
+                Some(json!({"refresh_token": refresh})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["code"], "oauth_client");
+        let other_client = Refresher::Agent {
+            client_id: "another-client",
+        };
+        assert_eq!(
+            rotate_refresh_token(&app.state, &refresh, other_client, &meta)
+                .await
+                .unwrap_err(),
+            RefreshError::WrongClient
+        );
+        assert_eq!(
+            rotate_refresh_token(&app.state, &web_refresh, mcp, &meta)
+                .await
+                .unwrap_err(),
+            RefreshError::WrongClient
+        );
+
+        let rotated = rotate_refresh_token(&app.state, &refresh, mcp, &meta)
+            .await
+            .unwrap();
+        assert_eq!(rotated.grant.agent, session.agent);
+        assert_eq!(rotated.grant.device_id, Some(device_id));
+        let RefreshResult::Ok(claims, _, exp) = auth.validate_refresh_token(&rotated.refresh_token)
+        else {
+            panic!("invalid refresh");
+        };
+        assert_eq!(claims.agent, session.agent);
+        assert!(exp > now_epoch() + 29 * 24 * 3600, "30-day sliding refresh");
+        assert_eq!(
+            app.call("GET", "/api/devices", Some(&rotated.access_token), None)
+                .await
+                .0,
+            StatusCode::OK
+        );
+
+        // Presenting the used token again is theft: the grant and its device go, while
+        // the user's other sessions stay
+        assert_eq!(
+            rotate_refresh_token(&app.state, &refresh, mcp, &meta)
+                .await
+                .unwrap_err(),
+            RefreshError::Reused
+        );
+        assert!(grant_revoked(&app, grant.id).await);
+        assert!(db.get_device_by_id(device_id).await.is_err());
+        assert_eq!(
+            rotate_refresh_token(&app.state, &rotated.refresh_token, mcp, &meta)
+                .await
+                .unwrap_err(),
+            RefreshError::GrantRevoked
+        );
+        assert_eq!(
+            app.call("GET", "/api/me", Some(&rotated.access_token), None)
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let user_row = db.get_user_by_id(user.id).await.unwrap();
+        assert_eq!(user_row.tokens_revoked_before.unwrap_or_default(), 0);
+        let (status, body) = app
+            .call(
+                "POST",
+                "/api/auth/refresh",
+                None,
+                Some(json!({"refresh_token": web_refresh})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let reuse = audit_details(&app, &user, "oauth.token.reuse").await;
+        assert_eq!(reuse.len(), 1);
+        assert_eq!(reuse[0]["grant_id"], grant.id.to_string());
+        let revocations = audit_details(&app, &user, "oauth.grant.revoke").await;
+        assert_eq!(revocations[0]["reason"], "token_reuse");
+        assert!(
+            audit_details(&app, &user, "token_revoke_all")
+                .await
+                .is_empty()
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn removing_or_rejecting_an_agents_device_revokes_its_grant() {
+    use aws_lc_rs::signature::KeyPair as _;
+    with_app(Options::default(), |app| async move {
+        let db = &app.state.db;
+        let auth = &app.state.auth;
+        let user = app.member("agent-devices").await;
+        let desktop = db
+            .create_device(
+                user.id,
+                "Desktop",
+                device_key().public_key().as_ref(),
+                None,
+                "approved",
+                None,
+            )
+            .await
+            .unwrap();
+        let desktop_token = auth
+            .issue_access(&SessionGrant::signed_in(user.id, true).with_device(Some(desktop.id)))
+            .unwrap();
+        let web = app.mfa_session(&user);
+
+        // Removed from the dashboard
+        let (removed, session) = agent_grant(&app, &user, &[Scope::ClipboardRead]).await;
+        let token = auth.issue_access(&session).unwrap();
+        let (status, registered) = register_device(&app, &token, &device_key(), "removed").await;
+        assert_eq!(status, StatusCode::CREATED, "{registered}");
+        let removed_device = registered_id(&registered);
+        let (status, _) = app
+            .call(
+                "DELETE",
+                &format!("/api/devices/{removed_device}"),
+                Some(&web),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(grant_revoked(&app, removed.id).await);
+
+        // Rejected by one of the user's devices
+        let (rejected, session) = agent_grant(&app, &user, &[Scope::ClipboardRead]).await;
+        let token = auth.issue_access(&session).unwrap();
+        let (status, registered) = register_device(&app, &token, &device_key(), "rejected").await;
+        assert_eq!(status, StatusCode::CREATED, "{registered}");
+        let rejected_device = registered_id(&registered);
+        let (status, body) = app
+            .call(
+                "POST",
+                &format!("/api/device-approvals/{rejected_device}/reject"),
+                Some(&desktop_token),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(grant_revoked(&app, rejected.id).await);
+        assert_eq!(
+            db.get_device_status(rejected_device).await.unwrap(),
+            "rejected"
+        );
+        let (status, _) = app.call("GET", "/api/me", Some(&token), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let reasons: Vec<Value> = audit_details(&app, &user, "oauth.grant.revoke")
+            .await
+            .into_iter()
+            .map(|d| d["reason"].clone())
+            .collect();
+        assert_eq!(reasons, [json!("device_removed"), json!("device_rejected")]);
+    })
+    .await;
+}
+
+/// The types of the messages a socket receives, up to and including the first `kind`.
+async fn messages_until(socket: &mut TestSocket, kind: &str) -> Vec<String> {
+    use futures_util::StreamExt;
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let mut kinds = Vec::new();
+        loop {
+            let message = socket.next().await.expect("socket closed").unwrap();
+            if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                let value: Value = serde_json::from_str(&text).unwrap();
+                kinds.push(value["type"].as_str().unwrap_or_default().to_string());
+                if kinds.last().is_some_and(|last| last == kind) {
+                    return kinds;
+                }
+            }
+        }
+    })
+    .await
+    .expect("message deadline")
+}
+
+#[tokio::test]
+async fn send_only_agents_push_without_receiving_entries() {
+    use aws_lc_rs::signature::KeyPair as _;
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    with_app(Options::default(), |app| async move {
+        let auth = &app.state.auth;
+        let user = app.member("send-only").await;
+        let db = &app.state.db;
+        let desktop_key = device_key();
+        let desktop = db
+            .create_device(
+                user.id,
+                "Desktop",
+                desktop_key.public_key().as_ref(),
+                None,
+                "approved",
+                None,
+            )
+            .await
+            .unwrap();
+        // Two paired agents: one may only send, the other only read
+        let mut agents = Vec::new();
+        for (name, scope) in [
+            ("Writer", Scope::ClipboardWrite),
+            ("Reader", Scope::ClipboardRead),
+        ] {
+            let (grant, session) = agent_grant(&app, &user, &[scope]).await;
+            let key = device_key();
+            let device = db
+                .create_device(
+                    user.id,
+                    name,
+                    key.public_key().as_ref(),
+                    None,
+                    "approved",
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                db.bind_oauth_grant_device(grant.id, user.id, device.id)
+                    .await
+                    .unwrap(),
+                GrantBinding::Bound { superseded: None }
+            );
+            let access = auth
+                .issue_access(&session.with_device(Some(device.id)))
+                .unwrap();
+            agents.push((key, device, access));
+        }
+        let [
+            (writer_key, writer, writer_access),
+            (reader_key, reader, reader_access),
+        ] = agents.try_into().ok().unwrap();
+        db.rotate_group_key(
+            user.id,
+            desktop.id,
+            0,
+            1,
+            &[
+                (desktop.id, vec![1; 60]),
+                (writer.id, vec![2; 60]),
+                (reader.id, vec![3; 60]),
+            ],
+            24,
+        )
+        .await
+        .unwrap();
+
+        // An agent that may neither read nor send cannot open the socket at all
+        let (_, session) = agent_grant(&app, &user, &[Scope::DevicesManage]).await;
+        let (status, body) = app
+            .call(
+                "GET",
+                "/ws",
+                Some(&auth.issue_access(&session).unwrap()),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["code"], "insufficient_scope");
+        // ...and a send-only one cannot read the history over HTTP either
+        assert_eq!(
+            app.call("GET", "/api/clipboard", Some(&writer_access), None)
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = app.router.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let desktop_access = auth
+            .issue_access(&SessionGrant::signed_in(user.id, true).with_device(Some(desktop.id)))
+            .unwrap();
+        let mut desktop_socket = open_socket(address, &desktop_access).await;
+        let mut writer_socket = open_socket(address, &writer_access).await;
+        let mut reader_socket = open_socket(address, &reader_access).await;
+        let now = chrono::Utc::now().timestamp_millis();
+
+        // The send-only agent pushes and gets its acknowledgement; the others get the entry
+        let push = signed_push(
+            &writer_key,
+            writer.id,
+            &uuid::Uuid::new_v4().to_string(),
+            1,
+            &[7; 48],
+            now,
+        );
+        writer_socket
+            .send(Message::Text(push.to_string().into()))
+            .await
+            .unwrap();
+        let ack = socket_message(&mut writer_socket, "clipboard_ack").await;
+        assert_eq!(ack["status"], "accepted", "{ack}");
+        assert_eq!(
+            socket_message(&mut desktop_socket, "clipboard_new").await["entry"]["id"],
+            ack["entry_id"]
+        );
+        assert_eq!(
+            socket_message(&mut reader_socket, "clipboard_new").await["entry"]["id"],
+            ack["entry_id"]
+        );
+
+        // ...but never receives an entry itself
+        let push = signed_push(
+            &desktop_key,
+            desktop.id,
+            &uuid::Uuid::new_v4().to_string(),
+            1,
+            &[8; 48],
+            now,
+        );
+        desktop_socket
+            .send(Message::Text(push.to_string().into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            socket_message(&mut desktop_socket, "clipboard_ack").await["status"],
+            "accepted"
+        );
+        assert_eq!(
+            socket_message(&mut reader_socket, "clipboard_new").await["entry"]["device_id"],
+            desktop.id.to_string()
+        );
+        // Messages arrive in order: whatever was sent to it before the pong is in by then
+        writer_socket
+            .send(Message::Text(json!({"type": "ping"}).to_string().into()))
+            .await
+            .unwrap();
+        let received = messages_until(&mut writer_socket, "pong").await;
+        assert!(
+            !received.iter().any(|kind| kind == "clipboard_new"),
+            "{received:?}"
+        );
+
+        // A read-only agent cannot push
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let push = signed_push(&reader_key, reader.id, &request_id, 1, &[9; 48], now);
+        reader_socket
+            .send(Message::Text(push.to_string().into()))
+            .await
+            .unwrap();
+        let ack = socket_message(&mut reader_socket, "clipboard_ack").await;
+        assert_eq!(ack["status"], "rejected", "{ack}");
+        assert_eq!(ack["code"], "insufficient_scope");
+        assert_eq!(ack["request_id"], request_id);
+        assert_eq!(db.count_user_clipboard_entries(user.id).await.unwrap(), 2);
+
+        // Device events still reach the send-only agent
+        reader_socket.close(None).await.unwrap();
+        let event = socket_message(&mut writer_socket, "device_status").await;
+        assert_eq!(event["device_id"], reader.id.to_string());
+        assert_eq!(event["online"], false);
+        server.abort();
+        let _ = server.await;
+    })
+    .await;
+}
+
+// ---- Agents signing in (OAuth endpoints) --------------------------------------
+
+const LOOPBACK: &str = "http://127.0.0.1:53682/callback";
+const VERIFIER: &str = "a-fresh-pkce-code-verifier-for-the-agent-0123456789";
+const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+
+fn pkce_challenge(verifier: &str) -> String {
+    use sha2::Digest;
+    b64url(&sha2::Sha256::digest(verifier.as_bytes()))
+}
+
+/// The query parameters of a URL.
+fn query_of(url: &str) -> std::collections::HashMap<String, String> {
+    let (_, query) = url.split_once('?').unwrap_or((url, ""));
+    let uri: axum::http::Uri = format!("/?{query}").parse().unwrap();
+    axum::extract::Query::try_from_uri(&uri).unwrap().0
+}
+
+impl TestApp {
+    /// Sends `req`, returning the status, headers and JSON body (`Null` when empty).
+    async fn exchange(
+        &self,
+        req: axum::http::Request<Body>,
+    ) -> (StatusCode, axum::http::HeaderMap, Value) {
+        let resp = send(&self.router, req).await;
+        let (status, headers) = (resp.status(), resp.headers().clone());
+        let bytes = body_bytes(resp).await;
+        (
+            status,
+            headers,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    /// POSTs a form to an OAuth endpoint.
+    async fn form_with_headers(
+        &self,
+        uri: &str,
+        params: &[(&str, &str)],
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, axum::http::HeaderMap, Value) {
+        let mut req =
+            request("POST", uri).header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        let body = crate::oauth::request::query_string(params);
+        self.exchange(req.body(Body::from(body)).unwrap()).await
+    }
+
+    async fn form(&self, uri: &str, params: &[(&str, &str)]) -> (StatusCode, Value) {
+        let (status, _, body) = self.form_with_headers(uri, params, &[]).await;
+        (status, body)
+    }
+}
+
+/// The consent page's request approving the default authorization request.
+fn consent(overrides: Value) -> Value {
+    let mut body = json!({
+        "client_id": MCP_CLIENT_ID,
+        "redirect_uri": LOOPBACK,
+        "state": "st-1",
+        "code_challenge": pkce_challenge(VERIFIER),
+        "code_challenge_method": "S256",
+        "scope": "clipboard:read clipboard:write",
+        "agent_name": "Test agent",
+        "decision": "approve",
+    });
+    for (name, value) in overrides.as_object().unwrap() {
+        body[name] = value.clone();
+    }
+    body
+}
+
+/// Approves an authorization request with `web`, returning the code it issued.
+async fn approve_authorization(app: &TestApp, web: &str, scope: &str) -> String {
+    let (status, body) = app
+        .call(
+            "POST",
+            "/api/oauth/authorize",
+            Some(web),
+            Some(consent(json!({ "scope": scope }))),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    query_of(body["redirect_to"].as_str().unwrap())["code"].clone()
+}
+
+async fn exchange_code(app: &TestApp, code: &str) -> (StatusCode, Value) {
+    app.form(
+        "/oauth/token",
+        &[
+            ("grant_type", "authorization_code"),
+            ("client_id", MCP_CLIENT_ID),
+            ("code", code),
+            ("redirect_uri", LOOPBACK),
+            ("code_verifier", VERIFIER),
+        ],
+    )
+    .await
+}
+
+/// Signs an agent of `user` in through the code flow; returns the token response.
+async fn agent_sign_in(app: &TestApp, user: &User, scope: &str) -> Value {
+    let code = approve_authorization(app, &app.mfa_session(user), scope).await;
+    let (status, tokens) = exchange_code(app, &code).await;
+    assert_eq!(status, StatusCode::OK, "{tokens}");
+    tokens
+}
+
+fn grant_of(tokens: &Value) -> uuid::Uuid {
+    tokens["grant_id"].as_str().unwrap().parse().unwrap()
+}
+
+async fn refresh_at_token_endpoint(app: &TestApp, refresh: &str) -> (StatusCode, Value) {
+    app.form(
+        "/oauth/token",
+        &[
+            ("grant_type", "refresh_token"),
+            ("client_id", MCP_CLIENT_ID),
+            ("refresh_token", refresh),
+        ],
+    )
+    .await
+}
+
+async fn start_device_authorization(app: &TestApp, scope: &str) -> Value {
+    let (status, body) = app
+        .form(
+            "/oauth/device_authorization",
+            &[
+                ("client_id", MCP_CLIENT_ID),
+                ("scope", scope),
+                ("agent_name", "Codex via cpmesh-mcp on build-box"),
+            ],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body
+}
+
+async fn poll(app: &TestApp, device_code: &str) -> (StatusCode, Value) {
+    app.form(
+        "/oauth/token",
+        &[
+            ("grant_type", DEVICE_GRANT),
+            ("client_id", MCP_CLIENT_ID),
+            ("device_code", device_code),
+        ],
+    )
+    .await
+}
+
+async fn device_decision(
+    app: &TestApp,
+    web: &str,
+    decision: &str,
+    user_code: &str,
+    scope: &str,
+) -> (StatusCode, Value) {
+    app.call(
+        "POST",
+        &format!("/api/oauth/device/{decision}"),
+        Some(web),
+        Some(json!({ "user_code": user_code, "scope": scope })),
+    )
+    .await
+}
+
+async fn device_lookup(app: &TestApp, web: &str, user_code: &str) -> (StatusCode, Value) {
+    app.call(
+        "GET",
+        &format!(
+            "/api/oauth/device?user_code={}",
+            urlencoding::encode(user_code)
+        ),
+        Some(web),
+        None,
+    )
+    .await
+}
+
+async fn expire_device_code(app: &TestApp, device_code: &str) {
+    sqlx::query(
+        "UPDATE oauth_codes SET expires_at = NOW() - INTERVAL '1 second' WHERE code_hash = $1",
+    )
+    .bind(crate::oauth::codes::hash(device_code))
+    .execute(&app.state.db.pool)
+    .await
+    .unwrap();
+}
+
+async fn grant_count(app: &TestApp, user: &User) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM oauth_grants WHERE user_id = $1")
+        .bind(user.id)
+        .fetch_one(&app.state.db.pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn agents_sign_in_with_an_authorization_code_and_pkce() {
+    with_app(Options::default(), |app| async move {
+        let user = app.member("oauth-code").await;
+        let web = app.mfa_session(&user);
+
+        // The consent API checks the whole request again
+        for (overrides, code) in [
+            (json!({"client_id": "nobody"}), "invalid_client"),
+            (
+                json!({"redirect_uri": "http://localhost:53682/callback"}),
+                "invalid_redirect_uri",
+            ),
+            (json!({"state": null}), "invalid_request"),
+            (json!({"state": ""}), "invalid_request"),
+            (json!({"decision": "maybe"}), "invalid_request"),
+            (json!({"code_challenge_method": "plain"}), "invalid_request"),
+            (json!({"code_challenge": "short"}), "invalid_request"),
+            (json!({"scope": ""}), "invalid_scope"),
+            (json!({"scope": "clipboard:read root"}), "invalid_scope"),
+            (json!({"agent_name": "x".repeat(101)}), "invalid_request"),
+        ] {
+            let (status, body) = app
+                .call(
+                    "POST",
+                    "/api/oauth/authorize",
+                    Some(&web),
+                    Some(consent(overrides.clone())),
+                )
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{overrides}: {body}");
+            assert_eq!(body["code"], code, "{overrides}");
+        }
+
+        // Denying sends the browser back with access_denied
+        let (status, body) = app
+            .call(
+                "POST",
+                "/api/oauth/authorize",
+                Some(&web),
+                Some(consent(json!({"decision": "deny"}))),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let redirect_to = body["redirect_to"].as_str().unwrap();
+        assert!(redirect_to.starts_with(&format!("{LOOPBACK}?error=access_denied&")));
+        let denied = query_of(redirect_to);
+        assert_eq!(denied["state"], "st-1");
+        assert_eq!(denied["iss"], "https://cpmesh.test");
+        assert!(!denied.contains_key("code"));
+
+        // Approving issues a code for the client's redirect URI; only its hash is kept
+        let req = json_request("POST", "/api/oauth/authorize", consent(json!({})));
+        let mut req = req;
+        req.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {web}").parse().unwrap(),
+        );
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(client_addr()));
+        let (status, headers, body) = app.exchange(req).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        let redirect_to = body["redirect_to"].as_str().unwrap();
+        assert!(redirect_to.starts_with(&format!("{LOOPBACK}?code=")));
+        let approved = query_of(redirect_to);
+        assert_eq!(approved["state"], "st-1");
+        assert_eq!(approved["iss"], "https://cpmesh.test");
+        let code = approved["code"].clone();
+        assert_eq!(code.len(), 43);
+        let (stored, lifetime): (String, f64) = sqlx::query_as(
+            "SELECT code_hash, EXTRACT(EPOCH FROM expires_at - created_at)::float8
+             FROM oauth_codes WHERE kind = 'authorization_code'",
+        )
+        .fetch_one(&app.state.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, crate::oauth::codes::hash(&code));
+        assert!((60.0..=121.0).contains(&lifetime), "{lifetime}");
+
+        // A wrong verifier uses the code up
+        let wrong = "another-verifier-that-does-not-match-the-challenge";
+        let (status, body) = app
+            .form(
+                "/oauth/token",
+                &[
+                    ("grant_type", "authorization_code"),
+                    ("client_id", MCP_CLIENT_ID),
+                    ("code", &code),
+                    ("redirect_uri", LOOPBACK),
+                    ("code_verifier", wrong),
+                ],
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_grant");
+        let (status, body) = exchange_code(&app, &code).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_grant"))
+        );
+
+        // So does another redirect URI
+        let code = approve_authorization(&app, &web, "clipboard:read").await;
+        let (status, body) = app
+            .form(
+                "/oauth/token",
+                &[
+                    ("grant_type", "authorization_code"),
+                    ("client_id", MCP_CLIENT_ID),
+                    ("code", &code),
+                    ("redirect_uri", "http://127.0.0.1:53683/callback"),
+                    ("code_verifier", VERIFIER),
+                ],
+            )
+            .await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_grant"))
+        );
+        assert_eq!(exchange_code(&app, &code).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(grant_count(&app, &user).await, 0);
+
+        // The right verifier and redirect URI sign the agent in
+        let code = approve_authorization(&app, &web, "clipboard:write clipboard:read").await;
+        let (status, headers, tokens) = app
+            .form_with_headers(
+                "/oauth/token",
+                &[
+                    ("grant_type", "authorization_code"),
+                    ("client_id", MCP_CLIENT_ID),
+                    ("code", &code),
+                    ("redirect_uri", LOOPBACK),
+                    ("code_verifier", VERIFIER),
+                ],
+                &[],
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{tokens}");
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        assert_eq!(headers[header::PRAGMA], "no-cache");
+        assert_eq!(tokens["token_type"], "Bearer");
+        assert_eq!(tokens["expires_in"], 3600);
+        assert_eq!(tokens["scope"], "clipboard:read clipboard:write");
+        assert_eq!(tokens["user_id"], user.id.to_string());
+        let grant_id = grant_of(&tokens);
+        let access = tokens["access_token"].as_str().unwrap();
+        let claims = app.state.auth.validate_access_token(access).unwrap();
+        assert_eq!(
+            claims.agent,
+            Some(AgentClaims {
+                client_id: MCP_CLIENT_ID,
+                scopes: Scopes::of(&[Scope::ClipboardRead, Scope::ClipboardWrite]),
+                grant_id,
+            })
+        );
+        assert!(claims.mfa, "approved with a second factor");
+        assert_eq!(claims.device_id, None);
+        let RefreshResult::Ok(refresh, _, exp) = app
+            .state
+            .auth
+            .validate_refresh_token(tokens["refresh_token"].as_str().unwrap())
+        else {
+            panic!("invalid refresh token");
+        };
+        assert_eq!(refresh.agent, claims.agent);
+        assert!(exp > now_epoch() + 29 * 24 * 3600);
+        let grant = app
+            .state
+            .db
+            .get_oauth_grant(grant_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(grant.user_id, user.id);
+        assert_eq!(grant.agent_name, "Test agent");
+        assert_eq!(grant.session_start, claims.session_started_at() as i64);
+
+        // ...as an agent that still has to enroll its device
+        let (status, me) = app.call("GET", "/api/me", Some(access), None).await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        let (status, body) = app.call("GET", "/api/devices", Some(access), None).await;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (StatusCode::FORBIDDEN, Some("device_required"))
+        );
+
+        // ...once
+        let (status, body) = exchange_code(&app, &code).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_grant"))
+        );
+        assert_eq!(grant_count(&app, &user).await, 1);
+        let created = audit_details(&app, &user, "oauth.grant.create").await;
+        assert_eq!(created.len(), 1, "{created:?}");
+        assert_eq!(created[0]["grant_id"], grant_id.to_string());
+        assert_eq!(created[0]["flow"], "authorization_code");
+        assert_eq!(created[0]["agent_name"], "Test agent");
+        assert_eq!(
+            created[0]["scopes"],
+            json!(["clipboard:read", "clipboard:write"])
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn authorization_codes_expire_and_work_once_even_when_raced() {
+    with_app(Options::default(), |app| async move {
+        let user = app.member("oauth-race").await;
+        let web = app.mfa_session(&user);
+
+        let code = approve_authorization(&app, &web, "clipboard:read").await;
+        sqlx::query("UPDATE oauth_codes SET expires_at = NOW() - INTERVAL '1 second'")
+            .execute(&app.state.db.pool)
+            .await
+            .unwrap();
+        let (status, body) = exchange_code(&app, &code).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_grant"))
+        );
+
+        // Concurrent exchanges of one code: exactly one signs in
+        for _ in 0..3 {
+            let code = approve_authorization(&app, &web, "clipboard:read").await;
+            let (first, second) =
+                tokio::join!(exchange_code(&app, &code), exchange_code(&app, &code));
+            let mut statuses = [first.0, second.0];
+            statuses.sort();
+            assert_eq!(
+                statuses,
+                [StatusCode::OK, StatusCode::BAD_REQUEST],
+                "{first:?} {second:?}"
+            );
+            let loser = if first.0 == StatusCode::OK {
+                second.1
+            } else {
+                first.1
+            };
+            assert_eq!(loser["error"], "invalid_grant");
+        }
+        assert_eq!(grant_count(&app, &user).await, 3);
+
+        // Signing out everywhere after approving refuses the code
+        let code = approve_authorization(&app, &web, "clipboard:read").await;
+        app.state
+            .db
+            .revoke_all_user_tokens(user.id, now_epoch() + 1)
+            .await
+            .unwrap();
+        let (status, body) = exchange_code(&app, &code).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_grant"))
+        );
+        assert_eq!(grant_count(&app, &user).await, 3);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn deciding_for_an_agent_needs_a_recent_second_factor() {
+    with_app(Options::default(), |app| async move {
+        let user = app.member("oauth-step-up").await;
+        let old = app.old_mfa_session(&user, 3600);
+        let unverified = app.state.auth.generate_access_token(user.id, None).unwrap();
+        let device = start_device_authorization(&app, "clipboard:read").await;
+        let user_code = device["user_code"].as_str().unwrap();
+
+        for (token, code) in [(&old, "reauth_required"), (&unverified, "mfa_required")] {
+            for decision in ["approve", "deny"] {
+                let (status, body) = app
+                    .call(
+                        "POST",
+                        "/api/oauth/authorize",
+                        Some(token),
+                        Some(consent(json!({ "decision": decision }))),
+                    )
+                    .await;
+                assert_eq!(
+                    (status, body["code"].as_str()),
+                    (StatusCode::FORBIDDEN, Some(code)),
+                    "{decision}"
+                );
+                let (status, body) =
+                    device_decision(&app, token, decision, user_code, "clipboard:read").await;
+                assert_eq!(
+                    (status, body["code"].as_str()),
+                    (StatusCode::FORBIDDEN, Some(code)),
+                    "{decision}"
+                );
+            }
+        }
+        // Looking a request up needs no step-up, and nothing was decided
+        let (status, body) = device_lookup(&app, &old, user_code).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            poll(&app, device["device_code"].as_str().unwrap()).await.1["error"],
+            "authorization_pending"
+        );
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM oauth_codes WHERE kind = 'authorization_code'")
+                .fetch_one(&app.state.db.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+
+        // Agents never decide, nor manage agents
+        let tokens = agent_sign_in(&app, &user, "clipboard:read").await;
+        let agent = tokens["access_token"].as_str().unwrap();
+        let grant = grant_of(&tokens);
+        for (method, uri, body) in [
+            (
+                "POST",
+                "/api/oauth/authorize".to_string(),
+                Some(consent(json!({}))),
+            ),
+            (
+                "GET",
+                format!("/api/oauth/device?user_code={user_code}"),
+                None,
+            ),
+            (
+                "POST",
+                "/api/oauth/device/approve".into(),
+                Some(json!({"user_code": user_code, "scope": "clipboard:read"})),
+            ),
+            (
+                "POST",
+                "/api/oauth/device/deny".into(),
+                Some(json!({"user_code": user_code})),
+            ),
+            ("GET", "/api/oauth/grants".into(), None),
+            ("DELETE", format!("/api/oauth/grants/{grant}"), None),
+        ] {
+            let (status, body) = app.call(method, &uri, Some(agent), body).await;
+            assert_eq!(
+                (status, body["code"].as_str()),
+                (StatusCode::FORBIDDEN, Some("insufficient_scope")),
+                "{method} {uri}"
+            );
+        }
+        assert!(!grant_revoked(&app, grant).await);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn agents_refresh_and_sign_out_at_the_oauth_endpoints() {
+    let options = Options {
+        refresh_reuse_grace: Some(std::time::Duration::ZERO),
+        ..Options::default()
+    };
+    with_app(options, |app| async move {
+        let user = app.member("oauth-refresh").await;
+        let tokens = agent_sign_in(&app, &user, "clipboard:read").await;
+        let grant = grant_of(&tokens);
+        let refresh = tokens["refresh_token"].as_str().unwrap();
+
+        // A refresh cannot add scopes, and a refused one does not use the token
+        let (status, body) = app
+            .form(
+                "/oauth/token",
+                &[
+                    ("grant_type", "refresh_token"),
+                    ("client_id", MCP_CLIENT_ID),
+                    ("refresh_token", refresh),
+                    ("scope", "clipboard:read clipboard:write"),
+                ],
+            )
+            .await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_scope"))
+        );
+        let (status, rotated) = app
+            .form(
+                "/oauth/token",
+                &[
+                    ("grant_type", "refresh_token"),
+                    ("client_id", MCP_CLIENT_ID),
+                    ("refresh_token", refresh),
+                    ("scope", "clipboard:read"),
+                ],
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{rotated}");
+        assert_eq!(rotated["token_type"], "Bearer");
+        assert_eq!(rotated["expires_in"], 3600);
+        assert_eq!(rotated["scope"], "clipboard:read");
+        assert_eq!(grant_of(&rotated), grant);
+        assert_eq!(rotated["user_id"], user.id.to_string());
+        assert_ne!(rotated["refresh_token"], tokens["refresh_token"]);
+        let access = rotated["access_token"].as_str().unwrap();
+        assert_eq!(
+            app.call("GET", "/api/me", Some(access), None).await.0,
+            StatusCode::OK
+        );
+
+        // Only this client's agent tokens refresh here
+        let (_, web_refresh) = app
+            .state
+            .auth
+            .issue_session(&SessionGrant::signed_in(user.id, true))
+            .unwrap();
+        let (status, body) = refresh_at_token_endpoint(&app, &web_refresh).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_grant"))
+        );
+        let next = rotated["refresh_token"].as_str().unwrap();
+        let (status, body) = app
+            .form(
+                "/oauth/token",
+                &[
+                    ("grant_type", "refresh_token"),
+                    ("client_id", "nobody"),
+                    ("refresh_token", next),
+                ],
+            )
+            .await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_client"))
+        );
+
+        // Using a refresh token twice revokes the grant, not the user's other sessions
+        let (status, body) = refresh_at_token_endpoint(&app, refresh).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_grant"))
+        );
+        assert!(grant_revoked(&app, grant).await);
+        let (status, body) = refresh_at_token_endpoint(&app, next).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_grant"))
+        );
+        assert_eq!(
+            app.call("GET", "/api/me", Some(access), None).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        let web = app.mfa_session(&user);
+        assert_eq!(
+            app.call("GET", "/api/me", Some(&web), None).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            audit_details(&app, &user, "oauth.token.reuse").await.len(),
+            1
+        );
+
+        // Signing out with the refresh token revokes the grant; other tokens change nothing
+        let tokens = agent_sign_in(&app, &user, "clipboard:read").await;
+        let grant = grant_of(&tokens);
+        let revoke = |token: &str| {
+            let token = token.to_string();
+            let app = &app;
+            async move {
+                app.form(
+                    "/oauth/revoke",
+                    &[("client_id", MCP_CLIENT_ID), ("token", &token)],
+                )
+                .await
+            }
+        };
+        for token in ["garbage", web.as_str(), web_refresh.as_str()] {
+            let (status, body) = revoke(token).await;
+            assert_eq!((status, body), (StatusCode::OK, Value::Null));
+        }
+        assert!(!grant_revoked(&app, grant).await);
+        assert_eq!(
+            app.call("GET", "/api/me", Some(&web), None).await.0,
+            StatusCode::OK
+        );
+        let (status, body) = app
+            .form(
+                "/oauth/revoke",
+                &[
+                    ("client_id", "nobody"),
+                    ("token", tokens["refresh_token"].as_str().unwrap()),
+                ],
+            )
+            .await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_client"))
+        );
+        assert!(!grant_revoked(&app, grant).await);
+        let (status, _) = revoke(tokens["refresh_token"].as_str().unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(grant_revoked(&app, grant).await);
+        assert_eq!(
+            revoke(tokens["refresh_token"].as_str().unwrap()).await.0,
+            StatusCode::OK
+        );
+        let revocations = audit_details(&app, &user, "oauth.grant.revoke").await;
+        assert_eq!(revocations.last().unwrap()["reason"], "client");
+        assert_eq!(revocations.last().unwrap()["grant_id"], grant.to_string());
+
+        // ...and so does the access token
+        let tokens = agent_sign_in(&app, &user, "clipboard:read").await;
+        let access = tokens["access_token"].as_str().unwrap();
+        assert_eq!(revoke(access).await.0, StatusCode::OK);
+        assert!(grant_revoked(&app, grant_of(&tokens)).await);
+        assert_eq!(
+            app.call("GET", "/api/me", Some(access), None).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        let (status, body) =
+            refresh_at_token_endpoint(&app, tokens["refresh_token"].as_str().unwrap()).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_grant"))
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn connected_agents_are_listed_and_revoked_by_their_user() {
+    with_app(Options::default(), |app| async move {
+        let user = app.member("oauth-list").await;
+        let stranger = app.member("oauth-stranger").await;
+        let first = agent_sign_in(&app, &user, "clipboard:read clipboard:write").await;
+        let second = agent_sign_in(&app, &user, "clipboard:write").await;
+        let key = device_key();
+        let (status, registered) =
+            register_device(&app, first["access_token"].as_str().unwrap(), &key, "agent").await;
+        assert_eq!(status, StatusCode::CREATED, "{registered}");
+        let device_id = registered_id(&registered);
+
+        let web = app.mfa_session(&user);
+        let (status, list) = app.call("GET", "/api/oauth/grants", Some(&web), None).await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        let list = list.as_array().unwrap();
+        assert_eq!(list.len(), 2);
+        // Newest first
+        assert_eq!(list[0]["id"], grant_of(&second).to_string());
+        assert_eq!(list[0]["device"], Value::Null);
+        assert_eq!(list[0]["scopes"], json!(["clipboard:write"]));
+        assert_eq!(list[0]["status"], "active");
+        let listed = &list[1];
+        assert_eq!(listed["id"], grant_of(&first).to_string());
+        assert_eq!(listed["client_id"], MCP_CLIENT_ID);
+        assert_eq!(listed["client_name"], "cpmesh MCP");
+        assert_eq!(listed["agent_name"], "Test agent");
+        assert_eq!(
+            listed["scopes"],
+            json!(["clipboard:read", "clipboard:write"])
+        );
+        assert_eq!(listed["device"]["id"], device_id.to_string());
+        assert_eq!(listed["device"]["name"], "Proof device");
+        assert_eq!(listed["device"]["status"], "approved");
+        assert!(listed["created_at"].is_string());
+        assert!(listed.as_object().unwrap().contains_key("last_used_at"));
+        assert_eq!(listed["status"], "active");
+        let (_, theirs) = app
+            .call(
+                "GET",
+                "/api/oauth/grants",
+                Some(&app.mfa_session(&stranger)),
+                None,
+            )
+            .await;
+        assert_eq!(theirs, json!([]));
+
+        // Changing the password signs the agents out; they stay listed until revoked
+        let (status, body) = app
+            .call(
+                "PUT",
+                "/api/me/password",
+                Some(&web),
+                Some(json!({"current_password": PASSWORD, "new_password": "Another-Horse-7!"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let revoked_before = app
+            .state
+            .db
+            .get_user_by_id(user.id)
+            .await
+            .unwrap()
+            .tokens_revoked_before
+            .unwrap();
+        while (now_epoch() as i64) < revoked_before {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let web = app.mfa_session(&user);
+        let (_, list) = app.call("GET", "/api/oauth/grants", Some(&web), None).await;
+        let statuses: Vec<&str> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|grant| grant["status"].as_str().unwrap())
+            .collect();
+        assert_eq!(statuses, ["signed_out", "signed_out"]);
+        let (status, body) =
+            refresh_at_token_endpoint(&app, first["refresh_token"].as_str().unwrap()).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_grant"))
+        );
+
+        // An agent signing in afterwards is active
+        let third = agent_sign_in(&app, &user, "clipboard:read").await;
+        let (_, list) = app.call("GET", "/api/oauth/grants", Some(&web), None).await;
+        let listed: Vec<(String, String)> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| {
+                (
+                    g["id"].as_str().unwrap().into(),
+                    g["status"].as_str().unwrap().into(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                (grant_of(&third).to_string(), "active".into()),
+                (grant_of(&second).to_string(), "signed_out".into()),
+                (grant_of(&first).to_string(), "signed_out".into()),
+            ]
+        );
+
+        // Revoking: only the user's own grants, and their devices go with them
+        let first_id = grant_of(&first);
+        let uri = format!("/api/oauth/grants/{first_id}");
+        let (status, body) = app
+            .call("DELETE", &uri, Some(&app.mfa_session(&stranger)), None)
+            .await;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (StatusCode::NOT_FOUND, Some("not_found"))
+        );
+        assert!(!grant_revoked(&app, first_id).await);
+        let (status, body) = app.call("DELETE", &uri, Some(&web), None).await;
+        assert_eq!((status, body), (StatusCode::NO_CONTENT, Value::Null));
+        assert!(grant_revoked(&app, first_id).await);
+        assert!(app.state.db.get_device_by_id(device_id).await.is_err());
+        assert_eq!(
+            app.call("DELETE", &uri, Some(&web), None).await.0,
+            StatusCode::NOT_FOUND
+        );
+        let (status, _) = app
+            .call(
+                "DELETE",
+                &format!("/api/oauth/grants/{}", uuid::Uuid::new_v4()),
+                Some(&web),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (_, list) = app.call("GET", "/api/oauth/grants", Some(&web), None).await;
+        assert_eq!(list.as_array().unwrap().len(), 2);
+        let revoked = audit_details(&app, &user, "oauth.grant.revoke").await;
+        assert_eq!(revoked.len(), 1, "{revoked:?}");
+        assert_eq!(revoked[0]["reason"], "user");
+        assert_eq!(revoked[0]["device_id"], device_id.to_string());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn agents_without_a_browser_sign_in_with_a_device_code() {
+    with_app(Options::default(), |app| async move {
+        let user = app.member("oauth-device").await;
+        let web = app.mfa_session(&user);
+        let (status, headers, device) = app
+            .form_with_headers(
+                "/oauth/device_authorization",
+                &[
+                    ("client_id", MCP_CLIENT_ID),
+                    ("scope", "clipboard:read clipboard:write"),
+                    ("agent_name", "Codex via cpmesh-mcp on build-box"),
+                ],
+                &[("user-agent", "cpmesh-mcp/0.3.0")],
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{device}");
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        let device_code = device["device_code"].as_str().unwrap().to_string();
+        let user_code = device["user_code"].as_str().unwrap().to_string();
+        assert_eq!(device_code.len(), 43);
+        assert!(
+            regex::Regex::new("^[BCDFGHJKLMNPQRSTVWXZ]{4}-[BCDFGHJKLMNPQRSTVWXZ]{4}$")
+                .unwrap()
+                .is_match(&user_code),
+            "{user_code}"
+        );
+        assert_eq!(device["verification_uri"], "https://cpmesh.test/activate");
+        assert_eq!(
+            device["verification_uri_complete"],
+            format!("https://cpmesh.test/activate?user_code={user_code}")
+        );
+        assert_eq!(device["expires_in"], 600);
+        assert_eq!(device["interval"], 5);
+        let (stored, stored_user_code, ip, agent): (String, String, String, String) =
+            sqlx::query_as(
+                "SELECT code_hash, user_code, requester_ip, user_agent FROM oauth_codes
+                 WHERE kind = 'device_code'",
+            )
+            .fetch_one(&app.state.db.pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, crate::oauth::codes::hash(&device_code));
+        assert_eq!(stored_user_code, user_code.replace('-', ""));
+        assert_eq!(
+            (ip.as_str(), agent.as_str()),
+            ("203.0.113.10", "cpmesh-mcp/0.3.0")
+        );
+
+        // Pending, and polling too fast grows the interval
+        let interval = || async {
+            sqlx::query_scalar::<_, i32>(
+                "SELECT interval_secs FROM oauth_codes WHERE code_hash = $1",
+            )
+            .bind(crate::oauth::codes::hash(&device_code))
+            .fetch_one(&app.state.db.pool)
+            .await
+            .unwrap()
+        };
+        let (status, body) = poll(&app, &device_code).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("authorization_pending"))
+        );
+        for expected in [10, 15] {
+            let (status, body) = poll(&app, &device_code).await;
+            assert_eq!(
+                (status, body["error"].as_str()),
+                (StatusCode::BAD_REQUEST, Some("slow_down"))
+            );
+            assert_eq!(body["interval"], expected);
+            assert_eq!(interval().await, expected);
+        }
+        sqlx::query("UPDATE oauth_codes SET last_polled_at = NOW() - INTERVAL '16 seconds'")
+            .execute(&app.state.db.pool)
+            .await
+            .unwrap();
+        let (_, body) = poll(&app, &device_code).await;
+        assert_eq!(body["error"], "authorization_pending");
+        assert_eq!(interval().await, 15);
+
+        // The dashboard finds the request by its user code, however it was typed
+        let typed = user_code.to_lowercase().replace('-', " ");
+        let (status, request) = device_lookup(&app, &web, &typed).await;
+        assert_eq!(status, StatusCode::OK, "{request}");
+        assert_eq!(request["user_code"], user_code);
+        assert_eq!(request["client_id"], MCP_CLIENT_ID);
+        assert_eq!(request["client_name"], "cpmesh MCP");
+        assert_eq!(request["agent_name"], "Codex via cpmesh-mcp on build-box");
+        assert_eq!(
+            request["scopes"],
+            json!(["clipboard:read", "clipboard:write"])
+        );
+        assert_eq!(request["requester_ip"], "203.0.113.10");
+        assert_eq!(request["user_agent"], "cpmesh-mcp/0.3.0");
+        assert!(request["created_at"].is_string() && request["expires_at"].is_string());
+        let other_code = if user_code == "BCDF-GHJK" {
+            "ZXWV-TSRQ"
+        } else {
+            "BCDF-GHJK"
+        };
+        for unknown in [other_code, "nope", ""] {
+            let (status, body) = device_lookup(&app, &web, unknown).await;
+            assert_eq!(
+                (status, body["code"].as_str()),
+                (StatusCode::NOT_FOUND, Some("not_found")),
+                "{unknown}"
+            );
+        }
+
+        // The user approves part of what the agent asked for, once
+        let (status, body) = device_decision(
+            &app,
+            &web,
+            "approve",
+            &user_code,
+            "clipboard:read devices:manage",
+        )
+        .await;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_scope"))
+        );
+        let (status, body) = device_decision(&app, &web, "approve", &user_code, "").await;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_scope"))
+        );
+        let (status, body) =
+            device_decision(&app, &web, "approve", &typed, "clipboard:write").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body,
+            json!({"status": "approved", "scope": "clipboard:write"})
+        );
+        for decision in ["approve", "deny"] {
+            let (status, _) =
+                device_decision(&app, &web, decision, &user_code, "clipboard:write").await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{decision}");
+        }
+        assert_eq!(
+            device_lookup(&app, &web, &user_code).await.0,
+            StatusCode::NOT_FOUND
+        );
+        let approvals = audit_details(&app, &user, "oauth.device.approve").await;
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0]["scopes"], json!(["clipboard:write"]));
+        assert_eq!(approvals[0]["requester_ip"], "203.0.113.10");
+
+        // The next poll signs the agent in (send-only), once
+        let (status, tokens) = poll(&app, &device_code).await;
+        assert_eq!(status, StatusCode::OK, "{tokens}");
+        assert_eq!(tokens["scope"], "clipboard:write");
+        assert_eq!(tokens["token_type"], "Bearer");
+        let claims = app
+            .state
+            .auth
+            .validate_access_token(tokens["access_token"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            claims.agent.unwrap().scopes,
+            Scopes::of(&[Scope::ClipboardWrite])
+        );
+        assert_eq!(claims.agent.unwrap().grant_id, grant_of(&tokens));
+        assert!(claims.mfa);
+        let grant = app
+            .state
+            .db
+            .get_oauth_grant(grant_of(&tokens))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(grant.agent_name, "Codex via cpmesh-mcp on build-box");
+        let (status, body) = poll(&app, &device_code).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_grant"))
+        );
+        let created = audit_details(&app, &user, "oauth.grant.create").await;
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0]["flow"], "device_code");
+
+        // Denied
+        let denied = start_device_authorization(&app, "clipboard:read").await;
+        let (status, body) = device_decision(
+            &app,
+            &web,
+            "deny",
+            denied["user_code"].as_str().unwrap(),
+            "",
+        )
+        .await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::OK, json!({"status": "denied"}))
+        );
+        for _ in 0..2 {
+            let (status, body) = poll(&app, denied["device_code"].as_str().unwrap()).await;
+            assert_eq!(
+                (status, body["error"].as_str()),
+                (StatusCode::BAD_REQUEST, Some("access_denied"))
+            );
+        }
+        assert_eq!(
+            audit_details(&app, &user, "oauth.device.deny").await.len(),
+            1
+        );
+
+        // Expired
+        let expired = start_device_authorization(&app, "clipboard:read").await;
+        let expired_code = expired["device_code"].as_str().unwrap();
+        expire_device_code(&app, expired_code).await;
+        let (status, body) = poll(&app, expired_code).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("expired_token"))
+        );
+        let expired_user_code = expired["user_code"].as_str().unwrap();
+        assert_eq!(
+            device_lookup(&app, &web, expired_user_code).await.0,
+            StatusCode::NOT_FOUND
+        );
+        let (status, _) =
+            device_decision(&app, &web, "approve", expired_user_code, "clipboard:read").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Unknown device codes and clients
+        let (status, body) = poll(&app, "not-a-device-code").await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_grant"))
+        );
+        let (status, body) = app
+            .form(
+                "/oauth/token",
+                &[
+                    ("grant_type", DEVICE_GRANT),
+                    ("client_id", "nobody"),
+                    ("device_code", &device_code),
+                ],
+            )
+            .await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_client"))
+        );
+
+        // Signing out everywhere after approving refuses the device code as well
+        let late = start_device_authorization(&app, "clipboard:read").await;
+        let (status, _) = device_decision(
+            &app,
+            &web,
+            "approve",
+            late["user_code"].as_str().unwrap(),
+            "clipboard:read",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        app.state
+            .db
+            .revoke_all_user_tokens(user.id, now_epoch() + 1)
+            .await
+            .unwrap();
+        let (status, body) = poll(&app, late["device_code"].as_str().unwrap()).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_grant"))
+        );
+        assert_eq!(grant_count(&app, &user).await, 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn device_polling_does_not_use_up_the_sign_in_budget() {
+    let options = Options {
+        refresh_limit: Some(2),
+        ..Options::default()
+    };
+    with_app(options, |app| async move {
+        let device = start_device_authorization(&app, "clipboard:read").await;
+        let device_code = device["device_code"].as_str().unwrap();
+        for _ in 0..8 {
+            let (status, body) = poll(&app, device_code).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(
+                ["authorization_pending", "slow_down"].contains(&body["error"].as_str().unwrap()),
+                "{body}"
+            );
+        }
+        // Refreshes and code exchanges share the address's budget
+        for expected in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::BAD_REQUEST,
+            StatusCode::TOO_MANY_REQUESTS,
+        ] {
+            assert_eq!(refresh_at_token_endpoint(&app, "garbage").await.0, expected);
+        }
+        let (status, body) = exchange_code(&app, "some-code").await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Some("temporarily_unavailable")
+            )
+        );
+        // ...while the agent keeps polling
+        let (status, body) = poll(&app, device_code).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn user_code_lookups_and_decisions_are_rate_limited() {
+    let options = Options {
+        user_code_limit: Some(3),
+        user_code_ip_limit: Some(5),
+        ..Options::default()
+    };
+    with_app(options, |app| async move {
+        let alice = app.member("oauth-guess-a").await;
+        let bob = app.member("oauth-guess-b").await;
+        let (alice, bob) = (app.mfa_session(&alice), app.mfa_session(&bob));
+        for _ in 0..3 {
+            assert_eq!(
+                device_lookup(&app, &alice, "BCDF-GHJK").await.0,
+                StatusCode::NOT_FOUND
+            );
+        }
+        let (status, body) = device_lookup(&app, &alice, "BCDF-GHJK").await;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (StatusCode::TOO_MANY_REQUESTS, Some("rate_limited"))
+        );
+        let (status, _) =
+            device_decision(&app, &alice, "approve", "BCDF-GHJK", "clipboard:read").await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        // Another account has its own budget, but shares the address's
+        for _ in 0..2 {
+            assert_eq!(
+                device_lookup(&app, &bob, "BCDF-GHJK").await.0,
+                StatusCode::NOT_FOUND
+            );
+        }
+        assert_eq!(
+            device_lookup(&app, &bob, "BCDF-GHJK").await.0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
     })
     .await;
 }

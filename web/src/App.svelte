@@ -26,14 +26,25 @@
   import AuthCallback from './pages/AuthCallback.svelte';
   import Mcp from './pages/Mcp.svelte';
   import Agents from './pages/Agents.svelte';
+  import Authorize from './pages/Authorize.svelte';
+  import Activate from './pages/Activate.svelte';
 
   const publicRoutes = {
     '/': Home,
     '/login': Login,
     '/mcp': Mcp,
     '/auth/callback': AuthCallback,
+    // An AI agent's consent pages: sign in first, then continue there
+    '/authorize': Login,
+    '/activate': Login,
     // Deep links into the app while signed out land on the sign-in screen.
     '*': Login,
+  };
+
+  // Where an AI agent asks for access, shown on their own once the account is ready
+  const consentRoutes = {
+    '/authorize': Authorize,
+    '/activate': Activate,
   };
 
   const appRoutes = {
@@ -65,6 +76,7 @@
   );
   // Two-factor authentication is required but not set up yet (an older session, or reset by an admin)
   const mustEnroll = $derived(userState.id !== '' && userState.mfa.required && !userState.mfa.enabled);
+  const consentPage = $derived(Object.hasOwn(consentRoutes, router.location));
 
   onMount(() => {
     // Announcement banner, sign-up and passkey availability
@@ -115,6 +127,11 @@
     </div>
 {:else if mustEnroll}
   <EnrollGate />
+{:else if consentPage}
+  <!-- One request per page: another query starts over -->
+  {#key router.querystring}
+    <Router routes={consentRoutes} />
+  {/key}
 {:else}
   <Layout>
     <Router routes={appRoutes} />

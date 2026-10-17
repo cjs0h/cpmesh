@@ -11,7 +11,10 @@ use std::sync::Arc;
 use super::auth_service::SessionGrant;
 use super::middleware::{AuthClaims, extract_client_ip, json_error, json_response};
 use crate::AppState;
+use crate::audit::RequestMeta;
+use crate::db::{GrantBinding, NewDevice};
 use crate::models::{AUDIT_DEVICE_DELETE, AUDIT_DEVICE_REGISTER, AUDIT_GROUP_KEY_ROTATE};
+use crate::oauth::grants::{RevokeReason, grant_revoked, record_revocation};
 use cpmesh_proto::models as proto;
 
 const MAX_DEVICES_PER_USER: usize = 10;
@@ -75,6 +78,7 @@ pub async fn handle_register_device(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<AuthClaims>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    meta: RequestMeta,
     headers: axum::http::HeaderMap,
     axum::Json(req): axum::Json<proto::RegisterDeviceRequest>,
 ) -> Response {
@@ -155,6 +159,41 @@ pub async fn handle_register_device(
         if device.status == "revoked" || device.status == "rejected" {
             return json_error("device is revoked or rejected", StatusCode::FORBIDDEN);
         }
+        // An agent registers only the device of its own grant. Authorizing again moves
+        // the agent's existing device to the new grant, without pairing it again.
+        if let Some(agent) = claims.agent {
+            match state
+                .db
+                .bind_oauth_grant_device(agent.grant_id, claims.user_id, device.id)
+                .await
+            {
+                Ok(GrantBinding::Bound { superseded }) => {
+                    if let Some(old_grant) = superseded {
+                        // Its open sockets still run on the old grant
+                        state
+                            .hub
+                            .disconnect_device(&claims.user_id.to_string(), &device.id.to_string())
+                            .await;
+                        record_revocation(
+                            &state,
+                            claims.user_id,
+                            old_grant,
+                            device.id,
+                            RevokeReason::Superseded,
+                            &meta,
+                        )
+                        .await;
+                    }
+                }
+                Ok(GrantBinding::Unchanged) => {}
+                Ok(GrantBinding::OtherDevice) => return grant_has_other_device(),
+                Ok(GrantBinding::Revoked) => return grant_revoked().into_response(),
+                Ok(GrantBinding::NoDevice) => {
+                    return json_error("device is revoked or rejected", StatusCode::FORBIDDEN);
+                }
+                Err(e) => return super::middleware::ApiError::internal(e).into_response(),
+            }
+        }
         // An updated client re-registering with the same identity publishes its
         // encryption key here (the certification was verified above).
         if let Some((key, sig)) = encryption
@@ -202,11 +241,20 @@ pub async fn handle_register_device(
 
     let device = match state
         .db
-        .register_device(claims.user_id, &req, max_devices as i64)
+        .register_device(
+            claims.user_id,
+            &req,
+            max_devices as i64,
+            claims.agent.map(|agent| agent.grant_id),
+        )
         .await
     {
-        Ok(Some(d)) => d,
-        Ok(None) => return json_error("maximum number of devices reached", StatusCode::CONFLICT),
+        Ok(NewDevice::Registered(d)) => *d,
+        Ok(NewDevice::LimitReached) => {
+            return json_error("maximum number of devices reached", StatusCode::CONFLICT);
+        }
+        Ok(NewDevice::GrantRevoked) => return grant_revoked().into_response(),
+        Ok(NewDevice::GrantHasDevice) => return grant_has_other_device(),
         Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
             return json_error(
                 "device registration changed; retry with a fresh proof",
@@ -296,43 +344,24 @@ pub async fn handle_delete_device(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<AuthClaims>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    meta: RequestMeta,
     headers: axum::http::HeaderMap,
     Path(device_id): Path<uuid::Uuid>,
 ) -> Response {
-    // Check if this was an approved device (for rotation trigger)
-    let was_approved = match state.db.get_device_by_id(device_id).await {
-        Ok(d) if d.user_id == claims.user_id => d.status == "approved",
+    match state.db.get_device_by_id(device_id).await {
+        Ok(d) if d.user_id == claims.user_id => {}
         Ok(_) | Err(sqlx::Error::RowNotFound) => {
             return json_error("device not found", StatusCode::NOT_FOUND);
         }
         Err(e) => return super::middleware::ApiError::internal(e).into_response(),
+    }
+
+    let removal = match state.db.delete_device(device_id, claims.user_id).await {
+        Ok(removal) => removal,
+        Err(_) => return json_error("device not found", StatusCode::NOT_FOUND),
     };
-
-    if state
-        .db
-        .delete_device(device_id, claims.user_id)
-        .await
-        .is_err()
-    {
-        return json_error("device not found", StatusCode::NOT_FOUND);
-    }
-
-    state
-        .hub
-        .disconnect_device(&claims.user_id.to_string(), &device_id.to_string())
-        .await;
-
-    // If the deleted device was approved, trigger immediate key rotation
-    if was_approved {
-        let msg = cpmesh_proto::models::WsMessage {
-            msg_type: cpmesh_proto::models::MSG_ROTATION_NEEDED.to_string(),
-            payload: json!({"reason": "device_revoked", "revoked_device_id": device_id.to_string()}),
-        };
-        state
-            .hub
-            .broadcast_to_user(&claims.user_id.to_string(), "", &msg)
-            .await;
-    }
+    let was_approved = removal.was_approved;
+    device_removed(&state, claims.user_id, device_id, was_approved).await;
 
     // Audit log
     let ip = extract_client_ip(&headers, &addr, state.config.trust_proxy_headers);
@@ -353,8 +382,53 @@ pub async fn handle_delete_device(
         .bind(json!({"device_id": device_id.to_string(), "was_approved": was_approved}))
         .execute(&pool)
         .await { tracing::warn!("Failed to persist audit entry: {error}"); }
+    if let Some(grant_id) = removal.revoked_grant {
+        record_revocation(
+            &state,
+            claims.user_id,
+            grant_id,
+            device_id,
+            RevokeReason::DeviceRemoved,
+            &meta,
+        )
+        .await;
+    }
 
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// What follows removing a device, whatever removed it: its sockets close and, when it
+/// was approved, the user's devices are asked to rotate the group key without it.
+pub(crate) async fn device_removed(
+    state: &AppState,
+    user_id: uuid::Uuid,
+    device_id: uuid::Uuid,
+    was_approved: bool,
+) {
+    state
+        .hub
+        .disconnect_device(&user_id.to_string(), &device_id.to_string())
+        .await;
+    if was_approved {
+        let msg = proto::WsMessage {
+            msg_type: proto::MSG_ROTATION_NEEDED.to_string(),
+            payload: json!({"reason": "device_revoked", "revoked_device_id": device_id.to_string()}),
+        };
+        state
+            .hub
+            .broadcast_to_user(&user_id.to_string(), "", &msg)
+            .await;
+    }
+}
+
+/// An agent's grant belongs to one device; another device needs a new authorization.
+fn grant_has_other_device() -> Response {
+    super::middleware::ApiError::coded(
+        StatusCode::FORBIDDEN,
+        "grant_device_mismatch",
+        "this agent's authorization belongs to another device; authorize the agent again to register a new one",
+    )
+    .into_response()
 }
 
 pub async fn handle_get_device_keys(

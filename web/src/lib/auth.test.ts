@@ -7,8 +7,12 @@ import {
   isLoggedIn,
   loginPageUrl,
   parseAppSignIn,
+  rememberReturnPath,
+  returnPathFrom,
   setTokens,
+  signInLocation,
   ssoLoginUrl,
+  takeReturnPath,
 } from './auth';
 
 describe('auth token storage', () => {
@@ -85,5 +89,53 @@ describe('desktop app sign-in', () => {
     );
     expect(loginPageUrl(null)).toBe('#/login');
     expect(parseAppSignIn(loginPageUrl(request).split('?')[1])).toEqual(request);
+  });
+});
+
+describe("returning to an AI agent's consent page after signing in", () => {
+  const authorize =
+    '#/authorize?client_id=cpmesh-mcp&redirect_uri=http%3A%2F%2F127.0.0.1%3A53682%2Fcallback&response_type=code&state=s%2B1&scope=clipboard%3Aread';
+
+  it('recognizes the consent pages, keeping their query intact', () => {
+    expect(returnPathFrom(authorize)).toBe(authorize);
+    expect(returnPathFrom('#/activate?user_code=BCDF-GHJK')).toBe('#/activate?user_code=BCDF-GHJK');
+    expect(returnPathFrom('#/activate')).toBe('#/activate');
+    expect(returnPathFrom('/authorize?state=x')).toBe('#/authorize?state=x');
+  });
+
+  it('ignores every other page', () => {
+    for (const hash of ['', '#/', '#/login', '#/clipboard', '#/authorize/x', '#/activated', '#/mcp?x=/authorize', null, undefined]) {
+      expect(returnPathFrom(hash), String(hash)).toBeNull();
+    }
+  });
+
+  it('signs in again on the consent page, or on the sign-in page elsewhere', () => {
+    expect(signInLocation(authorize)).toBe(authorize);
+    expect(signInLocation('#/devices')).toBe('#/login');
+    window.location.hash = '#/activate?user_code=BCDF-GHJK';
+    expect(signInLocation()).toBe('#/activate?user_code=BCDF-GHJK');
+  });
+
+  it('keeps the page across a single sign-on, once', () => {
+    rememberReturnPath(authorize);
+    expect(takeReturnPath()).toBe(authorize);
+    expect(takeReturnPath()).toBeNull();
+  });
+
+  it('forgets a single sign-on that took longer than 30 minutes', () => {
+    const now = Date.now();
+    rememberReturnPath(authorize);
+    expect(takeReturnPath(now + 31 * 60_000)).toBeNull();
+    // Read once, even when too old
+    expect(takeReturnPath(now)).toBeNull();
+  });
+
+  it('only returns to consent pages', () => {
+    rememberReturnPath('#/admin/users');
+    expect(takeReturnPath()).toBeNull();
+    sessionStorage.setItem('cpmesh_return_to', 'not json');
+    expect(takeReturnPath()).toBeNull();
+    sessionStorage.setItem('cpmesh_return_to', JSON.stringify({ path: 'javascript:alert(1)', at: Date.now() }));
+    expect(takeReturnPath()).toBeNull();
   });
 });

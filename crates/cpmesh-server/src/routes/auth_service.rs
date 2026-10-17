@@ -8,6 +8,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
+use crate::oauth::{AGENT_REFRESH_TTL, AgentClaims, Scopes};
 use crate::routes::middleware::AuthClaims;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -47,6 +48,15 @@ struct Claims {
     /// Passkey ceremony: "register" or "authenticate".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     purpose: Option<String>,
+    /// Agent session: the OAuth client ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cid: Option<String>,
+    /// Agent session: the grant's scopes, separated by spaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scp: Option<String>,
+    /// Agent session: the grant ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gid: Option<String>,
 }
 
 fn default_token_type() -> String {
@@ -69,6 +79,8 @@ pub struct SessionGrant {
     pub mfa: bool,
     pub auth_time: u64,
     pub session_start: u64,
+    /// The agent the session belongs to; `None` for first-party apps.
+    pub agent: Option<AgentClaims>,
 }
 
 impl SessionGrant {
@@ -81,6 +93,7 @@ impl SessionGrant {
             mfa,
             auth_time: now,
             session_start: now,
+            agent: None,
         }
     }
 
@@ -92,11 +105,18 @@ impl SessionGrant {
             mfa: claims.mfa,
             auth_time: claims.auth_time,
             session_start: claims.session_started_at(),
+            agent: claims.agent,
         }
     }
 
     pub fn with_device(mut self, device_id: Option<uuid::Uuid>) -> Self {
         self.device_id = device_id;
+        self
+    }
+
+    /// Makes this the session of an agent, under the grant `agent` names.
+    pub fn with_agent(mut self, agent: AgentClaims) -> Self {
+        self.agent = Some(agent);
         self
     }
 }
@@ -203,6 +223,7 @@ pub struct AuthService {
     public_keys: Vec<PublicKeyEntry>,
     access_expiry: Duration,
     refresh_expiry: Duration,
+    agent_refresh_expiry: Duration,
     refresh_reuse_grace: Duration,
     revoked: Arc<RwLock<HashMap<String, Revocation>>>, // L1 cache keyed by jti
     pool: Option<PgPool>,
@@ -233,10 +254,16 @@ impl AuthService {
             public_keys,
             access_expiry: Duration::from_secs(3600), // 1 hour
             refresh_expiry: Duration::from_secs(7 * 24 * 3600), // 7 days
+            agent_refresh_expiry: AGENT_REFRESH_TTL,
             refresh_reuse_grace: REFRESH_REUSE_GRACE,
             revoked: Arc::new(RwLock::new(HashMap::new())),
             pool,
         })
+    }
+
+    /// How long an access token lasts (the OAuth token endpoint's `expires_in`).
+    pub fn access_token_ttl(&self) -> Duration {
+        self.access_expiry
     }
 
     /// Overrides the window in which a repeated refresh token use counts as a benign race.
@@ -309,8 +336,15 @@ impl AuthService {
         self.sign(&self.session_claims(grant, "access", self.access_expiry))
     }
 
+    /// Issues a refresh token: 7 days for first-party sessions, 30 for agents. Each
+    /// refresh issues a new one, so both lifetimes slide.
     pub fn issue_refresh(&self, grant: &SessionGrant) -> Result<String, String> {
-        self.sign(&self.session_claims(grant, "refresh", self.refresh_expiry))
+        let ttl = if grant.agent.is_some() {
+            self.agent_refresh_expiry
+        } else {
+            self.refresh_expiry
+        };
+        self.sign(&self.session_claims(grant, "refresh", ttl))
     }
 
     /// Issues an access and refresh token pair.
@@ -355,6 +389,9 @@ impl AuthService {
             mfa: grant.mfa,
             auth_time: grant.auth_time,
             session_start: grant.session_start,
+            cid: grant.agent.map(|agent| agent.client_id.to_string()),
+            scp: grant.agent.map(|agent| agent.scopes.to_string()),
+            gid: grant.agent.map(|agent| agent.grant_id.to_string()),
             ..base_claims(grant.user_id, tt, ttl)
         }
     }
@@ -528,11 +565,13 @@ impl AuthService {
             user_id: parse_user_id(&claims.user_id)?,
             device_id: claims
                 .device_id
-                .and_then(|d| uuid::Uuid::parse_str(&d).ok()),
+                .as_deref()
+                .and_then(|d| uuid::Uuid::parse_str(d).ok()),
             iat: claims.iat,
             session_start: claims.session_start,
             mfa: claims.mfa,
             auth_time: claims.auth_time,
+            agent: agent_claims(&claims)?,
         })
     }
 
@@ -554,6 +593,10 @@ impl AuthService {
             Ok(uid) => uid,
             Err(e) => return RefreshResult::Invalid(e),
         };
+        let agent = match agent_claims(&claims) {
+            Ok(agent) => agent,
+            Err(e) => return RefreshResult::Invalid(e),
+        };
         let device_id = claims
             .device_id
             .and_then(|d| uuid::Uuid::parse_str(&d).ok());
@@ -566,6 +609,7 @@ impl AuthService {
                 session_start: claims.session_start,
                 mfa: claims.mfa,
                 auth_time: claims.auth_time,
+                agent,
             },
             claims.jti,
             claims.exp,
@@ -804,9 +848,25 @@ fn parse_user_id(value: &str) -> Result<uuid::Uuid, String> {
     uuid::Uuid::parse_str(value).map_err(|e| format!("invalid user_id in token: {e}"))
 }
 
+/// The agent behind a session token: all of `cid`, `scp` and `gid`, or none of them.
+fn agent_claims(claims: &Claims) -> Result<Option<AgentClaims>, String> {
+    match (&claims.cid, &claims.scp, &claims.gid) {
+        (None, None, None) => Ok(None),
+        (Some(cid), Some(scp), Some(gid)) => Ok(Some(AgentClaims {
+            client_id: crate::oauth::registered_client(cid)
+                .ok_or_else(|| format!("token names an unknown client: {cid}"))?,
+            scopes: Scopes::from_recorded(scp.split_ascii_whitespace()),
+            grant_id: uuid::Uuid::parse_str(gid)
+                .map_err(|e| format!("invalid grant id in token: {e}"))?,
+        })),
+        _ => Err("token has incomplete agent claims".to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oauth::Scope;
     use crate::test_support::{TEST_KID, generate_rsa_keys, test_auth_service, test_keys};
 
     fn uid() -> uuid::Uuid {
@@ -916,6 +976,7 @@ mod tests {
             mfa: true,
             auth_time: 1_700_000_000,
             session_start: 1_700_000_000,
+            agent: None,
         };
         let (access, refresh) = svc.issue_session(&grant).unwrap();
         let claims = svc.validate_access_token(&access).unwrap();
@@ -1382,5 +1443,156 @@ mod tests {
         assert!(!svc.check_revoked_db_async("anything").await);
         // Both are no-ops without a pool
         svc.start_cleanup();
+    }
+
+    fn agent() -> AgentClaims {
+        AgentClaims {
+            client_id: crate::oauth::MCP_CLIENT_ID,
+            scopes: Scopes::of(&[Scope::ClipboardRead, Scope::ClipboardWrite]),
+            grant_id: uid(),
+        }
+    }
+
+    fn payload(token: &str) -> serde_json::Value {
+        let payload = token.split('.').nth(1).unwrap();
+        let bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload)
+                .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn sign(claims: &Claims) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(TEST_KID.to_string());
+        let key = EncodingKey::from_rsa_pem(test_keys().private_pem.as_bytes()).unwrap();
+        encode(&header, claims, &key).unwrap()
+    }
+
+    #[test]
+    fn agent_sessions_carry_client_scopes_and_grant_through_refresh() {
+        let svc = test_auth_service();
+        let agent = agent();
+        let grant = SessionGrant::signed_in(uid(), true)
+            .with_device(Some(uid()))
+            .with_agent(agent);
+        let (access, refresh) = svc.issue_session(&grant).unwrap();
+
+        let claims = svc.validate_access_token(&access).unwrap();
+        assert_eq!(claims.agent, Some(agent));
+        assert_eq!(SessionGrant::from_claims(&claims), grant);
+        let json = payload(&access);
+        assert_eq!(json["cid"], "cpmesh-mcp");
+        assert_eq!(json["scp"], "clipboard:read clipboard:write");
+        assert_eq!(json["gid"], agent.grant_id.to_string());
+        // Access tokens last an hour, for agents too
+        assert_eq!(svc.access_token_ttl(), Duration::from_secs(3600));
+        assert!(json["exp"].as_u64().unwrap() <= now_secs() + 3600);
+
+        let RefreshResult::Ok(refreshed, _, exp) = svc.validate_refresh_token(&refresh) else {
+            panic!("agent refresh token rejected");
+        };
+        assert_eq!(SessionGrant::from_claims(&refreshed), grant);
+        // Agent refresh tokens last 30 days; first-party ones keep their 7
+        assert!(exp > now_secs() + 29 * 24 * 3600, "{exp}");
+        assert!(exp <= now_secs() + 30 * 24 * 3600, "{exp}");
+        let first_party = svc
+            .issue_refresh(&SessionGrant {
+                agent: None,
+                ..grant
+            })
+            .unwrap();
+        let RefreshResult::Ok(_, _, exp) = svc.validate_refresh_token(&first_party) else {
+            panic!("refresh token rejected");
+        };
+        assert!(exp <= now_secs() + 7 * 24 * 3600, "{exp}");
+    }
+
+    #[test]
+    fn first_party_tokens_carry_no_agent_claims() {
+        let svc = test_auth_service();
+        let grant = SessionGrant::signed_in(uid(), true).with_device(Some(uid()));
+        let (access, refresh) = svc.issue_session(&grant).unwrap();
+        for token in [&access, &refresh] {
+            let mut keys: Vec<String> = payload(token)
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            keys.sort();
+            // The same claims as before agents existed
+            assert_eq!(
+                keys,
+                [
+                    "auth_time",
+                    "device_id",
+                    "exp",
+                    "iat",
+                    "jti",
+                    "mfa",
+                    "session_start",
+                    "tt",
+                    "user_id"
+                ]
+            );
+        }
+        assert_eq!(svc.validate_access_token(&access).unwrap().agent, None);
+    }
+
+    #[test]
+    fn incomplete_or_unknown_agent_claims_invalidate_the_token() {
+        let svc = test_auth_service();
+        let gid = uid().to_string();
+        let claims = |tt: &str, cid: Option<&str>, scp: Option<&str>, gid: Option<&str>| Claims {
+            user_id: uid().to_string(),
+            exp: now_secs() + 60,
+            iat: now_secs(),
+            jti: generate_jti(),
+            tt: tt.to_string(),
+            cid: cid.map(String::from),
+            scp: scp.map(String::from),
+            gid: gid.map(String::from),
+            ..Claims::default()
+        };
+        for (cid, scp, gid) in [
+            (Some("cpmesh-mcp"), None, Some(gid.as_str())),
+            (Some("cpmesh-mcp"), Some("clipboard:read"), None),
+            (None, Some("clipboard:read"), Some(gid.as_str())),
+            (
+                Some("another-client"),
+                Some("clipboard:read"),
+                Some(gid.as_str()),
+            ),
+            (
+                Some("cpmesh-mcp"),
+                Some("clipboard:read"),
+                Some("not-a-uuid"),
+            ),
+        ] {
+            let access = sign(&claims("access", cid, scp, gid));
+            assert!(
+                svc.validate_access_token(&access).is_err(),
+                "{cid:?} {scp:?} {gid:?}"
+            );
+            let refresh = sign(&claims("refresh", cid, scp, gid));
+            assert!(
+                matches!(
+                    svc.validate_refresh_token(&refresh),
+                    RefreshResult::Invalid(_)
+                ),
+                "{cid:?} {scp:?} {gid:?}"
+            );
+        }
+
+        // Scopes this server does not know are dropped, never granted
+        let token = sign(&claims(
+            "access",
+            Some("cpmesh-mcp"),
+            Some("clipboard:write admin:everything"),
+            Some(&gid),
+        ));
+        let agent = svc.validate_access_token(&token).unwrap().agent.unwrap();
+        assert_eq!(agent.scopes, Scopes::of(&[Scope::ClipboardWrite]));
+        assert_eq!(agent.grant_id.to_string(), gid);
     }
 }
