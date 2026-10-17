@@ -2252,6 +2252,14 @@ pub async fn get_config(ctx: State<'_, AppContext>) -> Result<AppConfig, String>
     Ok(ctx.config.read().await.clone())
 }
 
+/// Where this device keeps its config, keyring and clipboard history.
+#[tauri::command]
+pub async fn get_data_dir(ctx: State<'_, AppContext>) -> Result<String, String> {
+    Ok(ctx.config_dir.display().to_string())
+}
+
+/// Saves the given settings. The global shortcut has its own command (`shortcut.rs`),
+/// which also registers it.
 #[tauri::command]
 pub async fn update_config(
     app_handle: tauri::AppHandle,
@@ -2260,7 +2268,6 @@ pub async fn update_config(
     auto_connect: Option<bool>,
     autostart: Option<bool>,
     notifications_enabled: Option<bool>,
-    global_hotkey: Option<String>,
 ) -> Result<(), String> {
     let mut config = ctx.config.write().await;
     if let Some(v) = server_url {
@@ -2290,9 +2297,6 @@ pub async fn update_config(
     }
     if let Some(v) = notifications_enabled {
         config.notifications_enabled = v;
-    }
-    if let Some(v) = global_hotkey {
-        config.global_hotkey = v;
     }
     config.save(&ctx.config_dir).map_err(|e| e.to_string())?;
     let _ = app_handle.emit("config-changed", ());
@@ -2347,9 +2351,10 @@ pub async fn logout(
     let token_store = TokenStore::new(&ctx.config_dir);
     token_store.clear().map_err(|e| e.to_string())?;
 
-    // Reset config to defaults
+    // Forget the server, account and device registration; this computer's preferences
+    // (connect on open, Open at Login, notifications, the shortcut) stay as they are
     let mut config = ctx.config.write().await;
-    *config = AppConfig::default();
+    *config = config.signed_out();
     config.save(&ctx.config_dir).map_err(|e| e.to_string())?;
 
     // Clear state

@@ -190,7 +190,16 @@ graph on future Tauri updates and exercise Linux builds when a compatible fix be
   `lib/toast.svelte.ts`.
 - Fingerprints are always shown in full with the `Fingerprint` component (groups of four); never shorten them.
 - Keep keyboard parity with desktop conventions: `⌘/Ctrl+1…4` switch sections, `⌘/Ctrl+,` opens
-  Settings, `⌘/Ctrl+F` searches history.
+  Settings, `⌘/Ctrl+F` (or `/`) searches history. List in-app shortcuts under Settings → Keyboard
+  shortcuts, and add them to `APP_SHORTCUTS` in `lib/shortcuts.ts` so the global shortcut can't take them.
+- The global shortcut that shows cpmesh is saved as an accelerator (`global_hotkey` in `config.json`,
+  `CmdOrCtrl+Shift+Space` by default, empty when turned off) and owned by `src-tauri/src/shortcut.rs`
+  (the webview has no `global-shortcut:*` permissions):
+  it registers the shortcut at startup and when Settings changes it (the new one before the old one is
+  released, so a combination another app holds leaves the current one working), reports refusals to
+  Settings and gives the tray menu its accelerator. Settings records new combinations with
+  `ShortcutRecorder`; `lib/shortcuts.ts` turns key presses into accelerators and refuses ones that
+  typing or other apps need. Signing out keeps it, like the other preferences of the computer.
 - cpmesh is a background app: closing the window hides it (and its macOS Dock icon) while the tray /
   menu bar item in `src-tauri/src/tray.rs` keeps the status, recent clips and quick actions. "Open at
   login" launches it with `--background`, so it starts without a window. The tray and app menus open

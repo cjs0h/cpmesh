@@ -56,6 +56,8 @@ struct Snapshot {
     devices: usize,
     online: usize,
     autostart: bool,
+    /// The global shortcut that shows cpmesh, while it is registered
+    shortcut: Option<String>,
     /// (history entry id, menu label), newest first
     clips: Vec<(String, String)>,
 }
@@ -121,6 +123,8 @@ fn snapshot_now(ctx: &AppContext) -> Snapshot {
         devices: 0,
         online: 0,
         autostart,
+        // Registered after the tray, which then refreshes
+        shortcut: None,
         clips: Vec::new(),
     }
 }
@@ -159,6 +163,7 @@ async fn snapshot(app: &AppHandle) -> Snapshot {
         devices,
         online,
         autostart,
+        shortcut: crate::shortcut::active(app),
         clips,
     }
 }
@@ -187,16 +192,23 @@ fn build_menu(app: &AppHandle, snapshot: &Snapshot) -> tauri::Result<Menu<Wry>> 
         .enabled(false)
         .build(app)?;
     let signed_in = !matches!(snapshot.status, Status::SignedOut);
-    let open = MenuItemBuilder::with_id(
-        "tray:open",
-        if signed_in {
-            "Open cpmesh"
-        } else {
-            "Sign In…"
-        },
-    )
-    .accelerator("CmdOrCtrl+Shift+Space")
-    .build(app)?;
+    let open_label = if signed_in {
+        "Open cpmesh"
+    } else {
+        "Sign In…"
+    };
+    let open_item = |accelerator: Option<&str>| {
+        let mut item = MenuItemBuilder::with_id("tray:open", open_label);
+        if let Some(accelerator) = accelerator {
+            item = item.accelerator(accelerator);
+        }
+        item.build(app)
+    };
+    // A shortcut the menu can't spell is left out rather than losing the menu
+    let open = open_item(snapshot.shortcut.as_deref()).or_else(|e| {
+        log::warn!("The tray menu can't show the shortcut: {e}");
+        open_item(None)
+    })?;
     let autostart = CheckMenuItemBuilder::with_id("tray:autostart", "Open at Login")
         .checked(snapshot.autostart)
         .build(app)?;
@@ -453,7 +465,6 @@ pub fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
                     None,
                     Some(enable),
                     None,
-                    None,
                 )
                 .await
                 {
@@ -494,6 +505,7 @@ mod tests {
             devices,
             online,
             autostart: false,
+            shortcut: None,
             clips: Vec::new(),
         }
     }

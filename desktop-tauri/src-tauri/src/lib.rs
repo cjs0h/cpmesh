@@ -8,6 +8,8 @@ mod history;
 mod key_sync;
 mod proto;
 mod secure_storage;
+#[cfg(desktop)]
+mod shortcut;
 mod state;
 #[cfg(desktop)]
 mod tray;
@@ -154,6 +156,11 @@ pub fn run() {
             commands::sync_history,
             commands::get_config,
             commands::update_config,
+            commands::get_data_dir,
+            #[cfg(desktop)]
+            shortcut::get_global_shortcut,
+            #[cfg(desktop)]
+            shortcut::set_global_shortcut,
             commands::change_password,
             commands::logout,
             commands::check_update,
@@ -270,21 +277,9 @@ pub fn run() {
                     }
                 }
 
-                // Register global hotkey (non-fatal if it fails — e.g. shortcut already taken)
-                {
-                    use tauri_plugin_global_shortcut::GlobalShortcutExt;
-                    let handle_for_hotkey = app.handle().clone();
-                    if let Err(e) = app.global_shortcut().on_shortcut(
-                        "CmdOrCtrl+Shift+Space",
-                        move |_app, _shortcut, event| {
-                            if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
-                                tray::show_main_window(&handle_for_hotkey);
-                            }
-                        },
-                    ) {
-                        log::error!("Failed to register global shortcut: {e}");
-                    }
-                }
+                // The shortcut that shows cpmesh from anywhere (one another app holds is
+                // reported in Settings rather than failing startup)
+                shortcut::init(app.handle());
             }
 
             // Background update checker (desktop only)
