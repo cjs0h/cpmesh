@@ -1,6 +1,6 @@
 {
   "name": "cpmesh-mcp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "MCP server that lets AI agents use cpmesh end-to-end-encrypted clipboard sync: share text to the user's devices, read and search clipboard history, manage devices.",
   "type": "module",
   "license": "MIT OR Apache-2.0",

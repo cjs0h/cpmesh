@@ -25,7 +25,7 @@ import { CpmeshDevice, DeviceNotReadyError } from "./device.js";
 import { sameAccount } from "./signin.js";
 import { loadSession } from "./state.js";
 
-const VERSION = "0.2.0";
+const VERSION = "0.2.1";
 
 // stdout is the MCP protocol channel — all diagnostics go to stderr.
 const log = (...args: unknown[]) =>
