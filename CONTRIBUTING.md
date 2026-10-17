@@ -35,7 +35,7 @@ cargo run -p cpmesh-server
 ```bash
 # Requires Node.js 22.12+ (24 LTS recommended)
 cd web
-npm install
+npm ci
 npm run dev
 ```
 
@@ -44,9 +44,18 @@ npm run dev
 ```bash
 # Requires Node.js 22.17+ (24 LTS recommended)
 cd desktop-tauri
-npm install
+npm ci
 npx tauri dev
 ```
+
+### JavaScript dependencies
+
+`web`, `desktop-tauri` and `mcp/cpmesh-mcp` pin their dependencies in `package-lock.json`. Install them with `npm ci`,
+and run it again after pulling a change to a lockfile. Their dev, build, check, typecheck and test scripts (and so
+`tauri dev` and `tauri build`) first run `scripts/check-deps.mjs`, which stops with that instruction when
+`node_modules` no longer matches the lockfile, instead of the build failing later with a "Cannot find module" error.
+The `scripts/build-*` scripts run `npm ci` themselves in that case. Set `CPMESH_SKIP_DEPS_CHECK=1` to skip the check,
+for example while trying out a dependency with `npm link`. The check's tests run with `node --test "scripts/*.test.mjs"`.
 
 ## Testing
 
@@ -64,6 +73,10 @@ cargo test --workspace
 # Desktop crate: crypto, key exchange, local history (SQLite), config and WebSocket client tests
 cd desktop-tauri/src-tauri && cargo test
 ```
+
+Desktop tests never touch the OS credential store (in test builds `SecureStore::new` stores secrets
+in files) or a real relay: sign-in, key recovery and rotation flows run against stateful fake relays
+built with `serve_with` in `src/api/client.rs`.
 
 The server's PostgreSQL integration tests (`crates/cpmesh-server/tests/db.rs`) are skipped unless
 `TEST_DATABASE_URL` is set. Each test migrates into its own throwaway schema, so any scratch
@@ -193,7 +206,16 @@ graph on future Tauri updates and exercise Linux builds when a compatible fix be
   `lib/toast.svelte.ts`.
 - Fingerprints are always shown in full with the `Fingerprint` component (groups of four); never shorten them.
 - Keep keyboard parity with desktop conventions: `⌘/Ctrl+1…4` switch sections, `⌘/Ctrl+,` opens
-  Settings, `⌘/Ctrl+F` searches history.
+  Settings, `⌘/Ctrl+F` (or `/`) searches history. List in-app shortcuts under Settings → Keyboard
+  shortcuts, and add them to `APP_SHORTCUTS` in `lib/shortcuts.ts` so the global shortcut can't take them.
+- The global shortcut that shows cpmesh is saved as an accelerator (`global_hotkey` in `config.json`,
+  `CmdOrCtrl+Shift+Space` by default, empty when turned off) and owned by `src-tauri/src/shortcut.rs`
+  (the webview has no `global-shortcut:*` permissions):
+  it registers the shortcut at startup and when Settings changes it (the new one before the old one is
+  released, so a combination another app holds leaves the current one working), reports refusals to
+  Settings and gives the tray menu its accelerator. Settings records new combinations with
+  `ShortcutRecorder`; `lib/shortcuts.ts` turns key presses into accelerators and refuses ones that
+  typing or other apps need. Signing out keeps it, like the other preferences of the computer.
 - cpmesh is a background app: closing the window hides it (and its macOS Dock icon) while the tray /
   menu bar item in `src-tauri/src/tray.rs` keeps the status, recent clips and quick actions. "Open at
   login" launches it with `--background`, so it starts without a window. The tray and app menus open
@@ -223,23 +245,35 @@ graph on future Tauri updates and exercise Linux builds when a compatible fix be
 
 Maintainers publish releases with the [Release workflow](.github/workflows/release.yml). It builds every
 app, attaches the installers to a GitHub Release, then registers that release on the website so the
-Downloads section on cpmesh.com and the apps' update check offer the new version.
+Downloads section on cpmesh.com and the apps' update check offer the new version. It also publishes a new
+version of the MCP package to npm (see [Publishing the MCP package](#publishing-the-mcp-package)).
 
 ### Cutting a release
 
-Push a version tag (the subject of an annotated tag becomes the one-line note in the apps' update banner):
+The version comes from the repository. Bump it with `scripts/release/set-version.mjs`, which writes it to
+`tauri.conf.json`, `Cargo.toml`/`Cargo.lock` and `package.json`/`package-lock.json`, and get that commit onto the
+branch you release from:
 
 ```bash
-git tag -a v0.2.0 -m "Faster sync and file previews"
-git push origin v0.2.0
+node scripts/release/set-version.mjs 0.5.0
+git commit -am "Release 0.5.0"
 ```
 
-Or run **Actions → Release → Run workflow** on a branch with a version (`0.2.0`) and an optional note; the
-branch is tagged `v0.2.0` when the release is published.
+Then tag that commit and push the tag (the subject of an annotated tag becomes the one-line note in the apps'
+update banner):
 
-The tag decides the version: the workflow stamps it into `tauri.conf.json`, `Cargo.toml`/`Cargo.lock` and
-`package.json`/`package-lock.json` before building, so the apps report the version they were released as.
-To bump the version in the repository too, run `node scripts/release/set-version.mjs 0.2.0`.
+```bash
+git tag -a v0.5.0 -m "Faster sync and file previews"
+git push origin v0.5.0
+```
+
+Or run **Actions → Release → Run workflow** on the bumped branch with the same version (`0.5.0`) and an optional
+note; the branch is tagged `v0.5.0` when the release is published.
+
+If the commit declares another version, the workflow stops before building anything: bump it, then re-create the tag
+on the bump commit (`node scripts/release/set-version.mjs --check 0.5.0` runs the same check locally). This keeps
+the repository at the latest released version, so an app built from it never reports an older version than the
+published release, which its update check would otherwise offer as an update.
 
 | Platform | Release asset |
 | --- | --- |
@@ -258,6 +292,25 @@ to create a download link for each installer plus a current app release for each
 Re-publishing a version is safe, and the script refuses to replace a newer version unless run by hand with
 `--force`. Use `--dry-run` to preview what a release JSON (from `gh release view <tag> --json tagName,url,isDraft,assets`)
 would publish. The release scripts have tests: `node --test "scripts/release/*.test.mjs"`.
+
+### Publishing the MCP package
+
+Once the builds succeed, the same run publishes `mcp/cpmesh-mcp` to npm if npm doesn't have that version yet, so a
+release that leaves the MCP version alone doesn't touch npm. To ship a new MCP version, bump it before tagging:
+
+```bash
+cd mcp/cpmesh-mcp
+npm version 0.4.0 --no-git-tag-version
+# then set the same version in src/index.ts (const VERSION); test/version.test.ts checks that they match
+```
+
+`npm publish` runs the package's `prepublishOnly` script first (typecheck, build and tests), and the package is
+published with provenance. npm has to trust the workflow once, in one of two ways:
+
+- **Trusted publishing** (no secret): on npmjs.com, open the `cpmesh-mcp` package's **Settings → Trusted Publisher**,
+  choose **GitHub Actions** and enter this repository (`cjs0h`/`cpmesh`) and the workflow `release.yml`, leaving
+  the environment empty.
+- **A token**: add an `NPM_TOKEN` secret holding an npm access token that can publish `cpmesh-mcp`.
 
 ### Signing updates
 
@@ -298,6 +351,7 @@ key secret is missing, and every signature is checked against the public key bef
 | `ANDROID_KEY_PASSWORD` | Optional | Key password, when it differs from the keystore password |
 | `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY` | Optional | Developer ID signing for macOS (base64 `.p12`) |
 | `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` | Optional | Notarization for macOS (app-specific password) |
+| `NPM_TOKEN` | Optional | npm access token that can publish `cpmesh-mcp`; not needed with trusted publishing (see [Publishing the MCP package](#publishing-the-mcp-package)) |
 
 Without the Android secrets the APK is skipped with a warning; without `CPMESH_ADMIN_TOKEN` (or the username and
 password) the GitHub Release is still published but the website is left unchanged. Creating a token needs a recent

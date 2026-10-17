@@ -103,7 +103,7 @@ Download the latest release from the [Releases page](https://github.com/cjs0h/cp
 ```bash
 # Requires Rust 1.94+, Node.js 22.17+ (24 LTS recommended), and Tauri CLI
 cd desktop-tauri
-npm install
+npm ci
 npx tauri build
 ```
 
@@ -115,7 +115,9 @@ your recovery codes (see [Two-factor authentication](#two-factor-authentication)
 
 Then open the desktop app, enter your server URL and click Connect: sign in with your password and the code from your
 authenticator app, or choose **Sign in with browser** to use a passkey or SSO. The app runs in your system tray, so
-closing the window hides it instead of quitting.
+closing the window hides it instead of quitting. Press `Ctrl+Shift+Space` (`⇧⌘Space` on macOS) to bring it back from
+any app, or change or turn off that shortcut under **Settings → Keyboard shortcuts**. Wayland desktops may not pass app
+shortcuts on; there, Settings shows a command to bind in your desktop's own keyboard settings instead.
 
 ## Components
 
@@ -210,14 +212,17 @@ Before upgrading, back up each device's private keys, encrypted keyring and loca
 membership. On an existing mesh, use the desktop **Devices** page or MCP `cpmesh_verify_device` to
 compare a peer's complete public-key fingerprint directly with that peer's own identity display.
 After verification, clients rotate to an authenticated membership and learn later approved members
-through signed transitions. Do not delete keyring files to bypass a verification error: a missing
-wrapped copy is not evidence of a new mesh, and lost historical key material cannot be regenerated.
+through signed transitions. Don't delete keyring files to get past an error: a missing wrapped copy is
+not evidence of a new mesh, and lost historical key material cannot be regenerated. The desktop app
+handles each of these situations itself (see [Recovering keys in the desktop app](#recovering-keys-in-the-desktop-app)).
 
 Device WebSockets negotiate `X-Cpmesh-Protocol: 3` in both directions. Older devices receive HTTP 426;
 updated clients refuse relays that do not confirm this version. Browser metadata sockets and the public
 download/update endpoints remain available, including to apps downloading an upgrade. Registration and
 reconnection require a session-bound proof; an unbound refresh token cannot select an approved device ID.
 The legacy group-key GET remains readable, but legacy writes and non-committed pairing return HTTP 426.
+Every 426 says what the client is missing, and that a previous version still running after an update
+has to be quit from its tray (menu bar) icon and opened again.
 
 **Protocol 3 changes.** On first start, each updated device moves its `device.key` into the OS
 credential store (Keychain, Credential Manager or Secret Service; a 0600 file when none is available),
@@ -242,6 +247,42 @@ Clipboard pushes carry a UUID `request_id`. A `clipboard_ack` confirms database 
 the canonical entry ID, or reports rejection/uncertain persistence. It is **not** proof that another device
 received the clipboard. Retries reuse the identical request and ID; relay receipts survive history deletion
 for at least 24 hours, and MCP retains up to 32 encrypted requests/receipts for restart-safe retries.
+
+### Updating the desktop app
+
+cpmesh keeps running in the tray after its window is closed, so an update (a package upgrade, the in-app updater's
+installer or a new AppImage) leaves the previous version running until it restarts. Opening cpmesh again starts the new
+version: on Linux, launching an upgraded package ends your previous version still running the replaced binary (never
+another user's); otherwise the running version restarts into the new one with the launch's arguments (a `cpmesh://`
+sign-in link stays with the version that started the sign-in). While the window is open, a **Restart now** banner appears
+once a newer version is installed. Versions up to 0.4.0 do neither: if a server answers "update your client" (HTTP 426)
+right after you installed an update, quit cpmesh from its tray (menu bar) icon and open it again.
+
+### Recovering keys in the desktop app
+
+These situations used to need hand-edited files or database resets. The app walks through each one, asks before every
+change, never uses one account's keys for another and never deletes key material: what it moves out of the way goes into
+a folder in its data folder (`backups/` or `archive/`), and **Settings → Encryption keys** restores from there.
+
+| Situation | What the app offers |
+| --- | --- |
+| Keys saved by a version before 0.3, whose account nothing records (signing out on those versions cleared it) | At sign-in: use them for the account signing in (it shows whether one of that account's devices has this computer's device key), or set them aside in `backups/` |
+| Keys of another account, when signing in to another server or account | At sign-in: archive them in `archive/<server>_<user>_<time>/`; they come back when that account signs in on this computer again |
+| Keys this device can't open, because its device key changed | At sign-in: set them aside; restore them later with the old `device.key` |
+| "This computer is already registered with different keys" (HTTP 409) | At sign-in: replace that registration. If it was the account's only approved device, the app warns that it held the only copy of the encryption key, and removes devices waiting for approval along with it (they can ask again): only a registration on an account without devices is approved by itself |
+| "This device doesn't have your account's current encryption key" | **Settings → Encryption keys** (also offered by a banner): get it from another device that still has the key, which then shares it — there, choose **Share key** next to this device on the **Devices** page and compare the 8-digit pairing code both screens show, or verify this device with its full fingerprint and then verify that device here in turn; restore it from a backup (one cpmesh made, or a folder with `keyring.enc` and the `device.key` that was next to it), re-encrypted for this device and checked against your clipboard history; or, as a last resort, start new encryption keys |
+
+Starting new encryption keys needs every other approved device verified on this device or removed, since each one gets
+the new key. Clips synced before stay unreadable on devices without the old key, though restoring a backup later still
+opens them. It is never automatic, and it replaces resetting `group_key_versions` in the database by hand.
+
+A device can also be approved yet lack the current key because an older relay re-registered it, which dropped its
+copies; current relays refuse changed keys instead and never drop them. The relay marks such devices, so a device that
+has the key shows **Needs the key** and **Share key** next to them on its **Devices** page. Keys still go only to devices
+verified on the sending device; the relay's mark only offers the action. Every new key (approving a device, sharing the
+key, starting new keys, the scheduled change) must reach all approved devices, so the **Devices** page and the approval
+dialog list any device that isn't verified on this one, changed its identity, was removed earlier or is too old to
+receive keys, with **Verify** and **Remove** next to each.
 
 ## Admin console
 

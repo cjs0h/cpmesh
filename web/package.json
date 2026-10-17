@@ -7,10 +7,14 @@
     "node": ">=22.12"
   },
   "scripts": {
+    "predev": "node ../scripts/check-deps.mjs",
     "dev": "vite",
+    "prebuild": "node ../scripts/check-deps.mjs",
     "build": "vite build",
     "preview": "vite preview",
+    "precheck": "node ../scripts/check-deps.mjs",
     "check": "svelte-check --tsconfig ./tsconfig.json",
+    "pretest": "node ../scripts/check-deps.mjs",
     "test": "vitest run",
     "test:watch": "vitest"
   },

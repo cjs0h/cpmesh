@@ -405,47 +405,6 @@ impl Db {
             .await
     }
 
-    pub async fn reregister_device(
-        &self,
-        device_id: uuid::Uuid,
-        name: &str,
-        public_key: &[u8],
-        public_key_sig: Option<&[u8]>,
-        status: &str,
-    ) -> Result<Device, sqlx::Error> {
-        let approved_at = if status == "approved" {
-            Some(chrono::Utc::now())
-        } else {
-            None
-        };
-        // Update device keys/name and reset approval state
-        let device = sqlx::query_as::<_, Device>(
-            "UPDATE devices SET name = $2, public_key = $3, public_key_sig = $4, status = $5,
-             approved_at = $6, approved_by_device_id = NULL, last_seen = NOW()
-             WHERE id = $1 RETURNING *",
-        )
-        .bind(device_id)
-        .bind(name)
-        .bind(public_key)
-        .bind(public_key_sig)
-        .bind(status)
-        .bind(approved_at)
-        .fetch_one(&self.pool)
-        .await?;
-
-        // Delete old group keys for this device (encrypted to old public key)
-        sqlx::query("DELETE FROM device_group_keys WHERE device_id = $1")
-            .bind(device_id)
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("DELETE FROM group_keys WHERE device_id = $1")
-            .bind(device_id)
-            .execute(&self.pool)
-            .await?;
-
-        Ok(device)
-    }
-
     pub async fn set_device_fingerprint(
         &self,
         device_id: uuid::Uuid,
@@ -847,6 +806,27 @@ impl Db {
         .bind(user_id)
         .fetch_optional(&self.pool)
         .await
+    }
+
+    /// The user's devices that hold a wrap of the current group key, or `None`
+    /// before the first key exists.
+    pub async fn current_key_holders(
+        &self,
+        user_id: uuid::Uuid,
+    ) -> Result<Option<std::collections::HashSet<uuid::Uuid>>, sqlx::Error> {
+        let rows: Vec<(i32, Option<uuid::Uuid>)> = sqlx::query_as(
+            "SELECT v.version, d.id FROM group_key_versions v
+             LEFT JOIN devices d ON d.user_id = v.user_id AND EXISTS (
+                SELECT 1 FROM device_group_keys k WHERE k.device_id = d.id AND k.version = v.version)
+             WHERE v.user_id = $1 AND v.is_current",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(rows.into_iter().filter_map(|(_, id)| id).collect()))
     }
 
     pub async fn get_device_group_key(

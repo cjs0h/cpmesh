@@ -1,16 +1,13 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "desktop-only",
-  "description": "Desktop-only capabilities (tray, hotkeys, autostart)",
+  "description": "Desktop-only capabilities (window, tray, autostart); the global shortcut is managed in Rust",
   "platforms": ["linux", "macOS", "windows"],
   "windows": ["main"],
   "permissions": [
     "core:window:allow-hide",
     "core:window:allow-set-theme",
     "core:tray:default",
-    "global-shortcut:allow-register",
-    "global-shortcut:allow-unregister",
-    "global-shortcut:allow-is-registered",
     "autostart:allow-enable",
     "autostart:allow-disable",
     "autostart:allow-is-enabled"

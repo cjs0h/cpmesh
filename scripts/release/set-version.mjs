@@ -3,10 +3,13 @@
  * Sets the app version in every desktop/mobile manifest that declares it.
  *
  *   node scripts/release/set-version.mjs 0.2.0
+ *   node scripts/release/set-version.mjs --check 0.2.0
  *
- * The Release workflow runs this with the version from the git tag so the installers,
- * the Android versionCode (which Tauri derives from tauri.conf.json) and the version the
- * apps report to the update check (CARGO_PKG_VERSION) always match the published release.
+ * Run it and commit the result before tagging a release, so the installers, the Android
+ * versionCode (which Tauri derives from tauri.conf.json) and the version the apps report to the
+ * update check (CARGO_PKG_VERSION) match the published release, and so does any build from the
+ * repository. With --check it changes nothing and fails if a manifest declares another version;
+ * the Release workflow uses it to refuse to build a commit that was not bumped.
  */
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -95,8 +98,11 @@ export function versionEdits(version) {
   ];
 }
 
-/** Applies the version to every manifest under `root`. Returns the files that changed. */
-export async function setVersion(root, version) {
+/**
+ * Applies the version to every manifest under `root`. Returns the files that changed, or with
+ * `write: false` the files that would change, leaving them untouched.
+ */
+export async function setVersion(root, version, { write = true } = {}) {
   if (!VERSION_RE.test(version)) throw new Error(`version must look like 1.2.3, got "${version}"`);
   const changed = [];
   for (const [relative, edit] of versionEdits(version)) {
@@ -109,7 +115,7 @@ export async function setVersion(root, version) {
       throw new Error(`${relative}: ${err.message}`);
     }
     if (after !== before) {
-      await writeFile(file, after);
+      if (write) await writeFile(file, after);
       changed.push(relative);
     }
   }
@@ -117,12 +123,24 @@ export async function setVersion(root, version) {
 }
 
 async function main() {
-  const version = (process.argv[2] ?? '').replace(/^v/, '');
-  if (!VERSION_RE.test(version)) {
-    console.error('Usage: node scripts/release/set-version.mjs <major.minor.patch>');
+  const args = process.argv.slice(2);
+  const check = args[0] === '--check';
+  const version = (args[check ? 1 : 0] ?? '').replace(/^v/, '');
+  if (!VERSION_RE.test(version) || args.length !== (check ? 2 : 1)) {
+    console.error('Usage: node scripts/release/set-version.mjs [--check] <major.minor.patch>');
     process.exit(2);
   }
-  const changed = await setVersion(REPO_ROOT, version);
+  const changed = await setVersion(REPO_ROOT, version, { write: !check });
+  if (check) {
+    if (changed.length) {
+      console.error(`error: these manifests do not declare version ${version}:\n  ${changed.join('\n  ')}`);
+      console.error(`Run 'node scripts/release/set-version.mjs ${version}' and commit the result.`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(`Every manifest declares version ${version}`);
+    return;
+  }
   console.log(changed.length ? `Set version ${version} in:\n  ${changed.join('\n  ')}` : `Version is already ${version}`);
 }
 

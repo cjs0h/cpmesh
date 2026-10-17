@@ -631,6 +631,24 @@ pub fn json_error(message: &str, status: StatusCode) -> Response {
     (status, axum::Json(json!({"error": message}))).into_response()
 }
 
+/// Explains an HTTP 426. Apps that are already installed show it as is, including to
+/// people who did update but whose previous version is still running in the tray.
+pub fn upgrade_required_message(requirement: &str) -> String {
+    format!(
+        "update your client: {requirement}. Install the latest cpmesh from your server's \
+         Downloads page. If you already installed the update, the previous version is still \
+         running: quit cpmesh from its tray (menu bar) icon and open it again."
+    )
+}
+
+/// HTTP 426 for a client older than this server's protocol.
+pub fn upgrade_required(requirement: &str) -> Response {
+    json_error(
+        &upgrade_required_message(requirement),
+        StatusCode::UPGRADE_REQUIRED,
+    )
+}
+
 /// An error clients recognize by `code`, with a readable `error` message and any
 /// `extra` fields merged in.
 pub fn json_error_code(
@@ -779,6 +797,25 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
             serde_json::json!({"id": 1})
         );
+    }
+
+    #[tokio::test]
+    async fn upgrade_required_keeps_the_requirement_and_says_what_to_do() {
+        let resp = upgrade_required("session-bound device proof is required");
+        assert_eq!(resp.status(), StatusCode::UPGRADE_REQUIRED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let message = body["error"].as_str().unwrap();
+        assert!(
+            message.starts_with("update your client: session-bound device proof is required."),
+            "{message}"
+        );
+        // Someone who already updated learns that the old version is still running
+        assert!(
+            message.contains("If you already installed the update"),
+            "{message}"
+        );
+        assert!(message.contains("quit cpmesh"), "{message}");
     }
 
     #[tokio::test]

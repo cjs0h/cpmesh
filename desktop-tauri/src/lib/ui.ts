@@ -68,17 +68,28 @@ export function isMacLike(): boolean {
 	return /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent);
 }
 
-/** Key labels for a shortcut like ['mod', 'shift', 'Space'] on the current platform. */
-export function shortcutKeys(keys: string[]): string[] {
-	const mac = isMacLike();
+export function isWindowsLike(): boolean {
+	if (typeof navigator === 'undefined') return false;
+	return /Win32|Win64|Windows/i.test(navigator.platform || navigator.userAgent);
+}
+
+/**
+ * Key labels for a shortcut like ['mod', 'shift', 'Space'] on the current platform:
+ * 'mod' is ⌘ or Ctrl, 'ctrl' is ⌃ on macOS, 'super' the Windows or Super key.
+ */
+export function shortcutKeys(keys: string[], mac = isMacLike()): string[] {
 	return keys.map((key) => {
 		switch (key) {
 			case 'mod':
 				return mac ? '⌘' : 'Ctrl';
+			case 'ctrl':
+				return mac ? '⌃' : 'Ctrl';
 			case 'shift':
 				return mac ? '⇧' : 'Shift';
 			case 'alt':
 				return mac ? '⌥' : 'Alt';
+			case 'super':
+				return mac ? '⌘' : isWindowsLike() ? 'Win' : 'Super';
 			default:
 				return key;
 		}

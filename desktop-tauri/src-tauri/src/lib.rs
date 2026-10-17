@@ -5,9 +5,14 @@ mod crypto;
 mod device_keys;
 mod fingerprint;
 mod history;
+mod key_backup;
 mod key_sync;
 mod proto;
+#[cfg(desktop)]
+mod relaunch;
 mod secure_storage;
+#[cfg(desktop)]
+mod shortcut;
 mod state;
 #[cfg(desktop)]
 mod tray;
@@ -23,6 +28,15 @@ use tauri::menu::{AboutMetadataBuilder, MenuBuilder, MenuItemBuilder, SubmenuBui
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     env_logger::init();
+
+    #[cfg(desktop)]
+    {
+        let env = tauri::Env::default();
+        relaunch::record_start(&env);
+        // A package upgrade may have left the previous version running in the tray
+        #[cfg(target_os = "linux")]
+        relaunch::end_outdated_instances(&env);
+    }
 
     let builder = tauri::Builder::default();
 
@@ -87,6 +101,11 @@ pub fn run() {
             // When a second instance is launched (e.g. via deep link), this callback fires
             // in the ORIGINAL instance. The new instance exits immediately.
 
+            // Opened again after an update was installed: the new version takes over
+            if relaunch::relaunch_if_updated(app, &argv) {
+                return;
+            }
+
             // Show and focus the main window
             tray::show_main_window(app);
 
@@ -129,6 +148,8 @@ pub fn run() {
             commands::complete_mfa_login,
             commands::cancel_mfa_login,
             commands::setup_with_oauth_tokens,
+            commands::resolve_sign_in,
+            commands::cancel_sign_in,
             commands::check_social_status,
             commands::check_browser_sign_in,
             commands::get_user_info,
@@ -146,6 +167,8 @@ pub fn run() {
             commands::confirm_pairing,
             commands::get_own_identity,
             commands::verify_device_identity,
+            commands::get_device_trust,
+            commands::confirm_key_share,
             commands::get_history,
             commands::search_history,
             commands::copy_entry,
@@ -154,10 +177,22 @@ pub fn run() {
             commands::sync_history,
             commands::get_config,
             commands::update_config,
+            commands::get_data_dir,
+            #[cfg(desktop)]
+            shortcut::get_global_shortcut,
+            #[cfg(desktop)]
+            shortcut::set_global_shortcut,
             commands::change_password,
             commands::logout,
             commands::check_update,
             commands::download_and_install_update,
+            commands::update_installed,
+            commands::restart_app,
+            commands::get_key_problem,
+            commands::get_key_recovery_status,
+            commands::inspect_key_backup,
+            commands::restore_key_backup,
+            commands::reset_encryption,
         ])
         .setup(|app| {
             // Resolve config directory: use Tauri's app data dir (works on all platforms including Android/iOS)
@@ -169,6 +204,7 @@ pub fn run() {
             log::info!("Config directory: {}", cfg_dir.display());
 
             let ctx = AppContext::new(cfg_dir);
+            ctx.attach(app.handle().clone());
             #[cfg(desktop)]
             let (configured, autostart) = ctx
                 .config
@@ -270,26 +306,17 @@ pub fn run() {
                     }
                 }
 
-                // Register global hotkey (non-fatal if it fails — e.g. shortcut already taken)
-                {
-                    use tauri_plugin_global_shortcut::GlobalShortcutExt;
-                    let handle_for_hotkey = app.handle().clone();
-                    if let Err(e) = app.global_shortcut().on_shortcut(
-                        "CmdOrCtrl+Shift+Space",
-                        move |_app, _shortcut, event| {
-                            if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
-                                tray::show_main_window(&handle_for_hotkey);
-                            }
-                        },
-                    ) {
-                        log::error!("Failed to register global shortcut: {e}");
-                    }
-                }
+                // The shortcut that shows cpmesh from anywhere (one another app holds is
+                // reported in Settings rather than failing startup)
+                shortcut::init(app.handle());
             }
 
             // Background update checker (desktop only)
             #[cfg(desktop)]
             {
+                // A newer version installed over this one is offered as a restart
+                relaunch::watch_for_update(app.handle().clone());
+
                 let update_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     // Wait 30 seconds before the first check
@@ -368,17 +395,26 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
+            // Starts the new version when this one quit for it (see `relaunch`)
+            #[cfg(desktop)]
+            if let tauri::RunEvent::Exit = event {
+                relaunch::on_exit(app);
+            }
             // Opening cpmesh again (Finder, Spotlight, the Dock) while it runs in the
-            // background shows the window
+            // background shows the window, or starts the version installed over it
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen {
-                has_visible_windows: false,
+                has_visible_windows,
                 ..
             } = event
             {
-                tray::show_main_window(app);
+                if relaunch::binary_replaced() {
+                    relaunch::relaunch(app, relaunch::foreground_args());
+                } else if !has_visible_windows {
+                    tray::show_main_window(app);
+                }
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(desktop))]
             let _ = (app, event);
         });
 }

@@ -20,14 +20,15 @@ End-to-end encrypted clipboard sync on a relay the user runs themselves. The rel
 
 ## Operating Context
 
-- Desktop app (Tauri + SvelteKit) for macOS, Windows and Linux. Closing the window hides it to the tray/menu bar; `Cmd/Ctrl+Shift+Space` brings it back from anywhere.
+- Desktop app (Tauri + SvelteKit) for macOS, Windows and Linux. Closing the window hides it to the tray/menu bar; a global shortcut (`Cmd/Ctrl+Shift+Space` by default, changeable or off in Settings) brings it back from anywhere.
 - A web dashboard (`web/`) served by the same server handles account management, passkeys and two-factor setup; the desktop app hands browser sign-ins back through the `cpmesh://` deep link.
 - Every sign-in is confirmed with a second factor (authenticator code, recovery code, or passkey in the browser).
 - New devices wait in a pending state until an approved device verifies the fingerprint and approves them.
+- An approved device without the current encryption key (for example one an older relay re-registered) gets it in the app: on a device that has the key, Devices → Share key, then the same 8-digit pairing code on both (the device without the key shows it under Settings → Encryption keys). Devices that keep new keys from every member (not verified here, changed identity, not updated) are listed with Verify and Remove, also in the approval dialog.
 
 ## Capabilities and Constraints
 
-- Desktop features: sign in or register against any cpmesh server, SSO and browser sign-in, two-factor codes, connection control, clipboard history (search, copy back, delete, clear, sync from server), device list with approve/reject/remove, fingerprint verification of existing peers, settings (auto-connect, launch at login, notifications), password change (signs the device out), update checks and installs.
+- Desktop features: sign in or register against any cpmesh server, SSO and browser sign-in, two-factor codes, connection control, clipboard history (search, copy back, delete, clear, sync from server), device list with approve/reject/remove, fingerprint verification of existing peers, settings (auto-connect, launch at login, notifications, the global shortcut, this device's ID, fingerprint and data folder), password change (signs the device out), sign-out that keeps the device's keys, history and preferences, update checks and installs.
 - Minimum window 700×500; default 900×650.
 - Content Security Policy forbids remote scripts, fonts and images; all assets must ship with the app.
 - Fingerprint comparison must always show and compare the full fingerprint; never shorten or summarise it.

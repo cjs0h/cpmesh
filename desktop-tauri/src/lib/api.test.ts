@@ -57,6 +57,19 @@ describe('Tauri command wrappers', () => {
 			{ pendingDeviceId: 'p1' },
 		],
 		['getMyApprovalStatus', () => api.getMyApprovalStatus(), 'get_my_approval_status', undefined],
+		['getDeviceTrust', () => api.getDeviceTrust(), 'get_device_trust', undefined],
+		[
+			'verifyDeviceIdentity',
+			() => api.verifyDeviceIdentity('d1', 'AB'.repeat(32)),
+			'verify_device_identity',
+			{ deviceId: 'd1', fingerprint: 'AB'.repeat(32) },
+		],
+		[
+			'confirmKeyShare',
+			() => api.confirmKeyShare('d1', 's1', '1234 5678'),
+			'confirm_key_share',
+			{ deviceId: 'd1', sessionId: 's1', code: '1234 5678' },
+		],
 		['getHistory (default page size)', () => api.getHistory(2), 'get_history', { page: 2, pageSize: 20 }],
 		['getHistory (custom page size)', () => api.getHistory(0, 50), 'get_history', { page: 0, pageSize: 50 }],
 		['searchHistory', () => api.searchHistory('needle'), 'search_history', { query: 'needle' }],
@@ -65,6 +78,16 @@ describe('Tauri command wrappers', () => {
 		['clearHistory', () => api.clearHistory(), 'clear_history', undefined],
 		['syncHistory', () => api.syncHistory(), 'sync_history', undefined],
 		['getConfig', () => api.getConfig(), 'get_config', undefined],
+		['getDataDir', () => api.getDataDir(), 'get_data_dir', undefined],
+		['getGlobalShortcut', () => api.getGlobalShortcut(), 'get_global_shortcut', undefined],
+		[
+			'setGlobalShortcut',
+			() => api.setGlobalShortcut('CmdOrCtrl+Alt+V'),
+			'set_global_shortcut',
+			{ shortcut: 'CmdOrCtrl+Alt+V' },
+		],
+		['setGlobalShortcut (turn off)', () => api.setGlobalShortcut(''), 'set_global_shortcut', { shortcut: '' }],
+		['copyText', () => api.copyText('d-1'), 'plugin:clipboard-manager|write_text', { text: 'd-1' }],
 		[
 			'changePassword',
 			() => api.changePassword('old', 'new'),
@@ -104,6 +127,26 @@ describe('Tauri command wrappers', () => {
 			'exchange_oauth_code',
 			{ serverUrl: 'https://s', code: 'code', codeVerifier: 'verifier' },
 		],
+		[
+			'resolveSignIn (set keys aside)',
+			() => api.resolveSignIn({ action: 'set_aside_keys' }),
+			'resolve_sign_in',
+			{ action: { action: 'set_aside_keys' } },
+		],
+		[
+			'resolveSignIn (replace a registration)',
+			() => api.resolveSignIn({ action: 'replace_device', device_id: 'd1', waiting_device_ids: ['d2'] }),
+			'resolve_sign_in',
+			{ action: { action: 'replace_device', device_id: 'd1', waiting_device_ids: ['d2'] } },
+		],
+		['cancelSignIn', () => api.cancelSignIn(), 'cancel_sign_in', undefined],
+		['getKeyProblem', () => api.getKeyProblem(), 'get_key_problem', undefined],
+		['getKeyRecoveryStatus', () => api.getKeyRecoveryStatus(), 'get_key_recovery_status', undefined],
+		['inspectKeyBackup', () => api.inspectKeyBackup('/b'), 'inspect_key_backup', { path: '/b' }],
+		['restoreKeyBackup', () => api.restoreKeyBackup('/b'), 'restore_key_backup', { path: '/b' }],
+		['resetEncryption', () => api.resetEncryption(4), 'reset_encryption', { expectedVersion: 4 }],
+		['updateInstalled', () => api.updateInstalled(), 'update_installed', undefined],
+		['restartApp', () => api.restartApp(), 'restart_app', undefined],
 	] as const)('%s invokes the matching command', async (_name, call, command, args) => {
 		await call();
 		expect(invoke).toHaveBeenCalledTimes(1);
@@ -179,14 +222,12 @@ describe('updateConfig', () => {
 			auto_connect: false,
 			autostart: true,
 			notifications_enabled: false,
-			global_hotkey: 'Alt+V',
 		});
 		expect(invoke).toHaveBeenCalledWith('update_config', {
 			serverUrl: 'https://s',
 			autoConnect: false,
 			autostart: true,
 			notificationsEnabled: false,
-			globalHotkey: 'Alt+V',
 		});
 	});
 
@@ -198,7 +239,6 @@ describe('updateConfig', () => {
 			autoConnect: undefined,
 			autostart: true,
 			notificationsEnabled: undefined,
-			globalHotkey: undefined,
 		});
 	});
 });

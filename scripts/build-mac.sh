@@ -3,8 +3,9 @@
 # Run from the project root: ./scripts/build-mac.sh
 set -euo pipefail
 
-VERSION="0.1.0"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# The app version, kept in step with releases by scripts/release/set-version.mjs
+VERSION="$(grep -m1 '"version"' "$ROOT/desktop-tauri/src-tauri/tauri.conf.json" | sed 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')"
 
 echo "=== Building cpmesh $VERSION for macOS ==="
 
@@ -39,11 +40,11 @@ case "$ARCH" in
     *)             ARCH_LABEL="$ARCH" ;;
 esac
 
-# Install frontend dependencies if needed
+# Install frontend dependencies when they are missing or out of date with package-lock.json
 cd "$ROOT/desktop-tauri"
-if [ ! -d "node_modules" ]; then
-    echo "Installing frontend dependencies..."
-    npm install
+if ! node "$ROOT/scripts/check-deps.mjs"; then
+    echo "Installing frontend dependencies with npm ci..."
+    npm ci
 fi
 
 # Build Tauri app (runs npm build automatically via beforeBuildCommand)

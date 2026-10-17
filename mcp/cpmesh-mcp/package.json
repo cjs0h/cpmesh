@@ -21,8 +21,11 @@
     "node": ">=18.19"
   },
   "scripts": {
+    "prebuild": "node ../../scripts/check-deps.mjs",
     "build": "node scripts/build.mjs",
+    "pretypecheck": "node ../../scripts/check-deps.mjs",
     "typecheck": "tsc --noEmit",
+    "pretest": "node ../../scripts/check-deps.mjs",
     "test": "vitest run",
     "prepublishOnly": "npm run typecheck && npm run build && npm run test"
   },

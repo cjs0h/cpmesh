@@ -1,5 +1,6 @@
 // Tests for the release scripts: node --test "scripts/release/*.test.mjs"
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { cp, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -526,5 +527,47 @@ describe('set-version', () => {
 
   it('rejects versions that are not x.y.z', async () => {
     await assert.rejects(setVersion(REPO_ROOT, '1.2.3-beta.1'), /must look like 1\.2\.3/);
+  });
+
+  it('the repository declares one version in every manifest', async () => {
+    const { version } = JSON.parse(await readFile(path.join(REPO_ROOT, 'desktop-tauri/src-tauri/tauri.conf.json'), 'utf8'));
+    assert.deepEqual(
+      await setVersion(REPO_ROOT, version, { write: false }),
+      [],
+      `run 'node scripts/release/set-version.mjs ${version}'`,
+    );
+  });
+
+  it('--check reports manifests that declare another version without changing them', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'cpmesh-set-version-'));
+    try {
+      // A copy of the script edits the manifests next to it, never the real repository
+      const files = versionEdits('0.0.0').map(([relative]) => relative);
+      for (const relative of [...files, 'scripts/release/set-version.mjs']) {
+        await cp(path.join(REPO_ROOT, relative), path.join(dir, relative));
+      }
+      const run = (...args) =>
+        spawnSync(process.execPath, [path.join(dir, 'scripts/release/set-version.mjs'), ...args], { encoding: 'utf8' });
+      const read = () => Promise.all(files.map((relative) => readFile(path.join(dir, relative), 'utf8')));
+      const before = await read();
+
+      assert.deepEqual(await setVersion(dir, '9.8.7', { write: false }), files);
+      const stale = run('--check', 'v9.8.7');
+      assert.equal(stale.status, 1);
+      assert.equal(
+        stale.stderr,
+        `error: these manifests do not declare version 9.8.7:\n  ${files.join('\n  ')}\n` +
+          "Run 'node scripts/release/set-version.mjs 9.8.7' and commit the result.\n",
+      );
+      assert.equal(run('9.8.7', '--check').status, 2, 'a misplaced flag is rejected, not ignored');
+      assert.deepEqual(await read(), before, 'nothing was written');
+
+      assert.equal(run('9.8.7').status, 0);
+      const bumped = run('--check', '9.8.7');
+      assert.equal(bumped.status, 0, bumped.stderr);
+      assert.equal(bumped.stdout, 'Every manifest declares version 9.8.7\n');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

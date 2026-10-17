@@ -4,6 +4,8 @@ WORKDIR /app/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
 COPY web/ .
+# The prebuild hook checks node_modules against the lockfile with this shared script
+COPY scripts/check-deps.mjs /app/scripts/
 RUN npm run build
 
 # ── Stage 2: Build Rust server (embeds web/dist via rust-embed) ──

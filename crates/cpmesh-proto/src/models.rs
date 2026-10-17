@@ -464,6 +464,12 @@ pub struct DeviceInfo {
     pub online: bool,
     #[serde(default = "default_device_status")]
     pub status: DeviceStatus,
+    /// Approved devices only: whether the relay holds this device's wrap of the
+    /// mesh's current group key. Absent before the first key exists and from older
+    /// servers. Informational: clients use it to offer sharing the key with a device,
+    /// never to decide who receives it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_current_key: Option<bool>,
 }
 
 fn default_device_status() -> DeviceStatus {

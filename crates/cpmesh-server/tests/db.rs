@@ -651,26 +651,6 @@ async fn device_lifecycle_and_approval_status() {
 
         db.update_device_last_seen(approved.id).await.unwrap();
 
-        // Re-registration replaces keys, resets approval and drops old group keys
-        db.store_group_keys(approved.id, &[(now_approved.id, vec![9, 9])])
-            .await
-            .unwrap();
-        assert!(db.get_group_key(now_approved.id).await.is_ok());
-        let rereg = db
-            .reregister_device(now_approved.id, "Phone v2", &[4, 9, 9, 9], None, "pending")
-            .await
-            .unwrap();
-        assert_eq!(rereg.name, "Phone v2");
-        assert_eq!(rereg.public_key, vec![4, 9, 9, 9]);
-        assert!(rereg.public_key_sig.is_none());
-        assert_eq!(rereg.status, "pending");
-        assert!(rereg.approved_at.is_none());
-        assert!(rereg.approved_by_device_id.is_none());
-        assert!(matches!(
-            db.get_group_key(now_approved.id).await,
-            Err(sqlx::Error::RowNotFound)
-        ));
-
         // Deletion is scoped to the owning user
         assert!(matches!(
             db.delete_device(approved.id, other.id).await,
@@ -679,6 +659,71 @@ async fn device_lifecycle_and_approval_status() {
         db.delete_device(approved.id, user.id).await.unwrap();
         assert!(db.get_device_by_id(approved.id).await.is_err());
         assert!(db.get_device_status(approved.id).await.is_err());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn current_key_holders_follow_the_current_version() {
+    use std::collections::HashSet;
+    with_db(|db| async move {
+        let user = make_user(&db, "keyholders", None).await;
+        let other = make_user(&db, "keyholders-other", None).await;
+        let a = make_device(&db, &user, "A", "approved").await;
+        assert_eq!(
+            db.current_key_holders(user.id).await.unwrap(),
+            None,
+            "no key yet"
+        );
+
+        assert!(
+            db.rotate_group_key(user.id, a.id, 0, 1, &[(a.id, vec![1; 60])], 24)
+                .await
+                .unwrap()
+        );
+        // Approved without a wrap of the current key, the state older servers could
+        // leave a device in when they re-registered it
+        let b = make_device(&db, &user, "B", "approved").await;
+        let pending = make_device(&db, &user, "C", "pending").await;
+        let theirs = make_device(&db, &other, "Theirs", "approved").await;
+        assert!(
+            db.rotate_group_key(other.id, theirs.id, 0, 1, &[(theirs.id, vec![2; 60])], 24)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            db.current_key_holders(user.id).await.unwrap(),
+            Some(HashSet::from([a.id]))
+        );
+
+        // The next rotation has to reach every approved device
+        assert!(
+            db.rotate_group_key(
+                user.id,
+                a.id,
+                1,
+                2,
+                &[(a.id, vec![3; 60]), (b.id, vec![4; 60])],
+                24
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            db.current_key_holders(user.id).await.unwrap(),
+            Some(HashSet::from([a.id, b.id]))
+        );
+        assert!(
+            !db.current_key_holders(user.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .contains(&pending.id)
+        );
+        assert_eq!(
+            db.current_key_holders(other.id).await.unwrap(),
+            Some(HashSet::from([theirs.id]))
+        );
     })
     .await;
 }

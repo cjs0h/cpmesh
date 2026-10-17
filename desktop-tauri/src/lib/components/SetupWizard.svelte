@@ -11,8 +11,13 @@
 		checkBrowserSignIn,
 		setupWithOAuthTokens,
 		exchangeOAuthCode,
+		resolveSignIn,
+		cancelSignIn,
+		type LoginStep,
 		type MfaCodeMethod,
 		type MfaPrompt,
+		type SignInAction,
+		type SignInDecision,
 		type SocialStatus,
 	} from '#lib/api.js';
 	import {
@@ -36,6 +41,7 @@
 	import Icon from './ui/Icon.svelte';
 	import Logo from './ui/Logo.svelte';
 	import Segmented from './ui/Segmented.svelte';
+	import SignInDecisionStep from './SignInDecision.svelte';
 
 	let wizardStep = $state(1);
 	let serverInput = $state(getLastServerUrl());
@@ -76,6 +82,10 @@
 	const hasPasskey = $derived(mfaPrompt?.methods.includes('webauthn') ?? false);
 	const host = $derived(serverHost(serverUrl));
 	const offersBrowser = $derived(Boolean(socialStatus?.enabled) || (desktop && browserSignIn));
+
+	// Keys saved on this computer that don't fit the account: the user decides first
+	let decision = $state<SignInDecision | null>(null);
+	let deciding = $state(false);
 
 	const steps = ['Server', 'Sign in', 'Ready'];
 
@@ -175,12 +185,10 @@
 				const { access_token, refresh_token } = await exchangeOAuthCode(baseUrl, code, pkceVerifier);
 
 				// Complete device setup with the obtained tokens
-				await setupWithOAuthTokens(baseUrl, access_token, refresh_token);
-				rememberServerUrl(baseUrl);
+				const step = await setupWithOAuthTokens(baseUrl, access_token, refresh_token);
 				// The browser also finished any second-factor step shown here
 				mfaPrompt = null;
-				wizardStep = 3;
-				await refreshStatus();
+				await afterSignIn(step, baseUrl);
 			} catch (e) {
 				error = errorMessage(e);
 			} finally {
@@ -206,6 +214,7 @@
 	async function handleSetup(event: SubmitEvent) {
 		event.preventDefault();
 		error = '';
+		decision = null;
 		if (isRegister) {
 			error = validateRegistration();
 			if (error) return;
@@ -234,13 +243,49 @@
 				passwordConfirm = '';
 				return;
 			}
-			rememberServerUrl(serverUrl);
-			wizardStep = 3;
-			await refreshStatus();
+			await afterSignIn(step);
 		} catch (e) {
 			error = errorMessage(e);
 		} finally {
 			loading = false;
+		}
+	}
+
+	// Where a finished sign-in leads: this device is set up, or the user first decides
+	// what happens to keys saved on it
+	async function afterSignIn(step: LoginStep, url = serverUrl) {
+		if (step.status === 'decision_required') {
+			decision = step;
+			return;
+		}
+		decision = null;
+		rememberServerUrl(url);
+		wizardStep = 3;
+		// After a recovery code, the last step says how many are left before moving on
+		if (recoveryCodesLeft === null) await refreshStatus();
+	}
+
+	async function resolveDecision(action: SignInAction) {
+		error = '';
+		deciding = true;
+		try {
+			await afterSignIn(await resolveSignIn(action));
+		} catch (e) {
+			error = errorMessage(e);
+		} finally {
+			deciding = false;
+		}
+	}
+
+	// Back to the sign-in form; nothing about the saved keys changes
+	async function cancelDecision() {
+		decision = null;
+		error = '';
+		recoveryCodesLeft = null;
+		try {
+			await cancelSignIn();
+		} catch {
+			// Nothing was waiting
 		}
 	}
 
@@ -286,6 +331,10 @@
 			const done = await completeMfaLogin(mfaMethod, code);
 			mfaPrompt = null;
 			recoveryCodesLeft = done.recovery_codes_remaining ?? null;
+			if (done.decision) {
+				decision = done.decision;
+				return;
+			}
 			rememberServerUrl(serverUrl);
 			wizardStep = 3;
 			// After a recovery code, the last step says how many are left before moving on
@@ -474,7 +523,15 @@
 					</div>
 				{:else if wizardStep === 2}
 					<div class="animate-[rise-in_0.25s_var(--ease-out-expo)]">
-						{#if mfaStep === 'code'}
+						{#if decision}
+							<SignInDecisionStep
+								{decision}
+								busy={deciding}
+								{error}
+								onresolve={resolveDecision}
+								oncancel={cancelDecision}
+							/>
+						{:else if mfaStep === 'code'}
 							{@render heading(
 								mfaMethod === 'totp' ? 'Enter your verification code' : 'Use a recovery code',
 								mfaMethod === 'totp'

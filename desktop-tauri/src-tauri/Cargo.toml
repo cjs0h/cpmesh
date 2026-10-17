@@ -1,6 +1,6 @@
 [package]
 name = "cpmesh-desktop"
-version = "0.1.0"
+version = "0.4.1"
 description = "cpmesh - Encrypted Clipboard Sync"
 authors = ["cpmesh"]
 edition = "2024"
@@ -68,6 +68,10 @@ gethostname = "1"
 # Windows-only dependencies
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.56"
+
+# Ends cpmesh processes a package upgrade left running from a replaced binary
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", features = ["process"] }
 
 # Desktop-only dependencies
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]

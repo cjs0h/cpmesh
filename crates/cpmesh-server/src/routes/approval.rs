@@ -211,7 +211,12 @@ pub async fn handle_reveal_nonce(
     }
 }
 
-/// POST /api/device-approvals/{pending_device_id}/begin — start approval session.
+/// POST /api/device-approvals/{pending_device_id}/begin — start a pairing session.
+///
+/// The target is usually a pending device. An approved device can be paired with
+/// too, so two members verify each other with the same short code, e.g. before one
+/// shares the group key with another that lacks it. That never changes the target's
+/// status: only `approve` admits a pending device, and keys move by rotation.
 pub async fn handle_begin_approval(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<AuthClaims>,
@@ -225,10 +230,7 @@ pub async fn handle_begin_approval(
         .and_then(|v| v.parse::<u32>().ok())
         != Some(proto::PAIRING_VERSION)
     {
-        return json_error(
-            "update your client: committed short-code pairing is required",
-            StatusCode::UPGRADE_REQUIRED,
-        );
+        return super::middleware::upgrade_required("committed short-code pairing is required");
     }
     let commit = match body {
         Some(axum::Json(req)) if req.commit.len() == 32 => req.commit,
@@ -238,8 +240,11 @@ pub async fn handle_begin_approval(
         Some(d) => d,
         None => return json_error("device context required", StatusCode::BAD_REQUEST),
     };
+    if pending_device_id == approver_device_id {
+        return json_error("a device cannot pair with itself", StatusCode::BAD_REQUEST);
+    }
 
-    // Verify pending device belongs to same user and is pending
+    // The device belongs to the same user and is pending, or a member being verified
     let pending_device = match state.db.get_device_by_id(pending_device_id).await {
         Ok(d) => d,
         Err(_) => return json_error("device not found", StatusCode::NOT_FOUND),
@@ -252,9 +257,12 @@ pub async fn handle_begin_approval(
         );
     }
 
-    if pending_device.status != "pending" {
+    if pending_device.status != "pending" && pending_device.status != "approved" {
         return json_error(
-            &format!("device is not pending (status: {})", pending_device.status),
+            &format!(
+                "device cannot be paired (status: {})",
+                pending_device.status
+            ),
             StatusCode::CONFLICT,
         );
     }
