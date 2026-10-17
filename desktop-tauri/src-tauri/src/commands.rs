@@ -2194,7 +2194,7 @@ pub async fn confirm_device_approval(
     let exchange = guard.as_mut().ok_or("Encryption not initialized")?;
     synchronize_keys(&ctx, exchange, &api, &own_id).await?;
     let mut members =
-        crate::key_sync::trusted_members(exchange, &api, &own_id, &ctx.config_dir).await?;
+        crate::key_sync::verified_members(exchange, &api, &own_id, &ctx.config_dir).await?;
     // The new member's encryption key must be certified by the identity we just
     // compared; fall back to the relay listing only to find that certification.
     let peer_encryption = match candidate.peer_encryption {

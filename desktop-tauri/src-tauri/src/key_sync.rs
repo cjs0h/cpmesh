@@ -146,11 +146,11 @@ pub async fn publish_encryption_key(
 pub const KEY_SHARING_BLOCKED: &str =
     "New keys must reach every device, so first verify or remove on the Devices page:";
 
-/// Approved members whose identity key is pinned locally and whose encryption key
-/// that identity certified. Only these receive wraps; the relay's listing alone
-/// authorizes nothing. A new key must reach every approved device, so any other
-/// approved device is an error that names each one in the way.
-pub async fn trusted_members(
+/// Approved members verified on this device: their identity key is pinned locally and
+/// their encryption key is certified by that identity. Only these receive wraps; the
+/// relay's listing alone authorizes nothing. A new key must reach every approved
+/// device, so any other approved device is an error that names each one in the way.
+pub async fn verified_members(
     exchange: &KeyExchange,
     api: &ApiClient,
     own_id: &str,
@@ -366,7 +366,7 @@ pub async fn synchronize(
     {
         Ok(response) => response,
         Err(ApiError::Server { status: 404, .. }) => {
-            let members = trusted_members(&candidate, api, own_id, directory).await?;
+            let members = verified_members(&candidate, api, own_id, directory).await?;
             if members.len() != 1
                 || members[0].identity.id != own_id
                 || candidate.current_version > 1
@@ -479,7 +479,7 @@ pub async fn reset_group_key(
             "Your account's encryption keys changed since you looked. Review them again.".into(),
         );
     }
-    let members = trusted_members(exchange, api, own_id, directory).await?;
+    let members = verified_members(exchange, api, own_id, directory).await?;
     let new_version = current.checked_add(1).ok_or("key version exhausted")?;
     let key = zeroize::Zeroizing::new(crate::crypto::encrypt::generate_group_key());
     let wrapped_keys = membership::signed_wraps(
@@ -519,7 +519,7 @@ pub async fn rotate(
     directory: &Path,
 ) -> Result<(), String> {
     synchronize(exchange, api, own_id, directory).await?;
-    let members = trusted_members(exchange, api, own_id, directory).await?;
+    let members = verified_members(exchange, api, own_id, directory).await?;
     let (new_version, wrapped_keys) = membership::stage_rotation(exchange, own_id, &members)?;
     let result = api
         .rotate_group_key(&RotateGroupKeyRequest {
@@ -755,7 +755,7 @@ pub(crate) mod tests {
 
     /// The account is at key `current`, but the devices that held it were removed, so
     /// nobody gave this (only) device a copy.
-    async fn account_without_key_holders(
+    async fn mesh_without_key_holders(
         current: i32,
     ) -> (DeviceKeys, DeviceIdentity, Arc<Mutex<Relay>>, ApiClient) {
         let keys = DeviceKeys::generate();
@@ -786,7 +786,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_reset_starts_a_new_key_only_while_the_current_one_is_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let (keys, own, relay, api) = account_without_key_holders(3).await;
+        let (keys, own, relay, api) = mesh_without_key_holders(3).await;
         let mut exchange = KeyExchange::new(keys.clone());
         // An older key, e.g. restored from a backup
         exchange.add_key_version(1, vec![1; 32]).unwrap();
@@ -836,7 +836,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_reset_reaches_every_approved_device_once_each_is_verified_here() {
         let dir = tempfile::tempdir().unwrap();
-        let (keys, own, relay, api) = account_without_key_holders(3).await;
+        let (keys, own, relay, api) = mesh_without_key_holders(3).await;
         // Another approved device that has no copy of the key either
         let peer_keys = DeviceKeys::generate();
         let peer = DeviceInfo {
@@ -906,7 +906,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn devices_that_cannot_receive_keys_are_reported() {
         let dir = tempfile::tempdir().unwrap();
-        let (_, own, relay, api) = account_without_key_holders(3).await;
+        let (_, own, relay, api) = mesh_without_key_holders(3).await;
         // Never updated to protocol 3: no certified encryption key
         let outdated = DeviceInfo {
             id: uuid::Uuid::new_v4().to_string(),
@@ -928,7 +928,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn restoring_the_current_key_from_a_backup_is_enough_to_sync() {
         let dir = tempfile::tempdir().unwrap();
-        let (keys, own, relay, api) = account_without_key_holders(3).await;
+        let (keys, own, relay, api) = mesh_without_key_holders(3).await;
         let mut exchange = KeyExchange::new(keys);
         exchange.add_key_version(3, vec![3; 32]).unwrap();
         assert!(
@@ -1313,7 +1313,7 @@ pub(crate) mod tests {
         assert!(members.iter().all(|m| m.has_current_key.is_none()));
 
         let exchange = KeyExchange::new(own);
-        let error = trusted_members(&exchange, &api, &ids[0], dir.path())
+        let error = verified_members(&exchange, &api, &ids[0], dir.path())
             .await
             .err()
             .unwrap();
