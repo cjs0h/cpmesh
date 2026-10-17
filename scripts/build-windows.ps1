@@ -2,8 +2,9 @@
 # Run from the project root: .\scripts\build-windows.ps1
 
 $ErrorActionPreference = "Stop"
-$VERSION = "0.1.0"
 $ROOT = (Resolve-Path "$PSScriptRoot\..").Path
+# The app version, kept in step with releases by scripts/release/set-version.mjs
+$VERSION = (Get-Content "$ROOT\desktop-tauri\src-tauri\tauri.conf.json" -Raw | ConvertFrom-Json).version
 
 Write-Host "=== Building cpmesh $VERSION for Windows ===" -ForegroundColor Cyan
 
@@ -43,11 +44,17 @@ if ($missing.Count -gt 0) {
     exit 1
 }
 
-# Install frontend dependencies if needed
 Push-Location "$ROOT\desktop-tauri"
-if (-not (Test-Path "node_modules")) {
-    Write-Host "Installing frontend dependencies..."
-    npm install
+# Install frontend dependencies when they are missing or out of date with package-lock.json
+node "$ROOT\scripts\check-deps.mjs"
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Installing frontend dependencies with npm ci..."
+    npm ci
+    if ($LASTEXITCODE -ne 0) {
+        Pop-Location
+        Write-Error "npm ci failed"
+        exit 1
+    }
 }
 Pop-Location
 

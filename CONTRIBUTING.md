@@ -35,7 +35,7 @@ cargo run -p cpmesh-server
 ```bash
 # Requires Node.js 22.12+ (24 LTS recommended)
 cd web
-npm install
+npm ci
 npm run dev
 ```
 
@@ -44,9 +44,18 @@ npm run dev
 ```bash
 # Requires Node.js 22.17+ (24 LTS recommended)
 cd desktop-tauri
-npm install
+npm ci
 npx tauri dev
 ```
+
+### JavaScript dependencies
+
+`web`, `desktop-tauri` and `mcp/cpmesh-mcp` pin their dependencies in `package-lock.json`. Install them with `npm ci`,
+and run it again after pulling a change to a lockfile. Their dev, build, check, typecheck and test scripts (and so
+`tauri dev` and `tauri build`) first run `scripts/check-deps.mjs`, which stops with that instruction when
+`node_modules` no longer matches the lockfile, instead of the build failing later with a "Cannot find module" error.
+The `scripts/build-*` scripts run `npm ci` themselves in that case. Set `CPMESH_SKIP_DEPS_CHECK=1` to skip the check,
+for example while trying out a dependency with `npm link`. The check's tests run with `node --test "scripts/*.test.mjs"`.
 
 ## Testing
 
@@ -237,19 +246,30 @@ Downloads section on cpmesh.com and the apps' update check offer the new version
 
 ### Cutting a release
 
-Push a version tag (the subject of an annotated tag becomes the one-line note in the apps' update banner):
+The version comes from the repository. Bump it with `scripts/release/set-version.mjs`, which writes it to
+`tauri.conf.json`, `Cargo.toml`/`Cargo.lock` and `package.json`/`package-lock.json`, and get that commit onto the
+branch you release from:
 
 ```bash
-git tag -a v0.2.0 -m "Faster sync and file previews"
-git push origin v0.2.0
+node scripts/release/set-version.mjs 0.5.0
+git commit -am "Release 0.5.0"
 ```
 
-Or run **Actions → Release → Run workflow** on a branch with a version (`0.2.0`) and an optional note; the
-branch is tagged `v0.2.0` when the release is published.
+Then tag that commit and push the tag (the subject of an annotated tag becomes the one-line note in the apps'
+update banner):
 
-The tag decides the version: the workflow stamps it into `tauri.conf.json`, `Cargo.toml`/`Cargo.lock` and
-`package.json`/`package-lock.json` before building, so the apps report the version they were released as.
-To bump the version in the repository too, run `node scripts/release/set-version.mjs 0.2.0`.
+```bash
+git tag -a v0.5.0 -m "Faster sync and file previews"
+git push origin v0.5.0
+```
+
+Or run **Actions → Release → Run workflow** on the bumped branch with the same version (`0.5.0`) and an optional
+note; the branch is tagged `v0.5.0` when the release is published.
+
+If the commit declares another version, the workflow stops before building anything: bump it, then re-create the tag
+on the bump commit (`node scripts/release/set-version.mjs --check 0.5.0` runs the same check locally). This keeps
+the repository at the latest released version, so an app built from it never reports an older version than the
+published release, which its update check would otherwise offer as an update.
 
 | Platform | Release asset |
 | --- | --- |

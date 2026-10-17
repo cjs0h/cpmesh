@@ -14,8 +14,9 @@
 # Optional: pass --aab to build Android App Bundle instead of APK
 set -euo pipefail
 
-VERSION="0.1.0"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# The app version, kept in step with releases by scripts/release/set-version.mjs
+VERSION="$(grep -m1 '"version"' "$ROOT/desktop-tauri/src-tauri/tauri.conf.json" | sed 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')"
 BUILD_AAB=false
 
 for arg in "$@"; do
@@ -86,17 +87,18 @@ if [ -n "$MISSING" ]; then
     exit 1
 fi
 
-# Initialize Android project if needed
 cd "$ROOT/desktop-tauri"
+
+# Install frontend dependencies when they are missing or out of date with package-lock.json
+if ! node "$ROOT/scripts/check-deps.mjs"; then
+    echo "Installing frontend dependencies with npm ci..."
+    npm ci
+fi
+
+# Initialize Android project if needed
 if [ ! -d "src-tauri/gen/android" ]; then
     echo "Initializing Tauri Android project..."
     npx tauri android init
-fi
-
-# Install frontend dependencies if needed
-if [ ! -d "node_modules" ]; then
-    echo "Installing frontend dependencies..."
-    npm install
 fi
 
 # Build
